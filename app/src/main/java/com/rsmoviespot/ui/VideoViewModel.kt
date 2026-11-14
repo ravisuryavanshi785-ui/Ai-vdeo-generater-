@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.rsmoviespot.service.VideoRenderEngine
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -82,10 +83,12 @@ class VideoViewModel @Inject constructor(
                         generatedVideoUri = result.galleryUri
                     )
                 }
-            } catch (exception: Exception) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
                 _uiState.update {
                     it.copy(
-                        statusMessage = exception.message
+                        statusMessage = error.message
                             ?.takeIf(String::isNotBlank)
                             ?.let { message -> "Generation failed: $message" }
                             ?: "Video generation failed. Please try again."
