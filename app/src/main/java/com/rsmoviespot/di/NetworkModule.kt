@@ -13,6 +13,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
+import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
 
 @Module
@@ -34,16 +35,16 @@ object NetworkModule {
         }
 
         return OkHttpClient.Builder()
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .addInterceptor(loggingInterceptor)
             .build()
     }
 
     @Provides
     @Singleton
-    fun provideGeminiApi(
-        client: OkHttpClient,
-        json: Json
-    ): GeminiApi =
+    fun provideGeminiApi(client: OkHttpClient, json: Json): GeminiApi =
         Retrofit.Builder()
             .baseUrl("https://generativelanguage.googleapis.com/")
             .client(client)
@@ -53,10 +54,7 @@ object NetworkModule {
 
     @Provides
     @Singleton
-    fun provideHuggingFaceApi(
-        client: OkHttpClient,
-        json: Json
-    ): HuggingFaceApi =
+    fun provideHuggingFaceApi(client: OkHttpClient, json: Json): HuggingFaceApi =
         Retrofit.Builder()
             .baseUrl("https://api-inference.huggingface.co/")
             .client(client)
@@ -66,12 +64,9 @@ object NetworkModule {
 
     @Provides
     @Singleton
-    fun provideEdgeTtsApi(
-        client: OkHttpClient,
-        json: Json
-    ): EdgeTtsApi =
+    fun provideEdgeTtsApi(client: OkHttpClient, json: Json): EdgeTtsApi =
         Retrofit.Builder()
-            // Is URL ko apne actual Edge TTS adapter ke URL se replace karein.
+            // Replace this with your actual Edge TTS adapter base URL.
             .baseUrl("https://your-edge-tts-adapter.example/")
             .client(client)
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
