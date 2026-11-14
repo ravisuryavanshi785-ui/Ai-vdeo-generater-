@@ -12,7 +12,7 @@ interface HuggingFaceApi {
     @POST("models/{model}")
     suspend fun generateImage(
         @Header("Authorization") authorization: String,
-        @Path("model") model: String,
+        @Path(value = "model", encoded = true) model: String,
         @Body request: HuggingFaceImageRequest
     ): ResponseBody
 }
