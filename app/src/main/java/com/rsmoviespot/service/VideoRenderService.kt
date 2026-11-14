@@ -11,7 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import com.rsmoviespot.R
+import androidx.core.content.ContextCompat
 
 class VideoRenderService : Service() {
 
@@ -28,13 +28,20 @@ class VideoRenderService : Service() {
             ACTION_PROGRESS -> {
                 val progress = intent.getIntExtra(EXTRA_PROGRESS, 0).coerceIn(0, 100)
                 val message = intent.getStringExtra(EXTRA_MESSAGE) ?: "Rendering video…"
-                notificationManager.notify(NOTIFICATION_ID, buildNotification(message, progress))
+                notificationManager.notify(
+                    NOTIFICATION_ID,
+                    buildNotification(message, progress)
+                )
             }
 
             ACTION_COMPLETE -> {
                 notificationManager.notify(
                     NOTIFICATION_ID,
-                    buildNotification("Video render complete", 100, indeterminate = false)
+                    buildNotification(
+                        message = "Video render complete",
+                        progress = 100,
+                        indeterminate = false
+                    )
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
@@ -44,15 +51,23 @@ class VideoRenderService : Service() {
                 val message = intent.getStringExtra(EXTRA_MESSAGE) ?: "Video render failed"
                 notificationManager.notify(
                     NOTIFICATION_ID,
-                    buildNotification(message, 0, indeterminate = false)
+                    buildNotification(
+                        message = message,
+                        progress = 0,
+                        indeterminate = false
+                    )
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
             }
 
             else -> {
-                // Starting the service immediately promotes it to foreground.
-                startAsForeground(buildNotification("Preparing video render…", 0))
+                startAsForeground(
+                    buildNotification(
+                        message = "Preparing video render…",
+                        progress = 0
+                    )
+                )
             }
         }
 
@@ -60,12 +75,11 @@ class VideoRenderService : Service() {
     }
 
     private fun startAsForeground(notification: Notification) {
-        val foregroundType =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            } else {
-                0
-            }
+        val foregroundType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        } else {
+            0
+        }
 
         ServiceCompat.startForeground(
             this,
@@ -79,9 +93,9 @@ class VideoRenderService : Service() {
         message: String,
         progress: Int,
         indeterminate: Boolean = false
-    ): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+    ): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_save)
             .setContentTitle("RS Movie Spot")
             .setContentText(message)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
@@ -90,6 +104,7 @@ class VideoRenderService : Service() {
             .setOnlyAlertOnce(true)
             .setProgress(100, progress, indeterminate)
             .build()
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -121,7 +136,7 @@ class VideoRenderService : Service() {
         fun start(context: Context) {
             val intent = Intent(context, VideoRenderService::class.java)
                 .setAction(ACTION_START)
-            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+            ContextCompat.startForegroundService(context, intent)
         }
 
         fun updateProgress(context: Context, progress: Int, message: String) {
