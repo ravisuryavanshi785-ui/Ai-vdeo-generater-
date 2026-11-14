@@ -5,14 +5,12 @@ import okhttp3.ResponseBody
 import retrofit2.http.Body
 import retrofit2.http.Header
 import retrofit2.http.POST
-import retrofit2.http.Path
 
 interface HuggingFaceApi {
 
-    @POST("models/{model}")
+    @POST("hf-inference/models/stabilityai/stable-diffusion-3-medium-diffusers")
     suspend fun generateImage(
         @Header("Authorization") authorization: String,
-        @Path(value = "model", encoded = true) model: String,
         @Body request: HuggingFaceImageRequest
     ): ResponseBody
 }
