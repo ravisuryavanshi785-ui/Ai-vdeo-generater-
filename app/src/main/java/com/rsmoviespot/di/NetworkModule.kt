@@ -32,17 +32,15 @@ object NetworkModule {
     @Provides
     @Singleton
     fun provideOkHttpClient(): OkHttpClient {
-        // Bootstrap IPs allow the DoH client to reach Cloudflare's DNS endpoint.
         val bootstrapClient = OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .build()
 
-        val cloudflareDns = DnsOverHttps.Builder(
-            bootstrapClient,
-            "https://cloudflare-dns.com/dns-query".toHttpUrl()
-        )
+        val cloudflareDns = DnsOverHttps.Builder()
+            .client(bootstrapClient)
+            .url("https://cloudflare-dns.com/dns-query".toHttpUrl())
             .bootstrapDnsHosts(
                 InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)),
                 InetAddress.getByAddress(byteArrayOf(1, 0, 0, 1))
@@ -95,7 +93,6 @@ object NetworkModule {
         json: Json
     ): EdgeTtsApi =
         Retrofit.Builder()
-            // Isse apne actual Edge TTS adapter ke base URL se replace karein.
             .baseUrl("https://your-edge-tts-adapter.example/")
             .client(client)
             .addConverterFactory(
