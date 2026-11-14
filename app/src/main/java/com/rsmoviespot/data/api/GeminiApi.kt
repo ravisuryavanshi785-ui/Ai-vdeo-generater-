@@ -19,7 +19,6 @@ interface GeminiApi {
 data class GeminiGenerateContentRequest(
     @SerialName("system_instruction")
     val systemInstruction: GeminiContent,
-
     val contents: List<GeminiContent>
 )
 
