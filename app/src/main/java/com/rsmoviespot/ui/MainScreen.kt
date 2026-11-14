@@ -8,9 +8,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -22,7 +23,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -76,7 +76,6 @@ fun MainScreen(
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Video topic") },
                 placeholder = { Text("e.g. Ramayana Box Office") },
-                singleLine = false,
                 minLines = 2,
                 maxLines = 4,
                 enabled = !state.isGenerating,
@@ -127,7 +126,7 @@ fun MainScreen(
                         color = MaterialTheme.colorScheme.onPrimary,
                         strokeWidth = 2.dp
                     )
-                    Spacer(Modifier.padding(horizontal = 6.dp))
+                    Spacer(modifier = Modifier.width(12.dp))
                     Text("Generating…")
                 } else {
                     Text("Generate Video", fontWeight = FontWeight.Bold)
@@ -163,7 +162,7 @@ fun MainScreen(
                         }
 
                         LinearProgressIndicator(
-                            progress = { state.progressPercentage / 100f },
+                            progress = state.progressPercentage / 100f,
                             modifier = Modifier.fillMaxWidth(),
                             color = MaterialTheme.colorScheme.primary,
                             trackColor = MaterialTheme.colorScheme.surface
@@ -184,9 +183,10 @@ fun MainScreen(
                         }
                     )
 
-                    state.generatedVideoUri?.let { uri ->
+                    val videoUri = state.generatedVideoUri
+                    if (videoUri != null) {
                         Text(
-                            text = "Gallery URI: $uri",
+                            text = "Gallery URI: $videoUri",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
