@@ -74,6 +74,6 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // FFmpeg (Corrected Stable Version)
-    implementation("com.arthenica:ffmpeg-kit-full:5.1")
+    // FFmpeg (New Actively Maintained Fork)
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
 }
