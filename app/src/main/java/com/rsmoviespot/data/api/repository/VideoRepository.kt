@@ -10,9 +10,14 @@ import com.rsmoviespot.data.api.GeminiPart
 import com.rsmoviespot.data.api.HuggingFaceApi
 import com.rsmoviespot.data.api.HuggingFaceImageRequest
 import com.rsmoviespot.domain.models.VideoScriptResponse
+import dagger.Binds
+import dagger.Module
+import dagger.hilt.InstallIn
+import dagger.hilt.components.SingletonComponent
 import kotlinx.serialization.json.Json
 import okhttp3.ResponseBody
 import javax.inject.Inject
+import javax.inject.Singleton
 
 interface VideoRepository {
     suspend fun generateScript(topic: String): VideoScriptResponse
@@ -20,6 +25,7 @@ interface VideoRepository {
     suspend fun generateAudioForSlab(text: String): ResponseBody
 }
 
+@Singleton
 class VideoRepositoryImpl @Inject constructor(
     private val geminiApi: GeminiApi,
     private val huggingFaceApi: HuggingFaceApi,
@@ -34,7 +40,6 @@ class VideoRepositoryImpl @Inject constructor(
         require(topic.isNotBlank()) { "Topic must not be blank." }
 
         val systemPrompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
-
         val response = geminiApi.generateContent(
             apiKey = BuildConfig.GEMINI_API_KEY,
             request = GeminiGenerateContentRequest(
@@ -89,8 +94,19 @@ class VideoRepositoryImpl @Inject constructor(
                 "10-second slabs. Output ONLY valid JSON containing a list of slabs with " +
                 "'voiceover_text' and 'image_prompt'. No markdown formatting, no explanations."
 
-        // Replace with the model identifier you have selected and access to.
-        const val HUGGING_FACE_IMAGE_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+        const val HUGGING_FACE_IMAGE_MODEL =
+            "stabilityai/stable-diffusion-xl-base-1.0"
         const val HINDI_VOICE = "hi-IN-MadhurNeural"
     }
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class VideoRepositoryModule {
+
+    @Binds
+    @Singleton
+    abstract fun bindVideoRepository(
+        implementation: VideoRepositoryImpl
+    ): VideoRepository
 }
