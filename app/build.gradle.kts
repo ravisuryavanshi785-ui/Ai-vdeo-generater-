@@ -43,6 +43,8 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        // FIXED: Ignore Experimental Material 3 API Strict Errors globally
+        freeCompilerArgs += listOf("-opt-in=androidx.compose.material3.ExperimentalMaterial3Api")
     }
     buildFeatures {
         compose = true
