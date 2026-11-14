@@ -70,7 +70,7 @@ android {
 }
 
 dependencies {
-    // Core, lifecycle, Compose
+    // Core / Compose
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
@@ -89,13 +89,13 @@ dependencies {
     ksp("com.google.dagger:hilt-compiler:2.51")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Retrofit, OkHttp, and Dns-over-HTTPS
+    // Retrofit / OkHttp / DoH
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
-    // Kotlinx Serialization + Retrofit converter
+    // Kotlinx Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0")
     implementation(
         "com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0"
@@ -104,6 +104,6 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // FFmpegKit-compatible maintained fork
+    // FFmpegKit
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
 }
