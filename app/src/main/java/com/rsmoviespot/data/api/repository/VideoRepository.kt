@@ -16,6 +16,7 @@ import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.serialization.json.Json
 import okhttp3.ResponseBody
+import retrofit2.HttpException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -34,26 +35,33 @@ class VideoRepositoryImpl @Inject constructor(
 
     private val json = Json {
         ignoreUnknownKeys = true
+        isLenient = true
     }
 
     override suspend fun generateScript(topic: String): VideoScriptResponse {
         require(topic.isNotBlank()) { "Topic must not be blank." }
+        require(BuildConfig.GEMINI_API_KEY.isNotBlank()) {
+            "GEMINI_API_KEY is empty. Check your GitHub Actions secret and Gradle BuildConfig setup."
+        }
 
-        val systemPrompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
-        val response = geminiApi.generateContent(
-            apiKey = BuildConfig.GEMINI_API_KEY,
-            request = GeminiGenerateContentRequest(
-                systemInstruction = GeminiContent(
-                    parts = listOf(GeminiPart(text = systemPrompt))
-                ),
-                contents = listOf(
-                    GeminiContent(
-                        role = "user",
-                        parts = listOf(GeminiPart(text = "Generate the script now."))
+        val prompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
+
+        val response = callWithHttpUrl {
+            geminiApi.generateContent(
+                apiKey = BuildConfig.GEMINI_API_KEY,
+                request = GeminiGenerateContentRequest(
+                    systemInstruction = GeminiContent(
+                        parts = listOf(GeminiPart(text = prompt))
+                    ),
+                    contents = listOf(
+                        GeminiContent(
+                            role = "user",
+                            parts = listOf(GeminiPart(text = "Generate the script now."))
+                        )
                     )
                 )
             )
-        )
+        }
 
         val generatedText = response.candidates
             .firstOrNull()
@@ -68,23 +76,53 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateImageForSlab(prompt: String): ResponseBody {
         require(prompt.isNotBlank()) { "Image prompt must not be blank." }
+        require(BuildConfig.HUGGING_FACE_KEY.isNotBlank()) {
+            "HUGGING_FACE_KEY is empty. Check your GitHub Actions secret and Gradle BuildConfig setup."
+        }
 
-        return huggingFaceApi.generateImage(
-            authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
-            model = HUGGING_FACE_IMAGE_MODEL,
-            request = HuggingFaceImageRequest(inputs = prompt)
-        )
+        return callWithHttpUrl {
+            huggingFaceApi.generateImage(
+                authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
+                model = HUGGING_FACE_IMAGE_MODEL,
+                request = HuggingFaceImageRequest(inputs = prompt)
+            )
+        }
     }
 
     override suspend fun generateAudioForSlab(text: String): ResponseBody {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
 
-        return edgeTtsApi.synthesize(
-            EdgeTtsRequest(
-                text = text,
-                voice = HINDI_VOICE
+        return callWithHttpUrl {
+            edgeTtsApi.synthesize(
+                EdgeTtsRequest(
+                    text = text,
+                    voice = HINDI_VOICE
+                )
             )
-        )
+        }
+    }
+
+    private suspend fun <T> callWithHttpUrl(
+        request: suspend () -> T
+    ): T {
+        try {
+            return request()
+        } catch (error: HttpException) {
+            val url = error.response()
+                ?.raw()
+                ?.request
+                ?.url
+                ?.toString()
+                ?: "URL unavailable"
+
+            val message = if (error.code() == 404) {
+                "404 Error at URL: $url"
+            } else {
+                "HTTP ${error.code()} Error at URL: $url"
+            }
+
+            throw IllegalStateException(message, error)
+        }
     }
 
     private companion object {
