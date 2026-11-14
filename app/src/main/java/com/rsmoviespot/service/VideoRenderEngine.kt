@@ -32,13 +32,6 @@ class VideoRenderEngine @Inject constructor(
     private val videoRepository: VideoRepository,
     @ApplicationContext private val context: Context
 ) {
-    /**
-     * Generates and publishes a video.
-     *
-     * Invoke from a foreground service or another lifecycle-managed background
-     * execution context. progress is 0..100 and can be wired to the service's
-     * notification updates.
-     */
     suspend fun render(
         topic: String,
         isShorts: Boolean,
@@ -48,7 +41,11 @@ class VideoRenderEngine @Inject constructor(
 
         val width = if (isShorts) SHORTS_WIDTH else LANDSCAPE_WIDTH
         val height = if (isShorts) SHORTS_HEIGHT else LANDSCAPE_HEIGHT
-        val renderDirectory = File(context.cacheDir, "video-render-${UUID.randomUUID()}")
+        val renderDirectory = File(
+            context.cacheDir,
+            "video-render-${UUID.randomUUID()}"
+        )
+
         if (!renderDirectory.mkdirs()) {
             throw IOException("Could not create render directory.")
         }
@@ -62,25 +59,22 @@ class VideoRenderEngine @Inject constructor(
             val slabCount = script.slabs.size
 
             script.slabs.forEachIndexed { index, slab ->
-                val slabProgress = (index * 85 / slabCount).coerceIn(0, 85)
-                progress(slabProgress, "Generating slab ${index + 1} of $slabCount…")
+                progress(
+                    (index * 85 / slabCount).coerceIn(0, 85),
+                    "Generating slab ${index + 1} of $slabCount…"
+                )
 
                 val imageFile = File(renderDirectory, "slab_${index + 1}.jpg")
                 val audioFile = File(renderDirectory, "slab_${index + 1}.mp3")
                 val segmentFile = File(renderDirectory, "segment_${index + 1}.mp4")
 
-                // Include the requested aspect ratio and dimensions in the prompt.
-                // The exact output dimensions still depend on the HF model/API;
-                // FFmpeg below forces every rendered segment to the selected size.
                 val imagePrompt = buildString {
                     append(slab.image_prompt)
                     append(
                         if (isShorts) {
-                            ", vertical portrait composition, 9:16 aspect ratio, " +
-                                "target image size 1080x1920"
+                            ", vertical portrait composition, 9:16 aspect ratio, target image size 1080x1920"
                         } else {
-                            ", horizontal landscape composition, 16:9 aspect ratio, " +
-                                "target image size 1920x1080"
+                            ", horizontal landscape composition, 16:9 aspect ratio, target image size 1920x1080"
                         }
                     )
                 }
@@ -97,7 +91,15 @@ class VideoRenderEngine @Inject constructor(
                     }
                 }
 
-                runFfmpeg(createSegmentCommand(imageFile, audioFile, segmentFile, width, height))
+                runFfmpeg(
+                    createSegmentCommand(
+                        imageFile = imageFile,
+                        audioFile = audioFile,
+                        outputFile = segmentFile,
+                        width = width,
+                        height = height
+                    )
+                )
                 segmentFiles += segmentFile
             }
 
@@ -134,16 +136,14 @@ class VideoRenderEngine @Inject constructor(
         width: Int,
         height: Int
     ): String {
-        val filter = (
+        val filter =
             "scale=$width:$height:force_original_aspect_ratio=increase," +
                 "crop=$width:$height," +
-                "zoompan=" +
-                "z='min(zoom+0.0005,1.08)':" +
+                "zoompan=z='min(zoom+0.0005,1.08)':" +
                 "x='(iw-iw/zoom)*on/249':" +
                 "y='(ih-ih/zoom)*on/249':" +
                 "d=250:s=${width}x${height}:fps=$FRAME_RATE," +
                 "format=yuv420p"
-            )
 
         return listOf(
             "-y",
@@ -169,16 +169,18 @@ class VideoRenderEngine @Inject constructor(
         ).joinToString(" ")
     }
 
-    private fun createConcatCommand(concatList: File, outputFile: File): String =
-        listOf(
-            "-y",
-            "-f concat",
-            "-safe 0",
-            "-i ${quoteFfmpegPath(concatList)}",
-            "-c copy",
-            "-movflags +faststart",
-            quoteFfmpegPath(outputFile)
-        ).joinToString(" ")
+    private fun createConcatCommand(
+        concatList: File,
+        outputFile: File
+    ): String = listOf(
+        "-y",
+        "-f concat",
+        "-safe 0",
+        "-i ${quoteFfmpegPath(concatList)}",
+        "-c copy",
+        "-movflags +faststart",
+        quoteFfmpegPath(outputFile)
+    ).joinToString(" ")
 
     private suspend fun runFfmpeg(command: String): FFmpegSession =
         suspendCancellableCoroutine { continuation ->
@@ -218,23 +220,15 @@ class VideoRenderEngine @Inject constructor(
                     "${Environment.DIRECTORY_MOVIES}/RSMovieSpot"
                 )
                 put(MediaStore.Video.Media.IS_PENDING, 1)
-            } else {
-                @Suppress("DEPRECATION")
-                put(
-                    MediaStore.Video.Media.DATA,
-                    File(
-                        Environment.getExternalStoragePublicDirectory(
-                            Environment.DIRECTORY_MOVIES
-                        ),
-                        "RSMovieSpot/$displayName"
-                    ).absolutePath
-                )
             }
         }
 
-        val collection = MediaStore.Video.Media.getContentUri(
-            MediaStore.VOLUME_EXTERNAL_PRIMARY
-        )
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+
         val uri = resolver.insert(collection, values)
             ?: throw IOException("Could not create a MediaStore video entry.")
 
@@ -278,7 +272,6 @@ class VideoRenderEngine @Inject constructor(
         const val SHORTS_HEIGHT = 1920
         const val LANDSCAPE_WIDTH = 1920
         const val LANDSCAPE_HEIGHT = 1080
-
         const val FRAME_RATE = 25
         const val SEGMENT_DURATION_SECONDS = 10
     }
