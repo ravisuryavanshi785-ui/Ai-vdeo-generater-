@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlin.plugin.serialization")
     id("com.google.devtools.ksp")
     id("com.google.dagger.hilt.android")
 }
@@ -16,10 +17,14 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField("String", "GEMINI_API_KEY", "\"\"")
+        buildConfigField("String", "HUGGING_FACE_KEY", "\"\"")
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -58,9 +63,15 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
-    // Retrofit: Gemini and Hugging Face API clients
+    // Kotlin serialization
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
+
+    // Retrofit, OkHttp, and Kotlinx Serialization converter
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
-    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation(
+        "com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0"
+    )
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // Room
@@ -73,11 +84,10 @@ dependencies {
     ksp("com.google.dagger:hilt-compiler:2.56.2")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Notifications and foreground service compatibility
+    // Notifications / foreground service
     implementation("androidx.core:core-ktx:1.16.0")
 
-    // FFmpegKit-compatible maintained community fork.
-    // The original com.arthenica artifacts were retired; see status notes below.
+    // FFmpegKit-compatible maintained community fork
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.9")
 
     // Tests
