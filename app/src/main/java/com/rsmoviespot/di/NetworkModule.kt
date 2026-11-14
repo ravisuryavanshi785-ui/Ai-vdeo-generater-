@@ -9,10 +9,12 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
+import okhttp3.dnsoverhttps.DnsOverHttps
 import retrofit2.Retrofit
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
 
@@ -30,15 +32,29 @@ object NetworkModule {
     @Provides
     @Singleton
     fun provideOkHttpClient(): OkHttpClient {
-        val loggingInterceptor = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
-        }
-
-        return OkHttpClient.Builder()
+        // Bootstrap IPs allow the DoH client to reach Cloudflare's DNS endpoint.
+        val bootstrapClient = OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
-            .addInterceptor(loggingInterceptor)
+            .build()
+
+        val cloudflareDns = DnsOverHttps.Builder(
+            bootstrapClient,
+            "https://cloudflare-dns.com/dns-query".toHttpUrl()
+        )
+            .bootstrapDnsHosts(
+                InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)),
+                InetAddress.getByAddress(byteArrayOf(1, 0, 0, 1))
+            )
+            .includeIPv6(true)
+            .build()
+
+        return OkHttpClient.Builder()
+            .dns(cloudflareDns)
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .build()
     }
 
@@ -79,7 +95,7 @@ object NetworkModule {
         json: Json
     ): EdgeTtsApi =
         Retrofit.Builder()
-            // Replace with the base URL of your Edge TTS REST adapter.
+            // Isse apne actual Edge TTS adapter ke base URL se replace karein.
             .baseUrl("https://your-edge-tts-adapter.example/")
             .client(client)
             .addConverterFactory(
