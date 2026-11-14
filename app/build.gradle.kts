@@ -21,11 +21,16 @@ android {
             useSupportLibrary = true
         }
 
-        // YAHAN SECRETS INJECT HO RAHE HAIN
-        val geminiKey = System.getenv("GEMINI_API_KEY") ?: ""
-        val hfKey = System.getenv("HUGGING_FACE_KEY") ?: ""
+        // GitHub Actions environment variables are passed to Gradle at build time.
+        val geminiKey = (System.getenv("GEMINI_API_KEY") ?: "")
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+        val huggingFaceKey = (System.getenv("HUGGING_FACE_KEY") ?: "")
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
-        buildConfigField("String", "HUGGING_FACE_KEY", "\"$hfKey\"")
+        buildConfigField("String", "HUGGING_FACE_KEY", "\"$huggingFaceKey\"")
     }
 
     buildTypes {
@@ -37,22 +42,27 @@ android {
             )
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
     kotlinOptions {
         jvmTarget = "17"
-        // FIXED: Ignore Experimental Material 3 API Strict Errors globally
-        freeCompilerArgs += listOf("-opt-in=androidx.compose.material3.ExperimentalMaterial3Api")
+        freeCompilerArgs +=
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
     }
+
     buildFeatures {
         compose = true
         buildConfig = true
     }
+
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.1"
     }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -61,30 +71,40 @@ android {
 }
 
 dependencies {
-    // Core & Compose
+    // Core, lifecycle, and Compose
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.activity:activity-compose:1.8.2")
-    implementation(platform("androidx.compose:compose-bom:2023.08.00"))
+
+    val composeBom = platform("androidx.compose:compose-bom:2023.08.00")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
+
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    debugImplementation("androidx.compose.ui:ui-tooling")
 
     // Hilt
     implementation("com.google.dagger:hilt-android:2.51")
-    ksp("com.google.dagger:hilt-android-compiler:2.51")
+    ksp("com.google.dagger:hilt-compiler:2.51")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Retrofit & Networking
+    // Retrofit, OkHttp, and Kotlinx Serialization
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
-    implementation("com.squareup.retrofit2:converter-gson:2.9.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0")
-    
+    implementation(
+        "com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0"
+    )
+
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // FFmpeg 
+    // FFmpegKit-compatible maintained fork
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
 }
