@@ -12,7 +12,9 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import dagger.hilt.android.AndroidEntryPoint
 
+@AndroidEntryPoint
 class VideoRenderService : Service() {
 
     private val notificationManager: NotificationManager
@@ -37,11 +39,7 @@ class VideoRenderService : Service() {
             ACTION_COMPLETE -> {
                 notificationManager.notify(
                     NOTIFICATION_ID,
-                    buildNotification(
-                        message = "Video render complete",
-                        progress = 100,
-                        indeterminate = false
-                    )
+                    buildNotification("Video render complete", 100)
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
@@ -51,24 +49,15 @@ class VideoRenderService : Service() {
                 val message = intent.getStringExtra(EXTRA_MESSAGE) ?: "Video render failed"
                 notificationManager.notify(
                     NOTIFICATION_ID,
-                    buildNotification(
-                        message = message,
-                        progress = 0,
-                        indeterminate = false
-                    )
+                    buildNotification(message, 0)
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
             }
 
-            else -> {
-                startAsForeground(
-                    buildNotification(
-                        message = "Preparing video render…",
-                        progress = 0
-                    )
-                )
-            }
+            else -> startAsForeground(
+                buildNotification("Preparing video render…", 0)
+            )
         }
 
         return START_NOT_STICKY
@@ -89,12 +78,8 @@ class VideoRenderService : Service() {
         )
     }
 
-    private fun buildNotification(
-        message: String,
-        progress: Int,
-        indeterminate: Boolean = false
-    ): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun buildNotification(message: String, progress: Int): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_save)
             .setContentTitle("RS Movie Spot")
             .setContentText(message)
@@ -102,9 +87,8 @@ class VideoRenderService : Service() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(progress < 100)
             .setOnlyAlertOnce(true)
-            .setProgress(100, progress, indeterminate)
+            .setProgress(100, progress, false)
             .build()
-    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
