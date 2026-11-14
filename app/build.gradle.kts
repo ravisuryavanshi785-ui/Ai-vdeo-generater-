@@ -20,6 +20,12 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        // YAHAN SECRETS INJECT HO RAHE HAIN
+        val geminiKey = System.getenv("GEMINI_API_KEY") ?: ""
+        val hfKey = System.getenv("HUGGING_FACE_KEY") ?: ""
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+        buildConfigField("String", "HUGGING_FACE_KEY", "\"$hfKey\"")
     }
 
     buildTypes {
@@ -40,7 +46,7 @@ android {
     }
     buildFeatures {
         compose = true
-        buildConfig = true // FIXED: Enabled for API Keys
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.1"
@@ -56,7 +62,7 @@ dependencies {
     // Core & Compose
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0") // FIXED: For collectAsState
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
     implementation("androidx.activity:activity-compose:1.8.2")
     implementation(platform("androidx.compose:compose-bom:2023.08.00"))
     implementation("androidx.compose.ui:ui")
@@ -72,7 +78,7 @@ dependencies {
     // Retrofit & Networking
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0") // FIXED: For @Serializable
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0")
     
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
