@@ -17,28 +17,33 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        buildConfigField("String", "GEMINI_API_KEY", "\"\"")
-        buildConfigField("String", "HUGGING_FACE_KEY", "\"\"")
+        vectorDrawables {
+            useSupportLibrary = true
+        }
     }
 
-    buildFeatures {
-        buildConfig = true
-        compose = true
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
     }
-
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.15"
-    }
-
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-
     kotlinOptions {
         jvmTarget = "17"
     }
-
+    buildFeatures {
+        compose = true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.1"
+    }
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -47,26 +52,28 @@ android {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2025.08.00")
-    implementation(composeBom)
-    androidTestImplementation(composeBom)
-
-    implementation("androidx.activity:activity-compose:1.10.1")
+    // Core & Compose
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+    implementation("androidx.activity:activity-compose:1.8.2")
+    implementation(platform("androidx.compose:compose-bom:2023.08.00"))
     implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
-    debugImplementation("androidx.compose.ui:ui-tooling")
 
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    // Hilt
+    implementation("com.google.dagger:hilt-android:2.51")
+    ksp("com.google.dagger:hilt-android-compiler:2.51")
+    implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    implementation("com.squareup.retrofit2:retrofit:2.11.0")
-    implementation("com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
+    // Retrofit & Networking
+    implementation("com.squareup.retrofit2:retrofit:2.9.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.9.0")
+    
+    // Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    implementation("com.google.dagger:hilt-android:2.56.2")
-    ksp("com.google.dagger:hilt-compiler:2.56.2")
-
-    implementation("com.arthenica:ffmpeg-kit-full:6.0-2")
+    // FFmpeg (Corrected Stable Version)
+    implementation("com.arthenica:ffmpeg-kit-full:5.1")
 }
