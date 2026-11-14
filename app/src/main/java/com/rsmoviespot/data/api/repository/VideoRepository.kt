@@ -13,6 +13,7 @@ import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
 import dagger.Binds
 import dagger.Module
+import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.serialization.SerialName
@@ -21,6 +22,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import okhttp3.ResponseBody
 import retrofit2.HttpException
 import javax.inject.Inject
@@ -47,7 +49,7 @@ class VideoRepositoryImpl @Inject constructor(
     override suspend fun generateScript(topic: String): VideoScriptResponse {
         require(topic.isNotBlank()) { "Topic must not be blank." }
         require(BuildConfig.GEMINI_API_KEY.isNotBlank()) {
-            "GEMINI_API_KEY is empty. Check your GitHub Actions secret / local config."
+            "GEMINI_API_KEY is empty. Check your API-key configuration."
         }
 
         val prompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
@@ -62,7 +64,9 @@ class VideoRepositoryImpl @Inject constructor(
                     contents = listOf(
                         GeminiContent(
                             role = "user",
-                            parts = listOf(GeminiPart(text = "Generate the script now."))
+                            parts = listOf(
+                                GeminiPart(text = "Generate the script now.")
+                            )
                         )
                     )
                 )
@@ -90,19 +94,21 @@ class VideoRepositoryImpl @Inject constructor(
 
         val root = json.parseToJsonElement(cleaned)
 
-        val slabsJson: List<JsonElement> = when (root) {
+        val slabElements: List<JsonElement> = when (root) {
             is JsonArray -> root
             is JsonObject -> {
-                val arr = root["slabs"] ?: root["scenes"]
-                    ?: error("Expected JSON object with 'slabs' or 'scenes' array.")
-                arr as? JsonArray
-                    ?: error("'slabs'/'scenes' must be a JSON array.")
+                val array = root["slabs"] ?: root["scenes"]
+                    ?: error("Expected a 'slabs' or 'scenes' JSON array.")
+
+                array as? JsonArray
+                    ?: error("'slabs' or 'scenes' must be a JSON array.")
             }
-            else -> error("Response must be a JSON array or object containing slabs.")
+            else -> error("Gemini response must be a JSON array or object.")
         }
 
-        val slabs = slabsJson.mapIndexed { index, element ->
+        val slabs = slabElements.mapIndexed { index, element ->
             val dto = json.decodeFromJsonElement<GeneratedSlabDto>(element)
+
             VideoSlab(
                 id = dto.id ?: index + 1,
                 voiceover_text = dto.voiceoverText,
@@ -152,13 +158,10 @@ class VideoRepositoryImpl @Inject constructor(
                 ?.toString()
                 ?: "URL unavailable"
 
-            val message = if (error.code() == 404) {
-                "404 Error at URL: $url"
-            } else {
-                "HTTP ${error.code()} Error at URL: $url"
-            }
-
-            throw IllegalStateException(message, error)
+            throw IllegalStateException(
+                "HTTP ${error.code()} Error at URL: $url",
+                error
+            )
         }
     }
 
@@ -175,16 +178,16 @@ class VideoRepositoryImpl @Inject constructor(
         const val HINDI_VOICE = "hi-IN-MadhurNeural"
 
         const val SYSTEM_PROMPT_TEMPLATE =
-            "You are a YouTube Shorts scriptwriter for the channel 'RS Movie Spot'. " +
-                "The topic is {topic}. Create a highly engaging script divided exactly into " +
-                "10-second slabs. Output ONLY valid JSON as an array of objects with " +
-                "'voiceover_text' and 'image_prompt'. No markdown."
+            "You are a YouTube Shorts scriptwriter for RS Movie Spot. " +
+                "The topic is {topic}. Return only a valid JSON array of objects " +
+                "with 'voiceover_text' and 'image_prompt' fields."
     }
 }
 
 @Module
 @InstallIn(SingletonComponent::class)
 abstract class VideoRepositoryModule {
+
     @Binds
     @Singleton
     abstract fun bindVideoRepository(
