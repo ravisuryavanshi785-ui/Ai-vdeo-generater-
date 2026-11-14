@@ -44,32 +44,47 @@ object NetworkModule {
 
     @Provides
     @Singleton
-    fun provideGeminiApi(client: OkHttpClient, json: Json): GeminiApi =
+    fun provideGeminiApi(
+        client: OkHttpClient,
+        json: Json
+    ): GeminiApi =
         Retrofit.Builder()
             .baseUrl("https://generativelanguage.googleapis.com/")
             .client(client)
-            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+            .addConverterFactory(
+                json.asConverterFactory("application/json".toMediaType())
+            )
             .build()
             .create(GeminiApi::class.java)
 
     @Provides
     @Singleton
-    fun provideHuggingFaceApi(client: OkHttpClient, json: Json): HuggingFaceApi =
+    fun provideHuggingFaceApi(
+        client: OkHttpClient,
+        json: Json
+    ): HuggingFaceApi =
         Retrofit.Builder()
             .baseUrl("https://api-inference.huggingface.co/")
             .client(client)
-            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+            .addConverterFactory(
+                json.asConverterFactory("application/json".toMediaType())
+            )
             .build()
             .create(HuggingFaceApi::class.java)
 
     @Provides
     @Singleton
-    fun provideEdgeTtsApi(client: OkHttpClient, json: Json): EdgeTtsApi =
+    fun provideEdgeTtsApi(
+        client: OkHttpClient,
+        json: Json
+    ): EdgeTtsApi =
         Retrofit.Builder()
-            // Replace this with your actual Edge TTS adapter base URL.
+            // Replace with the base URL of your Edge TTS REST adapter.
             .baseUrl("https://your-edge-tts-adapter.example/")
             .client(client)
-            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+            .addConverterFactory(
+                json.asConverterFactory("application/json".toMediaType())
+            )
             .build()
             .create(EdgeTtsApi::class.java)
 }
