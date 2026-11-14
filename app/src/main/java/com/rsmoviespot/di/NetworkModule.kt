@@ -19,12 +19,12 @@ import javax.inject.Singleton
 @InstallIn(SingletonComponent::class)
 object NetworkModule {
 
-    private val json = Json {
+    @Provides
+    @Singleton
+    fun provideJson(): Json = Json {
         ignoreUnknownKeys = true
         isLenient = true
     }
-
-    private val jsonMediaType = "application/json".toMediaType()
 
     @Provides
     @Singleton
@@ -40,32 +40,41 @@ object NetworkModule {
 
     @Provides
     @Singleton
-    fun provideGeminiApi(client: OkHttpClient): GeminiApi =
+    fun provideGeminiApi(
+        client: OkHttpClient,
+        json: Json
+    ): GeminiApi =
         Retrofit.Builder()
             .baseUrl("https://generativelanguage.googleapis.com/")
             .client(client)
-            .addConverterFactory(json.asConverterFactory(jsonMediaType))
+            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
             .create(GeminiApi::class.java)
 
     @Provides
     @Singleton
-    fun provideHuggingFaceApi(client: OkHttpClient): HuggingFaceApi =
+    fun provideHuggingFaceApi(
+        client: OkHttpClient,
+        json: Json
+    ): HuggingFaceApi =
         Retrofit.Builder()
             .baseUrl("https://api-inference.huggingface.co/")
             .client(client)
-            .addConverterFactory(json.asConverterFactory(jsonMediaType))
+            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
             .create(HuggingFaceApi::class.java)
 
     @Provides
     @Singleton
-    fun provideEdgeTtsApi(client: OkHttpClient): EdgeTtsApi =
+    fun provideEdgeTtsApi(
+        client: OkHttpClient,
+        json: Json
+    ): EdgeTtsApi =
         Retrofit.Builder()
-            // Is URL ko apne actual Edge TTS REST adapter ke URL se replace karein.
+            // Is URL ko apne actual Edge TTS adapter ke URL se replace karein.
             .baseUrl("https://your-edge-tts-adapter.example/")
             .client(client)
-            .addConverterFactory(json.asConverterFactory(jsonMediaType))
+            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
             .create(EdgeTtsApi::class.java)
 }
