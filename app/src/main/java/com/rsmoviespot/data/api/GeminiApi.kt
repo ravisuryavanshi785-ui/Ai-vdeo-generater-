@@ -3,14 +3,14 @@ package com.rsmoviespot.data.api
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import retrofit2.http.Body
-import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.Query
 
 interface GeminiApi {
 
     @POST("v1beta/models/gemini-1.5-flash:generateContent")
     suspend fun generateContent(
-        @Header("x-goog-api-key") apiKey: String,
+        @Query("key") apiKey: String,
         @Body request: GeminiGenerateContentRequest
     ): GeminiGenerateContentResponse
 }
@@ -18,7 +18,7 @@ interface GeminiApi {
 @Serializable
 data class GeminiGenerateContentRequest(
     @SerialName("system_instruction")
-    val systemInstruction: GeminiContent,
+    val systemInstruction: GeminiContent? = null,
     val contents: List<GeminiContent>
 )
 
