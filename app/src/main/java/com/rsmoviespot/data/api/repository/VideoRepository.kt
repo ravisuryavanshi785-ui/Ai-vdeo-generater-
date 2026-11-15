@@ -57,7 +57,6 @@ class VideoRepositoryImpl @Inject constructor(
                 groqApi.generateContent(
                     authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                     request = GroqChatRequest(
-                        // YAHAN FIX KIYA HAI: Universal aur 100% active free tier model daal diya
                         model = "openai/gpt-oss-20b", 
                         messages = listOf(
                             GroqMessage(
@@ -98,7 +97,7 @@ class VideoRepositoryImpl @Inject constructor(
         return callWithHttpUrl {
             huggingFaceApi.generateImage(
                 authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
-                model = "stabilityai/stable-diffusion-2-1",
+                model = "black-forest-labs/FLUX.1-schnell",
                 request = HuggingFaceImageRequest(
                     inputs = prompt
                 )
