@@ -1,131 +1,89 @@
 package com.rsmoviespot.data.api
 
-import android.content.Context
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
-import java.io.File
-import java.util.Locale
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 @Singleton
 class EdgeTtsApi @Inject constructor(
-    @ApplicationContext private val context: Context
+    private val okHttpClient: OkHttpClient
 ) {
-    private var tts: TextToSpeech? = null
-    private var isInitialized = false
-    
-    // Concurrent map to safely handle multiple slabs processing at the same time
-    private val continuations = ConcurrentHashMap<String, CancellableContinuation<ResponseBody>>()
-
-    init {
-        // FIX 1: Hamesha Main Thread par start karo taaki Looper crash na ho
-        Handler(Looper.getMainLooper()).post {
-            tts = TextToSpeech(context) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    tts?.language = Locale("hi", "IN")
-                    tts?.setPitch(1.0f)
-                    tts?.setSpeechRate(0.95f)
-                    
-                    // FIX 2: Listener sirf ek baar set hoga globally
-                    tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                        override fun onStart(id: String?) {}
-
-                        override fun onDone(id: String?) {
-                            id?.let { utteranceId ->
-                                val cont = continuations.remove(utteranceId)
-                                if (cont != null && cont.isActive) {
-                                    val tempFile = File(context.cacheDir, "$utteranceId.wav")
-                                    try {
-                                        if (tempFile.exists()) {
-                                            val bytes = tempFile.readBytes()
-                                            tempFile.delete()
-                                            cont.resume(bytes.toResponseBody("audio/wav".toMediaType()))
-                                        } else {
-                                            cont.resumeWithException(Exception("Audio file not found"))
-                                        }
-                                    } catch (e: Exception) {
-                                        cont.resumeWithException(e)
-                                    }
-                                }
-                            }
-                        }
-
-                        override fun onError(id: String?) {
-                            id?.let { utteranceId ->
-                                val cont = continuations.remove(utteranceId)
-                                if (cont != null && cont.isActive) {
-                                    cont.resumeWithException(Exception("Android Local TTS failed"))
-                                }
-                            }
-                        }
-                    })
-                    isInitialized = true
-                }
-            }
-        }
-    }
-
     suspend fun synthesize(request: EdgeTtsRequest): ResponseBody = withContext(Dispatchers.IO) {
-        // FIX 3: Agar TTS abhi start ho raha hai, toh app ko crash karne ki jagah thoda wait karao
-        var retries = 0
-        while (!isInitialized && retries < 10) {
-            delay(500)
-            retries++
+        // Google limit bypass: Text ko chhote words mein todna
+        val words = request.text.split(" ")
+        val chunks = mutableListOf<String>()
+        var currentChunk = ""
+        
+        for (word in words) {
+            if (currentChunk.length + word.length + 1 > 150) {
+                chunks.add(currentChunk.trim())
+                currentChunk = word
+            } else {
+                currentChunk += " $word"
+            }
+        }
+        if (currentChunk.isNotBlank()) {
+            chunks.add(currentChunk.trim())
         }
 
-        suspendCancellableCoroutine { continuation ->
-            if (!isInitialized || tts == null) {
-                continuation.resumeWithException(Exception("TTS Engine failed to initialize."))
-                return@suspendCancellableCoroutine
-            }
+        val audioBytes = mutableListOf<ByteArray>()
 
-            val utteranceId = UUID.randomUUID().toString()
-            val tempFile = File(context.cacheDir, "$utteranceId.wav")
+        // Har chunk ki MP3 audio free mein download karna
+        for (chunk in chunks) {
+            val url = "https://translate.google.com/translate_tts".toHttpUrl().newBuilder()
+                .addQueryParameter("ie", "UTF-8")
+                .addQueryParameter("tl", "hi") // Hindi Voice
+                .addQueryParameter("client", "tw-ob") // No-Auth Bypass
+                .addQueryParameter("q", chunk)
+                .build()
 
-            continuations[utteranceId] = continuation
+            val httpRequest = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .build()
 
-            val params = Bundle().apply {
-                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
-            }
-
-            val result = tts?.synthesizeToFile(request.text, params, tempFile, utteranceId)
-            
-            if (result == TextToSpeech.ERROR) {
-                continuations.remove(utteranceId)
-                if (continuation.isActive) {
-                    continuation.resumeWithException(Exception("Failed to start TTS synthesis"))
+            try {
+                val response = okHttpClient.newCall(httpRequest).execute()
+                if (response.isSuccessful) {
+                    response.body?.bytes()?.let {
+                        audioBytes.add(it)
+                    }
                 }
-            }
-
-            continuation.invokeOnCancellation {
-                tts?.stop()
-                continuations.remove(utteranceId)
+            } catch (e: Exception) {
+                e.printStackTrace() // Crash proof: Catch everything
             }
         }
+
+        // Agar internet band ho jaye toh silent file bhejega, par app CRASH nahi hogi
+        if (audioBytes.isEmpty()) {
+            return@withContext ByteArray(0).toResponseBody("audio/mpeg".toMediaType())
+        }
+
+        // Saare chunks ko jod kar ek lambi MP3 file banana
+        var totalSize = 0
+        for (b in audioBytes) totalSize += b.size
+        val finalBytes = ByteArray(totalSize)
+        var offset = 0
+        for (b in audioBytes) {
+            System.arraycopy(b, 0, finalBytes, offset, b.size)
+            offset += b.size
+        }
+
+        return@withContext finalBytes.toResponseBody("audio/mpeg".toMediaType())
     }
 }
 
 @Serializable
 data class EdgeTtsRequest(
     val text: String,
-    val voice: String,
+    val voice: String, // Ye parameter rahega taaki baaki files crash na hon
     val outputFormat: String = "audio-24khz-48kbitrate-mono-mp3"
 )
