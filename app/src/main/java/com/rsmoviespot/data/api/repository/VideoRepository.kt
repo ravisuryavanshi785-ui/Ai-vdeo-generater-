@@ -3,7 +3,6 @@ package com.rsmoviespot.data.repository
 import com.rsmoviespot.BuildConfig
 import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.EdgeTtsRequest
-// Yahan update hai: Gemini hat gaya, Groq aa gaya
 import com.rsmoviespot.data.api.GroqApi
 import com.rsmoviespot.data.api.GroqChatRequest
 import com.rsmoviespot.data.api.GroqMessage
@@ -35,7 +34,6 @@ interface VideoRepository {
 
 @Singleton
 class VideoRepositoryImpl @Inject constructor(
-    // Yahan GroqApi ko inject kiya
     private val groqApi: GroqApi,
     private val huggingFaceApi: HuggingFaceApi,
     private val edgeTtsApi: EdgeTtsApi
@@ -48,7 +46,6 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateScript(topic: String): VideoScriptResponse {
         require(topic.isNotBlank()) { "Topic must not be blank." }
-        // Groq ki key check kar rahe hain
         require(BuildConfig.GROQ_API_KEY.isNotBlank()) {
             "GROQ_API_KEY is empty."
         }
@@ -57,11 +54,10 @@ class VideoRepositoryImpl @Inject constructor(
 
         return try {
             val response = callWithHttpUrl {
-                // Groq API call
                 groqApi.generateContent(
                     authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                     request = GroqChatRequest(
-                        model = "llama-3.3-70b-versatile", // YAHAN FIX KIYA HAI: Model property pass karni zaroori hai
+                        model = "llama3-70b-8192", // YAHAN FIX KIYA HAI: Galat model name hata kar 100% active Llama 3 model daal diya
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
@@ -76,7 +72,6 @@ class VideoRepositoryImpl @Inject constructor(
                 )
             }
 
-            // Groq ka response parse karna
             val generatedText = response.choices
                 .firstOrNull()
                 ?.message
