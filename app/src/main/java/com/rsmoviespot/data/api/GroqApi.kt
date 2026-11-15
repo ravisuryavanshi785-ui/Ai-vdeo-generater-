@@ -8,10 +8,8 @@ import retrofit2.http.POST
 
 interface GroqApi {
 
-    // Groq ka endpoint bohot simple hota hai
     @POST("chat/completions")
     suspend fun generateContent(
-        // Gemini mein @Query tha, Groq mein @Header lagta hai (Bearer token ke liye)
         @Header("Authorization") authHeader: String,
         @Body request: GroqChatRequest
     ): GroqChatResponse
@@ -19,8 +17,8 @@ interface GroqApi {
 
 @Serializable
 data class GroqChatRequest(
-    // Default model set kar diya hai, taaki baar-baar pass na karna pade
-    val model: String = "llama-3.3-70b-versatile",
+    // YAHAN FIX KIYA HAI: '=' aur aage ki string hata di hai taaki Kotlin isey JSON se delete na kare
+    val model: String, 
     val messages: List<GroqMessage>,
     val temperature: Double = 0.7
 )
