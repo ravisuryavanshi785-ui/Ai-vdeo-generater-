@@ -8,6 +8,7 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.serialization.json.Json
+import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -32,9 +33,9 @@ object NetworkModule {
     @Singleton
     fun provideOkHttpClient(): OkHttpClient {
         val bootstrapClient = OkHttpClient.Builder()
-            .connectTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
             .build()
 
         val cloudflareDns = DnsOverHttps.Builder()
@@ -44,14 +45,23 @@ object NetworkModule {
                 InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)),
                 InetAddress.getByAddress(byteArrayOf(1, 0, 0, 1))
             )
-            .includeIPv6(true)
+            .includeIPv6(false)
             .build()
 
+        val resilientDns = Dns { hostname ->
+            try {
+                cloudflareDns.lookup(hostname)
+            } catch (_: Exception) {
+                Dns.SYSTEM.lookup(hostname)
+            }
+        }
+
         return OkHttpClient.Builder()
-            .dns(cloudflareDns)
+            .dns(resilientDns)
             .connectTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
     }
 
