@@ -9,7 +9,7 @@ import retrofit2.http.Path
 
 interface HuggingFaceApi {
 
-    @POST("models/{model}")
+    @POST("hf-inference/models/{model}")
     suspend fun generateImage(
         @Header("Authorization") authorization: String,
         @Path(value = "model", encoded = true) model: String,
