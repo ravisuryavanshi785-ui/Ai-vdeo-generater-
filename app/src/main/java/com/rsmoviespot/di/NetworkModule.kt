@@ -78,7 +78,8 @@ object NetworkModule {
         json: Json
     ): HuggingFaceApi =
         Retrofit.Builder()
-            .baseUrl("https://api.endpoints.huggingface.cloud/")
+            // YAHAN FIX KIYA HAI: Free Inference API ka correct Base URL
+            .baseUrl("https://api-inference.huggingface.co/")
             .client(client)
             .addConverterFactory(
                 json.asConverterFactory("application/json".toMediaType())
