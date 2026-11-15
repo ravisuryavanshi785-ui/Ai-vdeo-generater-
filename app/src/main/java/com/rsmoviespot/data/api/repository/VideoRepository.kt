@@ -60,9 +60,9 @@ class VideoRepositoryImpl @Inject constructor(
         }
 
         val formatInstruction = if (isShorts) {
-            "YouTube Shorts (vertical 9:16, 4 to 6 punchy scenes, hook in scene 1)"
+            "YouTube Shorts (vertical 9:16, 7 to 9 fast-paced scenes, 10-14 words per scene, hook in scene 1)"
         } else {
-            "YouTube landscape video (16:9, 6 to 8 engaging storytelling scenes)"
+            "YouTube landscape video (16:9, 8 to 12 engaging scenes, 12-18 words per scene)"
         }
 
         val systemPrompt = SYSTEM_PROMPT_TEMPLATE
@@ -84,7 +84,7 @@ class VideoRepositoryImpl @Inject constructor(
                             content = "Create the JSON script for topic: ${topic.trim()}"
                         )
                     ),
-                    temperature = 0.7
+                    temperature = 0.75
                 )
             )
         }
@@ -184,7 +184,8 @@ class VideoRepositoryImpl @Inject constructor(
                     id = dto.id ?: index + 1,
                     voiceover_text = voiceover,
                     image_prompt = prompt,
-                    sfx_cue = sfxCue
+                    sfx_cue = sfxCue,
+                    has_character = dto.hasCharacter ?: true
                 )
             }
         }
@@ -256,7 +257,9 @@ class VideoRepositoryImpl @Inject constructor(
         @SerialName("image_prompt")
         val imagePrompt: String,
         @SerialName("sfx_cue")
-        val sfxCue: String? = null
+        val sfxCue: String? = null,
+        @SerialName("has_character")
+        val hasCharacter: Boolean? = null
     )
 
     private companion object {
@@ -267,19 +270,20 @@ class VideoRepositoryImpl @Inject constructor(
         const val LANDSCAPE_IMAGE_WIDTH = 1344
         const val LANDSCAPE_IMAGE_HEIGHT = 768
         const val DEFAULT_NEGATIVE_PROMPT =
-            "text, watermark, signature, logo, blurry, low quality, distorted, deformed, inconsistent outfit, different character, collage, split screen"
+            "text, watermark, signature, logo, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers, collage, split screen"
 
         const val SYSTEM_PROMPT_TEMPLATE =
             "You are a professional Hindi video scriptwriter and visual director for RS Movie Spot. " +
                 "Create a script for a {format} on the topic \"{topic}\". " +
-                "Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure: " +
+                "Return ONLY a valid JSON object (no markdown, no explanation) with this structure: " +
                 "{" +
-                "\"character_bible\": \"Strict unchanging physical description of the main character in English (exact age, face, hair/beard, exact outfit/armor material and colors, exact single weapon/prop if any) so every scene draws the SAME person\", " +
-                "\"visual_style\": \"One unified cinematic art style, color palette, and lighting description used in every scene\", " +
+                "\"character_bible\": \"Short fixed description of the main character if the story has one (face, exact outfit/armor colors, single prop)\", " +
+                "\"visual_style\": \"Unified cinematic art style and lighting across scenes\", " +
                 "\"bgm_mood\": \"One of: epic_dark, devotional, suspense, sci_fi, emotional\", " +
                 "\"slabs\": [" +
-                "{\"voiceover_text\": \"Natural engaging spoken Hindi in clean Devanagari script; transliterate modern English terms accurately like बॉक्स ऑफिस, कलेक्शन, ट्रेलर; 1-2 crisp sentences per scene\", " +
-                "\"image_prompt\": \"Describe ONLY the scene action, pose, camera framing, and environment in English (do NOT change the character's outfit, armor color, helmet, or weapon defined in character_bible; use 'Lord Rama' instead of 'Ram')\", " +
+                "{\"voiceover_text\": \"1 short punchy Hindi sentence (10-14 words max) in Devanagari; spell करोड़ properly, transliterate English words like बॉक्स ऑफिस, कलेक्शन\", " +
+                "\"has_character\": true_or_false, " +
+                "\"image_prompt\": \"Rich visual scene in English. IMPORTANT: Do NOT repeat the same standing portrait! Vary shots wildly: crowded cinema theatre, wide battlefield, intense close-up, aerial landscape, golden coins/trophy, dramatic silhouette. Set has_character=false when showing environments/crowds/objects, and has_character=true ONLY when the main character appears in a distinct action pose or angle. Use 'Lord Rama' instead of 'Ram'.\", " +
                 "\"sfx_cue\": \"One of: boom, thunder, sword, fire, whoosh\"}" +
                 "]}"
     }
