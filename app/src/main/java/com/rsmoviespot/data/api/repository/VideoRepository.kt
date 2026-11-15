@@ -3,10 +3,10 @@ package com.rsmoviespot.data.repository
 import com.rsmoviespot.BuildConfig
 import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.EdgeTtsRequest
-import com.rsmoviespot.data.api.GeminiApi
-import com.rsmoviespot.data.api.GeminiContent
-import com.rsmoviespot.data.api.GeminiGenerateContentRequest
-import com.rsmoviespot.data.api.GeminiPart
+// Yahan update hai: Gemini hat gaya, Groq aa gaya
+import com.rsmoviespot.data.api.GroqApi
+import com.rsmoviespot.data.api.GroqChatRequest
+import com.rsmoviespot.data.api.GroqMessage
 import com.rsmoviespot.data.api.HuggingFaceApi
 import com.rsmoviespot.data.api.HuggingFaceImageRequest
 import com.rsmoviespot.domain.models.VideoScriptResponse
@@ -35,7 +35,8 @@ interface VideoRepository {
 
 @Singleton
 class VideoRepositoryImpl @Inject constructor(
-    private val geminiApi: GeminiApi,
+    // Yahan GroqApi ko inject kiya
+    private val groqApi: GroqApi,
     private val huggingFaceApi: HuggingFaceApi,
     private val edgeTtsApi: EdgeTtsApi
 ) : VideoRepository {
@@ -47,43 +48,45 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateScript(topic: String): VideoScriptResponse {
         require(topic.isNotBlank()) { "Topic must not be blank." }
-        require(BuildConfig.GEMINI_API_KEY.isNotBlank()) {
-            "GEMINI_API_KEY is empty."
+        // Groq ki key check kar rahe hain
+        require(BuildConfig.GROQ_API_KEY.isNotBlank()) {
+            "GROQ_API_KEY is empty."
         }
 
         val prompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
 
         return try {
             val response = callWithHttpUrl {
-                geminiApi.generateContent(
-                    apiKey = BuildConfig.GEMINI_API_KEY,
-                    request = GeminiGenerateContentRequest(
-                        systemInstruction = GeminiContent(
-                            parts = listOf(GeminiPart(text = prompt))
-                        ),
-                        contents = listOf(
-                            GeminiContent(
+                // Groq API call
+                groqApi.generateContent(
+                    authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
+                    request = GroqChatRequest(
+                        messages = listOf(
+                            GroqMessage(
+                                role = "system",
+                                content = prompt
+                            ),
+                            GroqMessage(
                                 role = "user",
-                                parts = listOf(GeminiPart(text = "Generate the script now."))
+                                content = "Generate the script now."
                             )
                         )
                     )
                 )
             }
 
-            val generatedText = response.candidates
+            // Groq ka response parse karna
+            val generatedText = response.choices
                 .firstOrNull()
+                ?.message
                 ?.content
-                ?.parts
-                ?.firstOrNull()
-                ?.text
-                ?: throw IllegalStateException("Gemini returned empty result.")
+                ?: throw IllegalStateException("Groq returned empty result.")
 
             parseScriptResponse(generatedText)
         } catch (e: HttpException) {
             val errorBody = e.response()?.errorBody()?.string().orEmpty()
             throw IllegalStateException(
-                "Gemini API error: HTTP ${e.code()} - $errorBody",
+                "Groq API error: HTTP ${e.code()} -$errorBody",
                 e
             )
         }
@@ -99,7 +102,7 @@ class VideoRepositoryImpl @Inject constructor(
             huggingFaceApi.generateImage(
                 authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
                 model = "stabilityai/stable-diffusion-2-1",
-                request = com.rsmoviespot.data.api.HuggingFaceImageRequest(
+                request = HuggingFaceImageRequest(
                     inputs = prompt
                 )
             )
@@ -136,7 +139,7 @@ class VideoRepositoryImpl @Inject constructor(
                 array as? JsonArray
                     ?: error("'slabs' or 'scenes' must be a JSON array.")
             }
-            else -> error("Gemini response must be a JSON array or object.")
+            else -> error("Groq response must be a JSON array or object.")
         }
 
         val slabs = slabElements.mapIndexed { index, element ->
@@ -148,7 +151,7 @@ class VideoRepositoryImpl @Inject constructor(
             )
         }
 
-        require(slabs.isNotEmpty()) { "Gemini returned an empty script." }
+        require(slabs.isNotEmpty()) { "Groq returned an empty script." }
         return VideoScriptResponse(slabs = slabs)
     }
 
