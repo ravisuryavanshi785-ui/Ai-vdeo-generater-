@@ -31,7 +31,7 @@ class EdgeTtsApi @Inject constructor(
         val utteranceId = UUID.randomUUID().toString()
         val tempFile = File(context.cacheDir, "$utteranceId.wav")
 
-        val executeSynthesis = {
+        val executeSynthesis: () -> Unit = {
             val listener = object : UtteranceProgressListener() {
                 override fun onStart(id: String?) {}
 
@@ -41,7 +41,6 @@ class EdgeTtsApi @Inject constructor(
                         tempFile.delete() // Clean up storage
                         
                         if (continuation.isActive) {
-                            // VideoRepository ko lagega API se MP3 aaya, par ye local WAV bytes hain
                             continuation.resume(bytes.toResponseBody("audio/wav".toMediaType()))
                         }
                     }
@@ -56,15 +55,15 @@ class EdgeTtsApi @Inject constructor(
             
             tts?.setOnUtteranceProgressListener(listener)
             
-            // Network synthesis use karne ka try karega (better quality voice)
             val params = Bundle().apply {
                 putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
             }
             
             tts?.synthesizeToFile(request.text, params, tempFile, utteranceId)
+            
+            Unit // <-- YAHI FIX HAI! Iski wajah se build fail hua tha.
         }
 
-        // Initialize TTS engine only once
         if (isInitialized && tts != null) {
             executeSynthesis()
         } else {
@@ -73,10 +72,7 @@ class EdgeTtsApi @Inject constructor(
                 isInitializing = true
                 tts = TextToSpeech(context) { status ->
                     if (status == TextToSpeech.SUCCESS) {
-                        // Hindi (India) set kar rahe hain
                         tts?.language = Locale("hi", "IN")
-                        
-                        // Voice pitch & speed adjustments to sound more natural
                         tts?.setPitch(1.0f)
                         tts?.setSpeechRate(0.95f) 
                         
@@ -99,7 +95,6 @@ class EdgeTtsApi @Inject constructor(
     }
 }
 
-// Data class same rakhi hai taaki VideoRepositoryImpl crash na ho
 @Serializable
 data class EdgeTtsRequest(
     val text: String,
