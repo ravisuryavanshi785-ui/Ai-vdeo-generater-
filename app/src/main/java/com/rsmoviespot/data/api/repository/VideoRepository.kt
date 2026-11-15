@@ -111,14 +111,14 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateAudioForSlab(text: String): ResponseBody {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
-        return callWithHttpUrl {
-            edgeTtsApi.synthesize(
-                EdgeTtsRequest(
-                    text = text,
-                    voice = HINDI_VOICE
-                )
+        
+        // Yahan se callWithHttpUrl hata diya hai kyunki EdgeTtsApi ab Retrofit use nahi karta
+        return edgeTtsApi.synthesize(
+            EdgeTtsRequest(
+                text = text,
+                voice = HINDI_VOICE
             )
-        }
+        )
     }
 
     private fun parseScriptResponse(text: String): VideoScriptResponse {
