@@ -72,6 +72,14 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            pickFirsts += listOf(
+                "lib/x86/libc++_shared.so",
+                "lib/x86_64/libc++_shared.so",
+                "lib/armeabi-v7a/libc++_shared.so",
+                "lib/arm64-v8a/libc++_shared.so"
+            )
+        }
     }
 }
 
@@ -110,6 +118,7 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // FFmpegKit
-    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
+    // FFmpegKit (GPL build required for libx264)
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl:8.1.7")
+    implementation("com.arthenica:smart-exception-java:0.2.1")
 }
