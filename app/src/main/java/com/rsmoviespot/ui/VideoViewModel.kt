@@ -2,6 +2,7 @@ package com.rsmoviespot.ui
 
 import android.content.Context
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.rsmoviespot.service.VideoRenderService
@@ -17,6 +18,8 @@ import javax.inject.Inject
 data class VideoUiState(
     val topic: String = "",
     val isShorts: Boolean = true,
+    val selectedBgmUri: Uri? = null,
+    val selectedBgmName: String = "Built-in Cinematic BGM",
     val isGenerating: Boolean = false,
     val progressText: String = "",
     val progressPercentage: Int = 0,
@@ -56,6 +59,26 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(isShorts = isShorts) }
     }
 
+    fun onBgmSelected(uri: Uri?) {
+        if (uri == null) return
+        val fileName = resolveDisplayName(uri) ?: "Custom Audio"
+        _uiState.update {
+            it.copy(
+                selectedBgmUri = uri,
+                selectedBgmName = fileName
+            )
+        }
+    }
+
+    fun clearBgm() {
+        _uiState.update {
+            it.copy(
+                selectedBgmUri = null,
+                selectedBgmName = "Built-in Cinematic BGM"
+            )
+        }
+    }
+
     fun startGeneratingVideo() {
         val currentState = _uiState.value
         if (currentState.isGenerating) return
@@ -71,7 +94,21 @@ class VideoViewModel @Inject constructor(
         VideoRenderService.startRender(
             context = context,
             topic = topic,
-            isShorts = currentState.isShorts
+            isShorts = currentState.isShorts,
+            bgmUri = currentState.selectedBgmUri
         )
+    }
+
+    private fun resolveDisplayName(uri: Uri): String? {
+        return runCatching {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) {
+                    cursor.getString(nameIndex)
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
     }
 }
