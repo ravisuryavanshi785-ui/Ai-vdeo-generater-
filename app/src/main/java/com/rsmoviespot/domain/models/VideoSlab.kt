@@ -15,5 +15,6 @@ data class VideoSlab(
     val id: Int,
     val voiceover_text: String,
     val image_prompt: String,
-    val sfx_cue: String = "whoosh"
+    val sfx_cue: String = "whoosh",
+    val has_character: Boolean = true
 )
