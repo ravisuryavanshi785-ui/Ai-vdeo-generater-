@@ -5,9 +5,12 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.rsmoviespot.data.repository.VideoRepository
+import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.service.VideoRenderService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,6 +23,8 @@ data class VideoUiState(
     val isShorts: Boolean = true,
     val selectedBgmUri: Uri? = null,
     val selectedBgmName: String = "Built-in Cinematic BGM",
+    val isPreviewingScript: Boolean = false,
+    val draftScript: VideoScriptResponse? = null,
     val isGenerating: Boolean = false,
     val progressText: String = "",
     val progressPercentage: Int = 0,
@@ -29,7 +34,8 @@ data class VideoUiState(
 
 @HiltViewModel
 class VideoViewModel @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val videoRepository: VideoRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(VideoUiState())
@@ -52,11 +58,11 @@ class VideoViewModel @Inject constructor(
     }
 
     fun onTopicChanged(topic: String) {
-        _uiState.update { it.copy(topic = topic) }
+        _uiState.update { it.copy(topic = topic, draftScript = null) }
     }
 
     fun onShortsChanged(isShorts: Boolean) {
-        _uiState.update { it.copy(isShorts = isShorts) }
+        _uiState.update { it.copy(isShorts = isShorts, draftScript = null) }
     }
 
     fun onBgmSelected(uri: Uri?) {
@@ -79,9 +85,60 @@ class VideoViewModel @Inject constructor(
         }
     }
 
+    fun previewScript() {
+        val currentState = _uiState.value
+        if (currentState.isGenerating || currentState.isPreviewingScript) return
+
+        val topic = currentState.topic.trim()
+        if (topic.isBlank()) {
+            _uiState.update {
+                it.copy(statusMessage = "Enter a topic before previewing a script.")
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isPreviewingScript = true,
+                    statusMessage = "",
+                    draftScript = null
+                )
+            }
+            try {
+                val script = videoRepository.generateScript(topic, currentState.isShorts)
+                _uiState.update {
+                    it.copy(
+                        isPreviewingScript = false,
+                        draftScript = script
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isPreviewingScript = false,
+                        statusMessage = "Script error: ${error.message ?: error::class.java.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun onSlabVoiceoverChanged(index: Int, newText: String) {
+        _uiState.update { current ->
+            val script = current.draftScript ?: return@update current
+            if (index !in script.slabs.indices) return@update current
+            val updatedSlabs = script.slabs.toMutableList()
+            updatedSlabs[index] = updatedSlabs[index].copy(voiceover_text = newText)
+            current.copy(draftScript = script.copy(slabs = updatedSlabs))
+        }
+    }
+
     fun startGeneratingVideo() {
         val currentState = _uiState.value
-        if (currentState.isGenerating) return
+        if (currentState.isGenerating || currentState.isPreviewingScript) return
 
         val topic = currentState.topic.trim()
         if (topic.isBlank()) {
@@ -95,7 +152,8 @@ class VideoViewModel @Inject constructor(
             context = context,
             topic = topic,
             isShorts = currentState.isShorts,
-            bgmUri = currentState.selectedBgmUri
+            bgmUri = currentState.selectedBgmUri,
+            preGeneratedScript = currentState.draftScript
         )
     }
 
