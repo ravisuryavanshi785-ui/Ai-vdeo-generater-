@@ -11,6 +11,7 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
 import com.rsmoviespot.data.repository.VideoRepository
+import com.rsmoviespot.domain.models.VideoScriptResponse
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -47,6 +48,7 @@ class VideoRenderEngine @Inject constructor(
         topic: String,
         isShorts: Boolean,
         customBgmUri: Uri? = null,
+        preGeneratedScript: VideoScriptResponse? = null,
         progress: (Int, String) -> Unit = { _, _ -> }
     ): VideoRenderResult = withContext(Dispatchers.IO) {
         require(topic.isNotBlank()) { "Topic must not be blank." }
@@ -63,8 +65,13 @@ class VideoRenderEngine @Inject constructor(
         }
 
         try {
-            progress(2, "Generating script…")
-            val script = videoRepository.generateScript(topic, isShorts)
+            val script = if (preGeneratedScript != null && preGeneratedScript.slabs.isNotEmpty()) {
+                progress(5, "Using your approved script…")
+                preGeneratedScript
+            } else {
+                progress(2, "Generating script…")
+                videoRepository.generateScript(topic, isShorts)
+            }
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
 
             val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
