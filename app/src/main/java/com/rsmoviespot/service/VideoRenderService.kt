@@ -1,348 +1,265 @@
 package com.rsmoviespot.service
 
-import android.content.ContentValues
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
-import android.media.MediaMetadataRetriever
+import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.FFmpegSession
-import com.arthenica.ffmpegkit.ReturnCode
-import com.rsmoviespot.data.repository.VideoRepository
-import dagger.hilt.android.qualifiers.ApplicationContext
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.IOException
-import java.util.Locale
-import java.util.UUID
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import javax.inject.Inject
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
-import kotlin.math.roundToInt
 
-data class VideoRenderResult(
-    val galleryUri: Uri,
-    val segmentCount: Int,
-    val width: Int,
-    val height: Int
+data class RenderServiceState(
+    val isGenerating: Boolean = false,
+    val progressText: String = "",
+    val progressPercentage: Int = 0,
+    val statusMessage: String = "",
+    val generatedVideoUri: Uri? = null
 )
 
-class VideoRenderEngine @Inject constructor(
-    private val videoRepository: VideoRepository,
-    @ApplicationContext private val context: Context
-) {
-    suspend fun render(
-        topic: String,
-        isShorts: Boolean,
-        progress: (Int, String) -> Unit = { _, _ -> }
-    ): VideoRenderResult = withContext(Dispatchers.IO) {
-        require(topic.isNotBlank()) { "Topic must not be blank." }
+@AndroidEntryPoint
+class VideoRenderService : Service() {
 
-        val width = if (isShorts) SHORTS_WIDTH else LANDSCAPE_WIDTH
-        val height = if (isShorts) SHORTS_HEIGHT else LANDSCAPE_HEIGHT
-        val renderDirectory = File(
-            context.cacheDir,
-            "video-render-${UUID.randomUUID()}"
-        )
+    @Inject
+    lateinit var videoRenderEngine: VideoRenderEngine
 
-        if (!renderDirectory.exists() && !renderDirectory.mkdirs()) {
-            throw IOException("Could not create render directory.")
-        }
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var renderJob: Job? = null
 
-        try {
-            progress(2, "Generating script…")
-            val script = videoRepository.generateScript(topic, isShorts)
-            require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
+    private val notificationManager: NotificationManager
+        get() = getSystemService(NotificationManager::class.java)
 
-            val segmentFiles = mutableListOf<File>()
-            val slabCount = script.slabs.size
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
 
-            script.slabs.forEachIndexed { index, slab ->
-                val baseProgress = 8 + (index * 77 / slabCount)
-                progress(
-                    baseProgress.coerceIn(8, 85),
-                    "Creating scene ${index + 1} of $slabCount…"
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START_RENDER -> {
+                val topic = intent.getStringExtra(EXTRA_TOPIC)?.trim().orEmpty()
+                val isShorts = intent.getBooleanExtra(EXTRA_IS_SHORTS, true)
+
+                startAsForeground(
+                    buildNotification("Preparing video render…", 0)
                 )
 
-                val imageFile = File(renderDirectory, "slab_${index + 1}.png")
-                val audioFile = File(renderDirectory, "slab_${index + 1}.mp3")
-                val segmentFile = File(renderDirectory, "segment_${index + 1}.mp4")
-
-                val imagePrompt = buildString {
-                    append(slab.image_prompt)
-                    append(
-                        if (isShorts) {
-                            ", vertical portrait composition, 9:16 aspect ratio"
-                        } else {
-                            ", horizontal landscape composition, 16:9 aspect ratio"
-                        }
-                    )
-                }
-
-                videoRepository.generateImageForSlab(imagePrompt, isShorts).use { body ->
-                    imageFile.outputStream().use { output ->
-                        body.byteStream().use { input -> input.copyTo(output) }
+                if (topic.isBlank()) {
+                    _renderState.update {
+                        it.copy(
+                            isGenerating = false,
+                            statusMessage = "Enter a topic before generating a video."
+                        )
                     }
-                }
-                validateImageFile(imageFile, index + 1)
-
-                videoRepository.generateAudioForSlab(slab.voiceover_text).use { body ->
-                    audioFile.outputStream().use { output ->
-                        body.byteStream().use { input -> input.copyTo(output) }
-                    }
-                }
-                if (!audioFile.exists() || audioFile.length() == 0L) {
-                    throw IOException("Generated audio for scene ${index + 1} is empty.")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return START_NOT_STICKY
                 }
 
-                val durationSeconds = getAudioDurationSeconds(audioFile)
-                val renderProgress = 8 + (((index + 0.5) * 77) / slabCount).roundToInt()
-                progress(
-                    renderProgress.coerceIn(8, 85),
-                    "Rendering scene ${index + 1} of $slabCount…"
-                )
-
-                runFfmpeg(
-                    createSegmentArguments(
-                        imageFile = imageFile,
-                        audioFile = audioFile,
-                        outputFile = segmentFile,
-                        width = width,
-                        height = height,
-                        durationSeconds = durationSeconds
-                    )
-                )
-                segmentFiles += segmentFile
+                startRenderJob(topic, isShorts)
             }
 
-            progress(88, "Joining video segments…")
-            val concatList = File(renderDirectory, "segments.txt")
-            concatList.writeText(
-                segmentFiles.joinToString(separator = "\n") { file ->
-                    "file '${escapeConcatPath(file.absolutePath)}'"
-                } + "\n"
-            )
-
-            val finalFile = File(renderDirectory, "final_video.mp4")
-            runFfmpeg(createConcatArguments(concatList, finalFile))
-
-            progress(96, "Saving video to gallery…")
-            val galleryUri = publishToMediaStore(finalFile, topic)
-            progress(100, "Video ready")
-
-            VideoRenderResult(
-                galleryUri = galleryUri,
-                segmentCount = segmentFiles.size,
-                width = width,
-                height = height
-            )
-        } finally {
-            renderDirectory.deleteRecursively()
-        }
-    }
-
-    private fun validateImageFile(imageFile: File, sceneNumber: Int) {
-        if (!imageFile.exists() || imageFile.length() < 64L) {
-            throw IOException("Generated image for scene $sceneNumber is empty or invalid.")
-        }
-
-        val header = imageFile.inputStream().use { stream ->
-            val buffer = ByteArray(16)
-            val read = stream.read(buffer)
-            if (read > 0) String(buffer, 0, read, Charsets.UTF_8).trimStart() else ""
-        }
-        if (header.startsWith("{") || header.startsWith("<")) {
-            throw IOException("Image API returned non-image response for scene $sceneNumber.")
-        }
-    }
-
-    private fun getAudioDurationSeconds(audioFile: File): Double {
-        val retriever = MediaMetadataRetriever()
-        return try {
-            retriever.setDataSource(audioFile.absolutePath)
-            val durationMs = retriever
-                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLongOrNull()
-                ?: 0L
-
-            if (durationMs > 200L) {
-                (durationMs / 1000.0 + AUDIO_TAIL_PADDING_SECONDS)
-                    .coerceAtLeast(MIN_SEGMENT_DURATION_SECONDS)
-            } else {
-                DEFAULT_SEGMENT_DURATION_SECONDS
+            ACTION_CANCEL_RENDER -> {
+                renderJob?.cancel()
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        progressText = "",
+                        statusMessage = "Video generation cancelled."
+                    )
+                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-        } catch (_: Exception) {
-            DEFAULT_SEGMENT_DURATION_SECONDS
-        } finally {
-            runCatching { retriever.release() }
+
+            else -> {
+                startAsForeground(
+                    buildNotification("Preparing video render…", 0)
+                )
+            }
         }
+
+        return START_NOT_STICKY
     }
 
-    private fun createSegmentArguments(
-        imageFile: File,
-        audioFile: File,
-        outputFile: File,
-        width: Int,
-        height: Int,
-        durationSeconds: Double
-    ): Array<String> {
-        val totalFrames = (durationSeconds * FRAME_RATE)
-            .roundToInt()
-            .coerceAtLeast(FRAME_RATE * 2)
-        val formattedDuration = String.format(Locale.US, "%.2f", durationSeconds)
+    private fun startRenderJob(topic: String, isShorts: Boolean) {
+        if (renderJob?.isActive == true) return
 
-        val filter =
-            "scale=$width:$height:force_original_aspect_ratio=increase," +
-                "crop=$width:$height," +
-                "setsar=1," +
-                "zoompan=z='min(zoom+0.0004,1.08)':" +
-                "x='iw/2-(iw/zoom/2)':" +
-                "y='ih/2-(ih/zoom/2)':" +
-                "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE," +
-                "format=yuv420p"
-
-        return arrayOf(
-            "-y",
-            "-i", imageFile.absolutePath,
-            "-i", audioFile.absolutePath,
-            "-vf", filter,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-af", "apad",
-            "-t", formattedDuration,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "21",
-            "-threads", "2",
-            "-pix_fmt", "yuv420p",
-            "-r", FRAME_RATE.toString(),
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ar", "44100",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            outputFile.absolutePath
+        _renderState.value = RenderServiceState(
+            isGenerating = true,
+            progressText = "Starting video generation…",
+            progressPercentage = 0,
+            statusMessage = "",
+            generatedVideoUri = null
         )
-    }
 
-    private fun createConcatArguments(
-        concatList: File,
-        outputFile: File
-    ): Array<String> = arrayOf(
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concatList.absolutePath,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        outputFile.absolutePath
-    )
+        renderJob = serviceScope.launch {
+            var lastPercent = -1
+            var lastMessage = ""
 
-    private suspend fun runFfmpeg(arguments: Array<String>): FFmpegSession =
-        suspendCancellableCoroutine { continuation ->
             try {
-                val session = FFmpegKit.executeWithArgumentsAsync(arguments) { completedSession ->
-                    if (!continuation.isActive) return@executeWithArgumentsAsync
+                val result = videoRenderEngine.render(
+                    topic = topic,
+                    isShorts = isShorts
+                ) { rawPercent, message ->
+                    val percent = rawPercent.coerceIn(0, 100)
+                    _renderState.update {
+                        it.copy(
+                            progressPercentage = percent,
+                            progressText = message
+                        )
+                    }
 
-                    if (ReturnCode.isSuccess(completedSession.returnCode)) {
-                        continuation.resume(completedSession)
-                    } else {
-                        val details = completedSession.allLogsAsString
-                            ?.takeIf(String::isNotBlank)
-                            ?: completedSession.failStackTrace
-                            ?: "No FFmpeg error details available."
-
-                        continuation.resumeWithException(
-                            IOException("FFmpeg failed: $details")
+                    if (percent != lastPercent || message != lastMessage) {
+                        lastPercent = percent
+                        lastMessage = message
+                        notificationManager.notify(
+                            NOTIFICATION_ID,
+                            buildNotification(message, percent)
                         )
                     }
                 }
 
-                continuation.invokeOnCancellation {
-                    FFmpegKit.cancel(session.sessionId)
-                }
-            } catch (throwable: Throwable) {
-                if (continuation.isActive) {
-                    continuation.resumeWithException(
-                        IOException(
-                            "FFmpeg startup error (${throwable::class.java.simpleName}): ${throwable.message ?: "Unknown"}",
-                            throwable
-                        )
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        progressPercentage = 100,
+                        progressText = "Video saved to your gallery.",
+                        statusMessage = "Video generation complete.",
+                        generatedVideoUri = result.galleryUri
                     )
                 }
-            }
-        }
 
-    private fun publishToMediaStore(sourceFile: File, topic: String): Uri {
-        val resolver = context.contentResolver
-        val displayName = "${safeFileName(topic)}_${System.currentTimeMillis()}.mp4"
-
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(
-                    MediaStore.Video.Media.RELATIVE_PATH,
-                    "${Environment.DIRECTORY_MOVIES}/RSMovieSpot"
+                notificationManager.notify(
+                    NOTIFICATION_ID,
+                    buildNotification("Video render complete", 100)
                 )
-                put(MediaStore.Video.Media.IS_PENDING, 1)
-            }
-        }
-
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        }
-
-        val uri = resolver.insert(collection, values)
-            ?: throw IOException("Could not create a MediaStore video entry.")
-
-        try {
-            val output = resolver.openOutputStream(uri, "w")
-                ?: throw IOException("Could not open MediaStore output stream.")
-
-            output.use { destination ->
-                sourceFile.inputStream().use { input -> input.copyTo(destination) }
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val completedValues = ContentValues().apply {
-                    put(MediaStore.Video.Media.IS_PENDING, 0)
+                stopForeground(STOP_FOREGROUND_DETACH)
+                stopSelf()
+            } catch (cancelled: CancellationException) {
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        statusMessage = "Video generation cancelled."
+                    )
                 }
-                resolver.update(uri, completedValues, null, null)
-            }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                throw cancelled
+            } catch (error: Throwable) {
+                val errorMessage = error.message
+                    ?.takeIf(String::isNotBlank)
+                    ?.let { "Generation failed: $it" }
+                    ?: "Generation failed (${error::class.java.simpleName})."
 
-            return uri
-        } catch (error: Exception) {
-            resolver.delete(uri, null, null)
-            throw error
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        statusMessage = errorMessage
+                    )
+                }
+
+                notificationManager.notify(
+                    NOTIFICATION_ID,
+                    buildNotification(errorMessage, 0)
+                )
+                stopForeground(STOP_FOREGROUND_DETACH)
+                stopSelf()
+            }
         }
     }
 
-    private fun safeFileName(value: String): String =
-        value.trim()
-            .replace(Regex("[^A-Za-z0-9._-]+"), "_")
-            .trim('_')
-            .take(60)
-            .ifBlank { "video" }
+    private fun startAsForeground(notification: Notification) {
+        val foregroundType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        } else {
+            0
+        }
 
-    private fun escapeConcatPath(path: String): String =
-        path.replace("\\", "\\\\").replace("'", "'\\''")
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            foregroundType
+        )
+    }
 
-    private companion object {
-        const val SHORTS_WIDTH = 1080
-        const val SHORTS_HEIGHT = 1920
-        const val LANDSCAPE_WIDTH = 1920
-        const val LANDSCAPE_HEIGHT = 1080
-        const val FRAME_RATE = 25
-        const val AUDIO_TAIL_PADDING_SECONDS = 0.35
-        const val MIN_SEGMENT_DURATION_SECONDS = 3.0
-        const val DEFAULT_SEGMENT_DURATION_SECONDS = 6.0
+    private fun buildNotification(message: String, progress: Int): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_save)
+            .setContentTitle("RS Movie Spot")
+            .setContentText(message)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(progress in 1..99 || _renderState.value.isGenerating)
+            .setOnlyAlertOnce(true)
+            .setProgress(100, progress.coerceIn(0, 100), false)
+            .build()
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Video rendering",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Progress notifications for video generation"
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    override fun onDestroy() {
+        renderJob?.cancel()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        const val ACTION_START_RENDER = "com.rsmoviespot.service.action.START_RENDER"
+        const val ACTION_CANCEL_RENDER = "com.rsmoviespot.service.action.CANCEL_RENDER"
+
+        const val EXTRA_TOPIC = "extra_topic"
+        const val EXTRA_IS_SHORTS = "extra_is_shorts"
+
+        private const val CHANNEL_ID = "video_render_channel"
+        private const val NOTIFICATION_ID = 4101
+
+        private val _renderState = MutableStateFlow(RenderServiceState())
+        val renderState: StateFlow<RenderServiceState> = _renderState.asStateFlow()
+
+        fun startRender(context: Context, topic: String, isShorts: Boolean) {
+            val intent = Intent(context, VideoRenderService::class.java)
+                .setAction(ACTION_START_RENDER)
+                .putExtra(EXTRA_TOPIC, topic)
+                .putExtra(EXTRA_IS_SHORTS, isShorts)
+            ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun cancelRender(context: Context) {
+            val intent = Intent(context, VideoRenderService::class.java)
+                .setAction(ACTION_CANCEL_RENDER)
+            context.startService(intent)
+        }
     }
 }
