@@ -48,11 +48,13 @@ object NetworkModule {
             .includeIPv6(false)
             .build()
 
-        val resilientDns = Dns { hostname ->
-            try {
-                cloudflareDns.lookup(hostname)
-            } catch (_: Exception) {
-                Dns.SYSTEM.lookup(hostname)
+        val resilientDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return try {
+                    cloudflareDns.lookup(hostname)
+                } catch (_: Exception) {
+                    Dns.SYSTEM.lookup(hostname)
+                }
             }
         }
 
