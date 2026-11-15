@@ -5,20 +5,19 @@ import okhttp3.ResponseBody
 import retrofit2.http.Body
 import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.Path
 
 interface HuggingFaceApi {
 
-    @POST("v1/text-to-image")
+    @POST("models/{model}")
     suspend fun generateImage(
         @Header("Authorization") authorization: String,
-        @Body request: TextToImageRequest
+        @Path(value = "model", encoded = true) model: String,
+        @Body request: HuggingFaceImageRequest
     ): ResponseBody
 }
 
 @Serializable
-data class TextToImageRequest(
-    val inputs: String,
-    val model: String = "stabilityai/stable-diffusion-3-medium-diffusers",
-    val provider: String = "hf-inference",
-    val parameters: Map<String, @Serializable(with = AnySerializer::class) Any>? = null
+data class HuggingFaceImageRequest(
+    val inputs: String
 )
