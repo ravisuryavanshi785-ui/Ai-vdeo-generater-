@@ -63,6 +63,7 @@ class EdgeTtsApi @Inject constructor(
                 .storage(tempDir.absolutePath)
                 .fileName(fileBaseName)
                 .overwrite(true)
+                .voiceRate("+10%")
                 .formatMp3()
                 .trans()
 
