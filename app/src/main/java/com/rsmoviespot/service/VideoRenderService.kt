@@ -57,6 +57,9 @@ class VideoRenderService : Service() {
             ACTION_START_RENDER -> {
                 val topic = intent.getStringExtra(EXTRA_TOPIC)?.trim().orEmpty()
                 val isShorts = intent.getBooleanExtra(EXTRA_IS_SHORTS, true)
+                val bgmUri = intent.getStringExtra(EXTRA_BGM_URI)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { Uri.parse(it) }
 
                 startAsForeground(
                     buildNotification("Preparing video render…", 0)
@@ -74,7 +77,7 @@ class VideoRenderService : Service() {
                     return START_NOT_STICKY
                 }
 
-                startRenderJob(topic, isShorts)
+                startRenderJob(topic, isShorts, bgmUri)
             }
 
             ACTION_CANCEL_RENDER -> {
@@ -100,7 +103,7 @@ class VideoRenderService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startRenderJob(topic: String, isShorts: Boolean) {
+    private fun startRenderJob(topic: String, isShorts: Boolean, customBgmUri: Uri?) {
         if (renderJob?.isActive == true) return
 
         _renderState.value = RenderServiceState(
@@ -118,7 +121,8 @@ class VideoRenderService : Service() {
             try {
                 val result = videoRenderEngine.render(
                     topic = topic,
-                    isShorts = isShorts
+                    isShorts = isShorts,
+                    customBgmUri = customBgmUri
                 ) { rawPercent, message ->
                     val percent = rawPercent.coerceIn(0, 100)
                     _renderState.update {
@@ -241,6 +245,7 @@ class VideoRenderService : Service() {
 
         const val EXTRA_TOPIC = "extra_topic"
         const val EXTRA_IS_SHORTS = "extra_is_shorts"
+        const val EXTRA_BGM_URI = "extra_bgm_uri"
 
         private const val CHANNEL_ID = "video_render_channel"
         private const val NOTIFICATION_ID = 4101
@@ -248,11 +253,17 @@ class VideoRenderService : Service() {
         private val _renderState = MutableStateFlow(RenderServiceState())
         val renderState: StateFlow<RenderServiceState> = _renderState.asStateFlow()
 
-        fun startRender(context: Context, topic: String, isShorts: Boolean) {
+        fun startRender(
+            context: Context,
+            topic: String,
+            isShorts: Boolean,
+            bgmUri: Uri? = null
+        ) {
             val intent = Intent(context, VideoRenderService::class.java)
                 .setAction(ACTION_START_RENDER)
                 .putExtra(EXTRA_TOPIC, topic)
                 .putExtra(EXTRA_IS_SHORTS, isShorts)
+                .putExtra(EXTRA_BGM_URI, bgmUri?.toString())
             ContextCompat.startForegroundService(context, intent)
         }
 
