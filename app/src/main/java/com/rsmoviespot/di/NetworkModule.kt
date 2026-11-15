@@ -2,7 +2,8 @@ package com.rsmoviespot.di
 
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.rsmoviespot.data.api.EdgeTtsApi
-import com.rsmoviespot.data.api.GeminiApi
+// Yahan update kiya hai: GeminiApi ko nikal kar GroqApi daal diya
+import com.rsmoviespot.data.api.GroqApi
 import com.rsmoviespot.data.api.HuggingFaceApi
 import dagger.Module
 import dagger.Provides
@@ -56,20 +57,21 @@ object NetworkModule {
             .build()
     }
 
+    // YAHAN FIX KIYA HAI: Naya Groq API provider add kar diya
     @Provides
     @Singleton
-    fun provideGeminiApi(
+    fun provideGroqApi(
         client: OkHttpClient,
         json: Json
-    ): GeminiApi =
+    ): GroqApi =
         Retrofit.Builder()
-            .baseUrl("https://generativelanguage.googleapis.com/")
+            .baseUrl("https://api.groq.com/openai/v1/") // Groq ka fast server
             .client(client)
             .addConverterFactory(
                 json.asConverterFactory("application/json".toMediaType())
             )
             .build()
-            .create(GeminiApi::class.java)
+            .create(GroqApi::class.java)
 
     @Provides
     @Singleton
@@ -78,7 +80,6 @@ object NetworkModule {
         json: Json
     ): HuggingFaceApi =
         Retrofit.Builder()
-            // YAHAN FIX KIYA HAI: Free Inference API ka correct Base URL
             .baseUrl("https://api-inference.huggingface.co/")
             .client(client)
             .addConverterFactory(
