@@ -1,9 +1,9 @@
 package com.rsmoviespot.di
 
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import com.rsmoviespot.data.api.CloudflareApi
 import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.GroqApi
-import com.rsmoviespot.data.api.HuggingFaceApi
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -73,18 +73,18 @@ object NetworkModule {
 
     @Provides
     @Singleton
-    fun provideHuggingFaceApi(
+    fun provideCloudflareApi(
         client: OkHttpClient,
         json: Json
-    ): HuggingFaceApi =
+    ): CloudflareApi =
         Retrofit.Builder()
-            .baseUrl("https://router.huggingface.co/")
+            .baseUrl("https://api.cloudflare.com/client/v4/")
             .client(client)
             .addConverterFactory(
                 json.asConverterFactory("application/json".toMediaType())
             )
             .build()
-            .create(HuggingFaceApi::class.java)
+            .create(CloudflareApi::class.java)
 
     @Provides
     @Singleton
