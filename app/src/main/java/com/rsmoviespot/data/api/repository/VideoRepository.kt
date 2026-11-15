@@ -58,7 +58,7 @@ class VideoRepositoryImpl @Inject constructor(
                     authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                     request = GroqChatRequest(
                         // YAHAN FIX KIYA HAI: Universal aur 100% active free tier model daal diya
-                        model = "llama-3.1-8b-instant", 
+                        model = "openai/gpt-oss-20b", 
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
