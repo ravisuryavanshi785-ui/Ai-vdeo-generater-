@@ -21,14 +21,16 @@ android {
             useSupportLibrary = true
         }
 
-        val geminiKey = (System.getenv("GEMINI_API_KEY") ?: "")
+        // YAHAN FIX KIYA HAI: Gemini ki jagah Groq lagaya hai aur local.properties (findProperty) ka support add kiya hai
+        val groqKey = (project.findProperty("GROQ_API_KEY") as? String ?: System.getenv("GROQ_API_KEY") ?: "")
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
-        val huggingFaceKey = (System.getenv("HUGGING_FACE_KEY") ?: "")
+            
+        val huggingFaceKey = (project.findProperty("HUGGING_FACE_KEY") as? String ?: System.getenv("HUGGING_FACE_KEY") ?: "")
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
 
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+        buildConfigField("String", "GROQ_API_KEY", "\"$groqKey\"")
         buildConfigField("String", "HUGGING_FACE_KEY", "\"$huggingFaceKey\"")
     }
 
