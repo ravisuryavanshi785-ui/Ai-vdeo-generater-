@@ -58,6 +58,12 @@ class VideoRenderEngine @Inject constructor(
             val script = videoRepository.generateScript(topic, isShorts)
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
 
+            // Same seed across all scenes improves character and style consistency.
+            val videoSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
+                .coerceAtLeast(1000)
+
+            val bgmBedFile = prepareBgmBed(renderDirectory, script.bgm_mood)
+
             val segmentFiles = mutableListOf<File>()
             val slabCount = script.slabs.size
 
@@ -69,21 +75,22 @@ class VideoRenderEngine @Inject constructor(
                 )
 
                 val imageFile = File(renderDirectory, "slab_${index + 1}.png")
-                val audioFile = File(renderDirectory, "slab_${index + 1}.mp3")
+                val voiceFile = File(renderDirectory, "slab_${index + 1}.mp3")
+                val mixedAudioFile = File(renderDirectory, "mixed_${index + 1}.m4a")
                 val segmentFile = File(renderDirectory, "segment_${index + 1}.mp4")
 
-                val imagePrompt = buildString {
-                    append(slab.image_prompt)
-                    append(
-                        if (isShorts) {
-                            ", vertical portrait composition, 9:16 aspect ratio"
-                        } else {
-                            ", horizontal landscape composition, 16:9 aspect ratio"
-                        }
-                    )
-                }
+                val imagePrompt = buildConsistentImagePrompt(
+                    characterBible = script.character_bible,
+                    visualStyle = script.visual_style,
+                    scenePrompt = slab.image_prompt,
+                    isShorts = isShorts
+                )
 
-                videoRepository.generateImageForSlab(imagePrompt, isShorts).use { body ->
+                videoRepository.generateImageForSlab(
+                    prompt = imagePrompt,
+                    isShorts = isShorts,
+                    seed = videoSeed
+                ).use { body ->
                     imageFile.outputStream().use { output ->
                         body.byteStream().use { input -> input.copyTo(output) }
                     }
@@ -91,25 +98,37 @@ class VideoRenderEngine @Inject constructor(
                 validateImageFile(imageFile, index + 1)
 
                 videoRepository.generateAudioForSlab(slab.voiceover_text).use { body ->
-                    audioFile.outputStream().use { output ->
+                    voiceFile.outputStream().use { output ->
                         body.byteStream().use { input -> input.copyTo(output) }
                     }
                 }
-                if (!audioFile.exists() || audioFile.length() == 0L) {
+                if (!voiceFile.exists() || voiceFile.length() == 0L) {
                     throw IOException("Generated audio for scene ${index + 1} is empty.")
                 }
 
-                val durationSeconds = getAudioDurationSeconds(audioFile)
+                val durationSeconds = getAudioDurationSeconds(voiceFile)
+
                 val renderProgress = 8 + (((index + 0.5) * 77) / slabCount).roundToInt()
                 progress(
                     renderProgress.coerceIn(8, 85),
                     "Rendering scene ${index + 1} of $slabCount…"
                 )
 
+                val finalAudioForScene = mixSceneAudioSafely(
+                    renderDirectory = renderDirectory,
+                    sceneIndex = index,
+                    voiceFile = voiceFile,
+                    bgmBedFile = bgmBedFile,
+                    sfxCue = slab.sfx_cue,
+                    durationSeconds = durationSeconds,
+                    outputFile = mixedAudioFile
+                )
+
                 runFfmpeg(
                     createSegmentArguments(
+                        sceneIndex = index,
                         imageFile = imageFile,
-                        audioFile = audioFile,
+                        audioFile = finalAudioForScene,
                         outputFile = segmentFile,
                         width = width,
                         height = height,
@@ -142,6 +161,192 @@ class VideoRenderEngine @Inject constructor(
             )
         } finally {
             renderDirectory.deleteRecursively()
+        }
+    }
+
+    private fun buildConsistentImagePrompt(
+        characterBible: String,
+        visualStyle: String,
+        scenePrompt: String,
+        isShorts: Boolean
+    ): String = buildString {
+        if (characterBible.isNotBlank()) {
+            append("Main character (strictly identical across every scene): ")
+            append(characterBible.trim())
+            append(". ")
+        }
+        append("Scene action: ")
+        append(scenePrompt.trim())
+        if (visualStyle.isNotBlank()) {
+            append(". Art style & lighting: ")
+            append(visualStyle.trim())
+        }
+        append(
+            if (isShorts) {
+                ", single cohesive cinematic frame, vertical portrait composition, 9:16 aspect ratio"
+            } else {
+                ", single cohesive cinematic frame, horizontal landscape composition, 16:9 aspect ratio"
+            }
+        )
+    }
+
+    private suspend fun prepareBgmBed(
+        renderDirectory: File,
+        mood: String
+    ): File? {
+        val rawResourceFile = copyOptionalRawAudio(renderDirectory, mood)
+        if (rawResourceFile != null) return rawResourceFile
+
+        val synthesizedBgm = File(renderDirectory, "bgm_bed.wav")
+        val lavfiExpression = when (mood.lowercase()) {
+            "devotional" ->
+                "aevalsrc='0.22*sin(2*PI*130.81*t)+0.16*sin(2*PI*196.00*t)+0.10*sin(2*PI*261.63*t)':s=44100:d=20"
+            "suspense" ->
+                "aevalsrc='0.35*sin(2*PI*58*t)*exp(-3*mod(t,1.0))+0.15*sin(2*PI*62*t)':s=44100:d=20"
+            "sci_fi" ->
+                "aevalsrc='0.25*sin(2*PI*73.42*t)+0.18*sin(2*PI*110*t)*sin(2*PI*0.4*t)+0.12*sin(2*PI*220*t)':s=44100:d=20"
+            "emotional" ->
+                "aevalsrc='0.24*sin(2*PI*174.61*t)+0.16*sin(2*PI*220.00*t)+0.12*sin(2*PI*261.63*t)':s=44100:d=20"
+            else ->
+                // epic_dark: deep pulsing war-drum sub-bass + cinematic harmonic drone
+                "aevalsrc='0.45*sin(2*PI*55*t)*exp(-4.5*mod(t,0.75))+0.22*sin(2*PI*110*t)+0.12*sin(2*PI*165*t)':s=44100:d=20"
+        }
+
+        val success = runCatching {
+            runFfmpeg(
+                arrayOf(
+                    "-y",
+                    "-f", "lavfi",
+                    "-i", lavfiExpression,
+                    "-af", "lowpass=f=360,aecho=0.8:0.85:70:0.45",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    synthesizedBgm.absolutePath
+                )
+            )
+        }.isSuccess
+
+        return if (success && synthesizedBgm.exists() && synthesizedBgm.length() > 0L) {
+            synthesizedBgm
+        } else {
+            null
+        }
+    }
+
+    private fun copyOptionalRawAudio(renderDirectory: File, mood: String): File? {
+        val candidates = listOf("bgm_${mood.lowercase()}", "bgm_epic")
+        for (name in candidates) {
+            val resId = context.resources.getIdentifier(name, "raw", context.packageName)
+            if (resId != 0) {
+                val outFile = File(renderDirectory, "$name.mp3")
+                context.resources.openRawResource(resId).use { input ->
+                    outFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                if (outFile.exists() && outFile.length() > 0L) return outFile
+            }
+        }
+        return null
+    }
+
+    private suspend fun synthesizeSceneSfx(
+        renderDirectory: File,
+        sceneIndex: Int,
+        sfxCue: String
+    ): File? {
+        val sfxFile = File(renderDirectory, "sfx_${sceneIndex + 1}.wav")
+        val (lavfiSource, filter) = when (sfxCue.lowercase()) {
+            "thunder" ->
+                "anoisesrc=color=brown:amplitude=0.85:r=44100:d=2.2" to
+                    "lowpass=f=240,aecho=0.8:0.85:110:0.5,afade=t=out:st=0.8:d=1.4"
+            "fire" ->
+                "anoisesrc=color=pink:amplitude=0.28:r=44100:d=3.0" to
+                    "bandpass=f=1200:w=800,tremolo=f=8:d=0.65,afade=t=out:st=1.8:d=1.2"
+            "sword" ->
+                "aevalsrc='0.45*sin(2*PI*1750*t)*exp(-9*t)+0.35*sin(2*PI*2450*t)*exp(-11*t)':s=44100:d=0.6" to
+                    "highpass=f=800,aecho=0.8:0.7:40:0.3"
+            "boom" ->
+                "aevalsrc='0.8*sin(2*PI*(95-55*min(t,0.7))*t)*exp(-3.2*t)':s=44100:d=1.3" to
+                    "lowpass=f=220"
+            else ->
+                // whoosh
+                "anoisesrc=color=pink:amplitude=0.45:r=44100:d=0.65" to
+                    "bandpass=f=650:w=420,afade=t=in:st=0:d=0.25,afade=t=out:st=0.3:d=0.35"
+        }
+
+        val success = runCatching {
+            runFfmpeg(
+                arrayOf(
+                    "-y",
+                    "-f", "lavfi",
+                    "-i", lavfiSource,
+                    "-af", filter,
+                    "-ar", "44100",
+                    "-ac", "2",
+                    sfxFile.absolutePath
+                )
+            )
+        }.isSuccess
+
+        return if (success && sfxFile.exists() && sfxFile.length() > 0L) sfxFile else null
+    }
+
+    private suspend fun mixSceneAudioSafely(
+        renderDirectory: File,
+        sceneIndex: Int,
+        voiceFile: File,
+        bgmBedFile: File?,
+        sfxCue: String,
+        durationSeconds: Double,
+        outputFile: File
+    ): File {
+        if (bgmBedFile == null) return voiceFile
+
+        val sfxFile = synthesizeSceneSfx(renderDirectory, sceneIndex, sfxCue)
+        val formattedDuration = String.format(Locale.US, "%.2f", durationSeconds)
+
+        val args = if (sfxFile != null) {
+            arrayOf(
+                "-y",
+                "-i", voiceFile.absolutePath,
+                "-stream_loop", "-1", "-i", bgmBedFile.absolutePath,
+                "-i", sfxFile.absolutePath,
+                "-filter_complex",
+                "[0:a]apad,volume=1.0[v];" +
+                    "[1:a]volume=0.18[b];" +
+                    "[2:a]volume=0.32[s];" +
+                    "[v][b][s]amix=inputs=3:duration=first:normalize=0[out]",
+                "-map", "[out]",
+                "-t", formattedDuration,
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "44100",
+                "-ac", "2",
+                outputFile.absolutePath
+            )
+        } else {
+            arrayOf(
+                "-y",
+                "-i", voiceFile.absolutePath,
+                "-stream_loop", "-1", "-i", bgmBedFile.absolutePath,
+                "-filter_complex",
+                "[0:a]apad,volume=1.0[v];" +
+                    "[1:a]volume=0.18[b];" +
+                    "[v][b]amix=inputs=2:duration=first:normalize=0[out]",
+                "-map", "[out]",
+                "-t", formattedDuration,
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "44100",
+                "-ac", "2",
+                outputFile.absolutePath
+            )
+        }
+
+        val mixedOk = runCatching { runFfmpeg(args) }.isSuccess
+        return if (mixedOk && outputFile.exists() && outputFile.length() > 0L) {
+            outputFile
+        } else {
+            voiceFile
         }
     }
 
@@ -183,6 +388,7 @@ class VideoRenderEngine @Inject constructor(
     }
 
     private fun createSegmentArguments(
+        sceneIndex: Int,
         imageFile: File,
         audioFile: File,
         outputFile: File,
@@ -193,16 +399,44 @@ class VideoRenderEngine @Inject constructor(
         val totalFrames = (durationSeconds * FRAME_RATE)
             .roundToInt()
             .coerceAtLeast(FRAME_RATE * 2)
+        val denom = (totalFrames - 1).coerceAtLeast(1)
         val formattedDuration = String.format(Locale.US, "%.2f", durationSeconds)
+        val fadeOutStart = String.format(
+            Locale.US,
+            "%.2f",
+            (durationSeconds - 0.25).coerceAtLeast(0.5)
+        )
 
+        // 1.5x supersample prevents zoompan subpixel jitter while staying light on mobile RAM
+        val upWidth = (width * 3) / 2
+        val upHeight = (height * 3) / 2
+
+        val motionFilter = when (sceneIndex % 4) {
+            0 ->
+                // Dramatic Zoom In
+                "zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
+                    "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
+            1 ->
+                // Dramatic Zoom Out
+                "zoompan=z='if(lte(on,1),1.18,max(1.0,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
+                    "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
+            2 ->
+                // Cinematic Horizontal Pan
+                "zoompan=z='1.14':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':" +
+                    "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
+            else ->
+                // Cinematic Vertical Reveal Tilt
+                "zoompan=z='1.14':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
+                    "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
+        }
+
+        val fadePrefix = if (sceneIndex > 0) "fade=t=in:st=0:d=0.22," else ""
         val filter =
-            "scale=$width:$height:force_original_aspect_ratio=increase," +
-                "crop=$width:$height," +
+            "scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
+                "crop=$upWidth:$upHeight," +
                 "setsar=1," +
-                "zoompan=z='min(zoom+0.0004,1.08)':" +
-                "x='iw/2-(iw/zoom/2)':" +
-                "y='ih/2-(ih/zoom/2)':" +
-                "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE," +
+                "$motionFilter," +
+                "${fadePrefix}fade=t=out:st=$fadeOutStart:d=0.25," +
                 "format=yuv420p"
 
         return arrayOf(
