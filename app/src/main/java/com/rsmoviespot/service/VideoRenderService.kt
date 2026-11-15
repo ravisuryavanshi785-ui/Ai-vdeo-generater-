@@ -7,15 +7,42 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+data class RenderServiceState(
+    val isGenerating: Boolean = false,
+    val progressText: String = "",
+    val progressPercentage: Int = 0,
+    val statusMessage: String = "",
+    val generatedVideoUri: Uri? = null
+)
 
 @AndroidEntryPoint
 class VideoRenderService : Service() {
+
+    @Inject
+    lateinit var videoRenderEngine: VideoRenderEngine
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var renderJob: Job? = null
 
     private val notificationManager: NotificationManager
         get() = getSystemService(NotificationManager::class.java)
@@ -27,40 +54,137 @@ class VideoRenderService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_PROGRESS -> {
-                val progress = intent.getIntExtra(EXTRA_PROGRESS, 0).coerceIn(0, 100)
-                val message = intent.getStringExtra(EXTRA_MESSAGE) ?: "Rendering video…"
-                notificationManager.notify(
-                    NOTIFICATION_ID,
-                    buildNotification(message, progress)
+            ACTION_START_RENDER -> {
+                val topic = intent.getStringExtra(EXTRA_TOPIC)?.trim().orEmpty()
+                val isShorts = intent.getBooleanExtra(EXTRA_IS_SHORTS, true)
+
+                startAsForeground(
+                    buildNotification("Preparing video render…", 0)
                 )
+
+                if (topic.isBlank()) {
+                    _renderState.update {
+                        it.copy(
+                            isGenerating = false,
+                            statusMessage = "Enter a topic before generating a video."
+                        )
+                    }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+
+                startRenderJob(topic, isShorts)
             }
 
-            ACTION_COMPLETE -> {
+            ACTION_CANCEL_RENDER -> {
+                renderJob?.cancel()
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        progressText = "",
+                        statusMessage = "Video generation cancelled."
+                    )
+                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+
+            else -> {
+                startAsForeground(
+                    buildNotification("Preparing video render…", 0)
+                )
+            }
+        }
+
+        return START_NOT_STICKY
+    }
+
+    private fun startRenderJob(topic: String, isShorts: Boolean) {
+        if (renderJob?.isActive == true) return
+
+        _renderState.value = RenderServiceState(
+            isGenerating = true,
+            progressText = "Starting video generation…",
+            progressPercentage = 0,
+            statusMessage = "",
+            generatedVideoUri = null
+        )
+
+        renderJob = serviceScope.launch {
+            var lastPercent = -1
+            var lastMessage = ""
+
+            try {
+                val result = videoRenderEngine.render(
+                    topic = topic,
+                    isShorts = isShorts
+                ) { rawPercent, message ->
+                    val percent = rawPercent.coerceIn(0, 100)
+                    _renderState.update {
+                        it.copy(
+                            progressPercentage = percent,
+                            progressText = message
+                        )
+                    }
+
+                    if (percent != lastPercent || message != lastMessage) {
+                        lastPercent = percent
+                        lastMessage = message
+                        notificationManager.notify(
+                            NOTIFICATION_ID,
+                            buildNotification(message, percent)
+                        )
+                    }
+                }
+
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        progressPercentage = 100,
+                        progressText = "Video saved to your gallery.",
+                        statusMessage = "Video generation complete.",
+                        generatedVideoUri = result.galleryUri
+                    )
+                }
+
                 notificationManager.notify(
                     NOTIFICATION_ID,
                     buildNotification("Video render complete", 100)
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
-            }
+            } catch (cancelled: CancellationException) {
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        statusMessage = "Video generation cancelled."
+                    )
+                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                throw cancelled
+            } catch (error: Exception) {
+                val errorMessage = error.message
+                    ?.takeIf(String::isNotBlank)
+                    ?.let { "Generation failed: $it" }
+                    ?: "Video generation failed. Please try again."
 
-            ACTION_FAIL -> {
-                val message = intent.getStringExtra(EXTRA_MESSAGE) ?: "Video render failed"
+                _renderState.update {
+                    it.copy(
+                        isGenerating = false,
+                        statusMessage = errorMessage
+                    )
+                }
+
                 notificationManager.notify(
                     NOTIFICATION_ID,
-                    buildNotification(message, 0)
+                    buildNotification(errorMessage, 0)
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
             }
-
-            else -> startAsForeground(
-                buildNotification("Preparing video render…", 0)
-            )
         }
-
-        return START_NOT_STICKY
     }
 
     private fun startAsForeground(notification: Notification) {
@@ -85,9 +209,9 @@ class VideoRenderService : Service() {
             .setContentText(message)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(progress < 100)
+            .setOngoing(progress in 1..99 || _renderState.value.isGenerating)
             .setOnlyAlertOnce(true)
-            .setProgress(100, progress, false)
+            .setProgress(100, progress.coerceIn(0, 100), false)
             .build()
 
     private fun createNotificationChannel() {
@@ -103,44 +227,38 @@ class VideoRenderService : Service() {
         }
     }
 
+    override fun onDestroy() {
+        renderJob?.cancel()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
-        const val ACTION_START = "com.rsmoviespot.service.action.START"
-        const val ACTION_PROGRESS = "com.rsmoviespot.service.action.PROGRESS"
-        const val ACTION_COMPLETE = "com.rsmoviespot.service.action.COMPLETE"
-        const val ACTION_FAIL = "com.rsmoviespot.service.action.FAIL"
+        const val ACTION_START_RENDER = "com.rsmoviespot.service.action.START_RENDER"
+        const val ACTION_CANCEL_RENDER = "com.rsmoviespot.service.action.CANCEL_RENDER"
 
-        const val EXTRA_PROGRESS = "extra_progress"
-        const val EXTRA_MESSAGE = "extra_message"
+        const val EXTRA_TOPIC = "extra_topic"
+        const val EXTRA_IS_SHORTS = "extra_is_shorts"
 
         private const val CHANNEL_ID = "video_render_channel"
         private const val NOTIFICATION_ID = 4101
 
-        fun start(context: Context) {
+        private val _renderState = MutableStateFlow(RenderServiceState())
+        val renderState: StateFlow<RenderServiceState> = _renderState.asStateFlow()
+
+        fun startRender(context: Context, topic: String, isShorts: Boolean) {
             val intent = Intent(context, VideoRenderService::class.java)
-                .setAction(ACTION_START)
+                .setAction(ACTION_START_RENDER)
+                .putExtra(EXTRA_TOPIC, topic)
+                .putExtra(EXTRA_IS_SHORTS, isShorts)
             ContextCompat.startForegroundService(context, intent)
         }
 
-        fun updateProgress(context: Context, progress: Int, message: String) {
+        fun cancelRender(context: Context) {
             val intent = Intent(context, VideoRenderService::class.java)
-                .setAction(ACTION_PROGRESS)
-                .putExtra(EXTRA_PROGRESS, progress)
-                .putExtra(EXTRA_MESSAGE, message)
-            context.startService(intent)
-        }
-
-        fun complete(context: Context) {
-            val intent = Intent(context, VideoRenderService::class.java)
-                .setAction(ACTION_COMPLETE)
-            context.startService(intent)
-        }
-
-        fun fail(context: Context, message: String) {
-            val intent = Intent(context, VideoRenderService::class.java)
-                .setAction(ACTION_FAIL)
-                .putExtra(EXTRA_MESSAGE, message)
+                .setAction(ACTION_CANCEL_RENDER)
             context.startService(intent)
         }
     }
