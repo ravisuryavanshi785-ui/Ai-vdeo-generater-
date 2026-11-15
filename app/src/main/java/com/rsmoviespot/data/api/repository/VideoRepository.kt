@@ -8,6 +8,7 @@ import com.rsmoviespot.data.api.EdgeTtsRequest
 import com.rsmoviespot.data.api.GroqApi
 import com.rsmoviespot.data.api.GroqChatRequest
 import com.rsmoviespot.data.api.GroqMessage
+import com.rsmoviespot.data.api.GroqResponseFormat
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
 import dagger.Binds
@@ -62,44 +63,69 @@ class VideoRepositoryImpl @Inject constructor(
             "GROQ_API_KEY is empty."
         }
 
-        val formatInstruction = if (isShorts) {
-            "YouTube Shorts (vertical 9:16, 7 to 9 fast-paced scenes, 10-14 words per scene, hook in scene 1)"
+        val defaultFormatGuide = if (isShorts) {
+            "Vertical 9:16 YouTube Shorts. Unless the user specifies another length or scene count, create 7 to 8 punchy scenes (~35-45 seconds total)."
         } else {
-            "YouTube landscape video (16:9, 8 to 12 engaging scenes, 12-18 words per scene)"
+            "Horizontal 16:9 YouTube video. Unless the user specifies another length or scene count, create 9 to 12 detailed scenes (~60-80 seconds total)."
         }
 
-        val systemPrompt = SYSTEM_PROMPT_TEMPLATE
-            .replace("{format}", formatInstruction)
-            .replace("{topic}", topic.trim())
+        val userPrompt = buildString {
+            appendLine("USER REQUEST (FOLLOW EVERY INSTRUCTION HERE STRICTLY):")
+            appendLine(topic.trim())
+            appendLine()
+            appendLine("Format guideline: $defaultFormatGuide")
+            appendLine("If the user mentioned a specific duration (e.g. '1 minute', '30 sec'), exact scene count, specific style, or specific plot points, OBEY the user request above everything else.")
+        }
 
-        val response = callWithHttpUrl {
-            groqApi.generateContent(
-                authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
-                request = GroqChatRequest(
-                    model = "openai/gpt-oss-120b",
-                    messages = listOf(
-                        GroqMessage(
-                            role = "system",
-                            content = systemPrompt
-                        ),
-                        GroqMessage(
-                            role = "user",
-                            content = "Create the JSON script for topic: ${topic.trim()}"
+        val modelsToTry = listOf(
+            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b"
+        )
+
+        var lastError: Throwable? = null
+        for ((index, modelId) in modelsToTry.withIndex()) {
+            try {
+                val response = callWithHttpUrl {
+                    groqApi.generateContent(
+                        authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
+                        request = GroqChatRequest(
+                            model = modelId,
+                            messages = listOf(
+                                GroqMessage(
+                                    role = "system",
+                                    content = SYSTEM_PROMPT
+                                ),
+                                GroqMessage(
+                                    role = "user",
+                                    content = userPrompt
+                                )
+                            ),
+                            temperature = 0.8,
+                            maxTokens = 4096,
+                            responseFormat = GroqResponseFormat(type = "json_object")
                         )
-                    ),
-                    temperature = 0.75
-                )
-            )
+                    )
+                }
+
+                val generatedText = response.choices
+                    .firstOrNull()
+                    ?.message
+                    ?.content
+                    ?.takeIf { it.isNotBlank() }
+                    ?: throw IllegalStateException("Groq returned empty result.")
+
+                return parseScriptResponse(generatedText)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                lastError = error
+                if (index == modelsToTry.lastIndex) {
+                    throw error
+                }
+            }
         }
 
-        val generatedText = response.choices
-            .firstOrNull()
-            ?.message
-            ?.content
-            ?.takeIf { it.isNotBlank() }
-            ?: throw IllegalStateException("Groq returned empty result.")
-
-        return parseScriptResponse(generatedText)
+        throw lastError ?: IllegalStateException("Failed to generate script.")
     }
 
     override suspend fun generateImageForSlab(
@@ -255,7 +281,6 @@ class VideoRepositoryImpl @Inject constructor(
                     error
                 )
                 lastError = wrapped
-                // Retry only on transient rate-limit / server errors
                 if ((code == 429 || code in 500..599) && attempt < MAX_API_ATTEMPTS - 1) {
                     delay(1500L * (attempt + 1))
                 } else {
@@ -298,20 +323,27 @@ class VideoRepositoryImpl @Inject constructor(
         const val DEFAULT_NEGATIVE_PROMPT =
             "text, watermark, signature, logo, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers, collage, split screen"
 
-        const val SYSTEM_PROMPT_TEMPLATE =
-            "You are a professional Hindi video scriptwriter and visual director for RS Movie Spot. " +
-                "Create a script for a {format} on the topic \"{topic}\". " +
-                "Return ONLY a valid JSON object (no markdown, no explanation) with this structure: " +
-                "{" +
-                "\"character_bible\": \"Short fixed description of the main character if the story has one (face, exact outfit/armor colors, single prop)\", " +
-                "\"visual_style\": \"Unified cinematic art style and lighting across scenes\", " +
-                "\"bgm_mood\": \"One of: epic_dark, devotional, suspense, sci_fi, emotional\", " +
-                "\"slabs\": [" +
-                "{\"voiceover_text\": \"1 short punchy Hindi sentence (10-14 words max) in Devanagari; spell करोड़ properly, transliterate English words like बॉक्स ऑफिस, कलेक्शन\", " +
-                "\"has_character\": true_or_false, " +
-                "\"image_prompt\": \"Rich visual scene in English. IMPORTANT: Do NOT repeat the same standing portrait! Vary shots wildly: crowded cinema theatre, wide battlefield, intense close-up, aerial landscape, golden coins/trophy, dramatic silhouette. Set has_character=false when showing environments/crowds/objects, and has_character=true ONLY when the main character appears in a distinct action pose or angle. Use 'Lord Rama' instead of 'Ram'.\", " +
-                "\"sfx_cue\": \"One of: boom, thunder, sword, fire, whoosh\"}" +
-                "]}"
+        const val SYSTEM_PROMPT =
+            "You are an elite Hindi storytelling scriptwriter and film director for RS Movie Spot. " +
+                "Your #1 priority is to STRICTLY obey every instruction in the user's request (duration, scene count, story angle, tone, facts). " +
+                "Write gripping, goosebumps-inducing spoken Hindi narration like top Indian YouTube storytellers — NOT dry Wikipedia facts. " +
+                "Start Scene 1 with an irresistible hook question or dramatic statement. Keep each scene connected smoothly to the next. " +
+                "In Hindi text, spell words accurately (e.g., करोड़, बॉक्स ऑफिस, ट्रेलर, छत्रपति शिवाजी महाराज) and avoid stiff literal translations. " +
+                "If user asks for ~1 minute, generate around 11-13 crisp scenes (each ~4.5-5 seconds, 12-16 words). For ~30 seconds, generate 6-7 crisp scenes (10-13 words). " +
+                "Return ONLY valid JSON matching this schema:\n" +
+                "{\n" +
+                "  \"character_bible\": \"Exact unchanging visual look of main character in English (age, face, beard, exact outfit/armor colors, weapon)\",\n" +
+                "  \"visual_style\": \"One unified cinematic art style, color palette, and dramatic lighting\",\n" +
+                "  \"bgm_mood\": \"epic_dark | devotional | suspense | sci_fi | emotional\",\n" +
+                "  \"slabs\": [\n" +
+                "    {\n" +
+                "      \"voiceover_text\": \"Punchy spoken Hindi narration in Devanagari\",\n" +
+                "      \"has_character\": true,\n" +
+                "      \"image_prompt\": \"Specific English visual scene with camera angle, action, and setting (vary shots: wide battle, fort silhouette, close-up eyes, crowd, palace map). Set has_character=false when character is not in frame.\",\n" +
+                "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
+                "    }\n" +
+                "  ]\n" +
+                "}"
     }
 }
 
