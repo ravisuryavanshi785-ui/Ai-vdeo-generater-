@@ -1,13 +1,13 @@
 package com.rsmoviespot.data.repository
 
 import com.rsmoviespot.BuildConfig
+import com.rsmoviespot.data.api.CloudflareApi
+import com.rsmoviespot.data.api.CloudflareImageRequest
 import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.EdgeTtsRequest
 import com.rsmoviespot.data.api.GroqApi
 import com.rsmoviespot.data.api.GroqChatRequest
 import com.rsmoviespot.data.api.GroqMessage
-import com.rsmoviespot.data.api.HuggingFaceApi
-import com.rsmoviespot.data.api.HuggingFaceImageRequest
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
 import dagger.Binds
@@ -35,7 +35,7 @@ interface VideoRepository {
 @Singleton
 class VideoRepositoryImpl @Inject constructor(
     private val groqApi: GroqApi,
-    private val huggingFaceApi: HuggingFaceApi,
+    private val cloudflareApi: CloudflareApi,
     private val edgeTtsApi: EdgeTtsApi
 ) : VideoRepository {
 
@@ -57,7 +57,7 @@ class VideoRepositoryImpl @Inject constructor(
                 groqApi.generateContent(
                     authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                     request = GroqChatRequest(
-                        model = "openai/gpt-oss-20b", 
+                        model = "openai/gpt-oss-20b",
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
@@ -90,16 +90,20 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateImageForSlab(prompt: String): ResponseBody {
         require(prompt.isNotBlank()) { "Image prompt must not be blank." }
-        require(BuildConfig.HUGGING_FACE_KEY.isNotBlank()) {
-            "HUGGING_FACE_KEY is empty."
+        require(BuildConfig.CLOUDFLARE_ACCOUNT_ID.isNotBlank()) {
+            "CLOUDFLARE_ACCOUNT_ID is empty."
+        }
+        require(BuildConfig.CLOUDFLARE_API_TOKEN.isNotBlank()) {
+            "CLOUDFLARE_API_TOKEN is empty."
         }
 
         return callWithHttpUrl {
-            huggingFaceApi.generateImage(
-                authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
-                model = "black-forest-labs/FLUX.1-schnell",
-                request = HuggingFaceImageRequest(
-                    inputs = prompt
+            cloudflareApi.generateImage(
+                authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
+                accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
+                model = "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+                request = CloudflareImageRequest(
+                    prompt = prompt
                 )
             )
         }
