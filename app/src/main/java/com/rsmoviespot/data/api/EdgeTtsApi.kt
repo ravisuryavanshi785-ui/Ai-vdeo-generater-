@@ -1,5 +1,10 @@
 package com.rsmoviespot.data.api
 
+import android.content.Context
+import dagger.hilt.android.qualifiers.ApplicationContext
+import io.github.whitemagic2014.tts.TTS
+import io.github.whitemagic2014.tts.TTSVoice
+import io.github.whitemagic2014.tts.bean.Voice
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -11,19 +16,94 @@ import okhttp3.Request
 import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
+import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class EdgeTtsApi @Inject constructor(
-    private val okHttpClient: OkHttpClient
+    private val okHttpClient: OkHttpClient,
+    @ApplicationContext private val context: Context
 ) {
     suspend fun synthesize(request: EdgeTtsRequest): ResponseBody = withContext(Dispatchers.IO) {
         val cleanText = request.text.trim()
         require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
 
-        val languageCode = resolveLanguageCode(request.voice)
+        val edgeBytes = runCatching {
+            synthesizeWithEdgeNeural(cleanText, request.voice)
+        }.getOrNull()
+
+        if (edgeBytes != null && edgeBytes.isNotEmpty()) {
+            return@withContext edgeBytes.toResponseBody("audio/mpeg".toMediaType())
+        }
+
+        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, request.voice)
+        if (fallbackBytes.isEmpty()) {
+            throw IOException("TTS produced empty audio output.")
+        }
+
+        return@withContext fallbackBytes.toResponseBody("audio/mpeg".toMediaType())
+    }
+
+    private fun synthesizeWithEdgeNeural(text: String, voiceName: String): ByteArray {
+        val voice = findEdgeVoice(voiceName)
+            ?: throw IOException("Edge Neural voice not found: $voiceName")
+
+        val tempDir = File(context.cacheDir, "edge-tts-${UUID.randomUUID()}")
+        if (!tempDir.exists() && !tempDir.mkdirs()) {
+            throw IOException("Could not create Edge TTS temp directory.")
+        }
+
+        try {
+            val fileBaseName = "voice"
+            val resultName = TTS(voice, text)
+                .findHeadHook()
+                .storage(tempDir.absolutePath)
+                .fileName(fileBaseName)
+                .overwrite(true)
+                .formatMp3()
+                .trans()
+
+            val directFile = resultName?.takeIf { it.isNotBlank() }?.let { name ->
+                val candidate = File(name)
+                when {
+                    candidate.isAbsolute && candidate.exists() -> candidate
+                    File(tempDir, name).exists() -> File(tempDir, name)
+                    File(tempDir, "$name.mp3").exists() -> File(tempDir, "$name.mp3")
+                    else -> null
+                }
+            }
+
+            val outputFile = directFile
+                ?: File(tempDir, "$fileBaseName.mp3").takeIf { it.exists() }
+                ?: tempDir.listFiles()?.firstOrNull { it.isFile && it.length() > 0L }
+                ?: throw IOException("Edge TTS output file was not created.")
+
+            val bytes = outputFile.readBytes()
+            if (bytes.isEmpty()) {
+                throw IOException("Edge TTS output file is empty.")
+            }
+            return bytes
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    private fun findEdgeVoice(requestedVoice: String): Voice? {
+        val voices = TTSVoice.provides()
+        return voices.firstOrNull { it.shortName.equals(requestedVoice, ignoreCase = true) }
+            ?: voices.firstOrNull { it.shortName.equals("hi-IN-MadhurNeural", ignoreCase = true) }
+            ?: voices.firstOrNull { it.shortName.equals("hi-IN-SwaraNeural", ignoreCase = true) }
+            ?: voices.firstOrNull { it.locale.startsWith("hi", ignoreCase = true) }
+    }
+
+    private suspend fun synthesizeWithGoogleFallback(
+        cleanText: String,
+        voiceName: String
+    ): ByteArray {
+        val languageCode = resolveLanguageCode(voiceName)
         val chunks = splitIntoChunks(cleanText, MAX_CHUNK_LENGTH)
         require(chunks.isNotEmpty()) { "No speakable text chunks found." }
 
@@ -35,12 +115,7 @@ class EdgeTtsApi @Inject constructor(
             outputStream.write(audioPayload)
         }
 
-        val finalBytes = outputStream.toByteArray()
-        if (finalBytes.isEmpty()) {
-            throw IOException("TTS produced empty audio output.")
-        }
-
-        return@withContext finalBytes.toResponseBody("audio/mpeg".toMediaType())
+        return outputStream.toByteArray()
     }
 
     private suspend fun fetchChunkWithRetry(
