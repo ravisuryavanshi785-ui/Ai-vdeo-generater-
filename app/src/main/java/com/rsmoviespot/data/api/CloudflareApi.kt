@@ -25,5 +25,9 @@ data class CloudflareImageRequest(
     val width: Int,
     val height: Int,
     @SerialName("negative_prompt")
-    val negativePrompt: String
+    val negativePrompt: String,
+    val seed: Int,
+    @SerialName("num_steps")
+    val numSteps: Int,
+    val guidance: Double
 )
