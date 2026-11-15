@@ -20,7 +20,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.ResponseBody
 import retrofit2.HttpException
 import javax.inject.Inject
@@ -28,7 +30,11 @@ import javax.inject.Singleton
 
 interface VideoRepository {
     suspend fun generateScript(topic: String, isShorts: Boolean = true): VideoScriptResponse
-    suspend fun generateImageForSlab(prompt: String, isShorts: Boolean = true): ResponseBody
+    suspend fun generateImageForSlab(
+        prompt: String,
+        isShorts: Boolean = true,
+        seed: Int = 42
+    ): ResponseBody
     suspend fun generateAudioForSlab(text: String): ResponseBody
 }
 
@@ -54,7 +60,7 @@ class VideoRepositoryImpl @Inject constructor(
         }
 
         val formatInstruction = if (isShorts) {
-            "YouTube Shorts (vertical 9:16, 5 to 6 punchy scenes, hook in scene 1)"
+            "YouTube Shorts (vertical 9:16, 4 to 6 punchy scenes, hook in scene 1)"
         } else {
             "YouTube landscape video (16:9, 6 to 8 engaging storytelling scenes)"
         }
@@ -95,7 +101,8 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateImageForSlab(
         prompt: String,
-        isShorts: Boolean
+        isShorts: Boolean,
+        seed: Int
     ): ResponseBody {
         require(prompt.isNotBlank()) { "Image prompt must not be blank." }
         require(BuildConfig.CLOUDFLARE_ACCOUNT_ID.isNotBlank()) {
@@ -117,7 +124,10 @@ class VideoRepositoryImpl @Inject constructor(
                     prompt = prompt,
                     width = imageWidth,
                     height = imageHeight,
-                    negativePrompt = DEFAULT_NEGATIVE_PROMPT
+                    negativePrompt = DEFAULT_NEGATIVE_PROMPT,
+                    seed = seed,
+                    numSteps = 20,
+                    guidance = 7.5
                 )
             )
         }
@@ -138,9 +148,18 @@ class VideoRepositoryImpl @Inject constructor(
         val extractedJson = extractJsonPayload(rawText)
         val root = json.parseToJsonElement(extractedJson)
 
+        var characterBible = ""
+        var visualStyle = ""
+        var bgmMood = "epic_dark"
+
         val slabElements: List<JsonElement> = when (root) {
             is JsonArray -> root
             is JsonObject -> {
+                characterBible = root["character_bible"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+                visualStyle = root["visual_style"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+                bgmMood = root["bgm_mood"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+                    .ifBlank { "epic_dark" }
+
                 val array = root["slabs"]
                     ?: root["scenes"]
                     ?: root["script"]
@@ -157,19 +176,26 @@ class VideoRepositoryImpl @Inject constructor(
             val dto = json.decodeFromJsonElement<GeneratedSlabDto>(element)
             val voiceover = dto.voiceoverText.trim()
             val prompt = dto.imagePrompt.trim()
+            val sfxCue = dto.sfxCue?.trim()?.lowercase()?.ifBlank { "whoosh" } ?: "whoosh"
             if (voiceover.isBlank() || prompt.isBlank()) {
                 null
             } else {
                 VideoSlab(
                     id = dto.id ?: index + 1,
                     voiceover_text = voiceover,
-                    image_prompt = prompt
+                    image_prompt = prompt,
+                    sfx_cue = sfxCue
                 )
             }
         }
 
         require(slabs.isNotEmpty()) { "Groq returned an empty script." }
-        return VideoScriptResponse(slabs = slabs)
+        return VideoScriptResponse(
+            character_bible = characterBible,
+            visual_style = visualStyle,
+            bgm_mood = bgmMood,
+            slabs = slabs
+        )
     }
 
     private fun extractJsonPayload(rawText: String): String {
@@ -228,7 +254,9 @@ class VideoRepositoryImpl @Inject constructor(
         @SerialName("voiceover_text")
         val voiceoverText: String,
         @SerialName("image_prompt")
-        val imagePrompt: String
+        val imagePrompt: String,
+        @SerialName("sfx_cue")
+        val sfxCue: String? = null
     )
 
     private companion object {
@@ -239,14 +267,21 @@ class VideoRepositoryImpl @Inject constructor(
         const val LANDSCAPE_IMAGE_WIDTH = 1344
         const val LANDSCAPE_IMAGE_HEIGHT = 768
         const val DEFAULT_NEGATIVE_PROMPT =
-            "text, watermark, signature, logo, blurry, low quality, distorted, deformed"
+            "text, watermark, signature, logo, blurry, low quality, distorted, deformed, inconsistent outfit, different character, collage, split screen"
 
         const val SYSTEM_PROMPT_TEMPLATE =
-            "You are a professional Hindi video scriptwriter for RS Movie Spot. " +
+            "You are a professional Hindi video scriptwriter and visual director for RS Movie Spot. " +
                 "Create a script for a {format} on the topic \"{topic}\". " +
-                "Return ONLY a valid JSON array (no markdown, no explanation) where each item has: " +
-                "\"voiceover_text\" (natural engaging spoken Hindi in clean Devanagari script; transliterate modern English terms accurately like बॉक्स ऑफिस, कलेक्शन, ट्रेलर instead of literal word-for-word translation; 1-2 crisp sentences per scene) and " +
-                "\"image_prompt\" (detailed English visual description keeping one consistent cinematic digital art style across all scenes, unambiguous nouns like 'Lord Rama' instead of 'Ram', no text or watermarks)."
+                "Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure: " +
+                "{" +
+                "\"character_bible\": \"Strict unchanging physical description of the main character in English (exact age, face, hair/beard, exact outfit/armor material and colors, exact single weapon/prop if any) so every scene draws the SAME person\", " +
+                "\"visual_style\": \"One unified cinematic art style, color palette, and lighting description used in every scene\", " +
+                "\"bgm_mood\": \"One of: epic_dark, devotional, suspense, sci_fi, emotional\", " +
+                "\"slabs\": [" +
+                "{\"voiceover_text\": \"Natural engaging spoken Hindi in clean Devanagari script; transliterate modern English terms accurately like बॉक्स ऑफिस, कलेक्शन, ट्रेलर; 1-2 crisp sentences per scene\", " +
+                "\"image_prompt\": \"Describe ONLY the scene action, pose, camera framing, and environment in English (do NOT change the character's outfit, armor color, helmet, or weapon defined in character_bible; use 'Lord Rama' instead of 'Ram')\", " +
+                "\"sfx_cue\": \"One of: boom, thunder, sword, fire, whoosh\"}" +
+                "]}"
     }
 }
 
