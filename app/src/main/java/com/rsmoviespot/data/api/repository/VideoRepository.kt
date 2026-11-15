@@ -61,6 +61,7 @@ class VideoRepositoryImpl @Inject constructor(
                 groqApi.generateContent(
                     authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                     request = GroqChatRequest(
+                        model = "llama-3.3-70b-versatile", // YAHAN FIX KIYA HAI: Model property pass karni zaroori hai
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
