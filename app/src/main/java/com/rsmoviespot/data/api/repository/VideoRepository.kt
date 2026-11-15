@@ -67,7 +67,7 @@ class VideoRepositoryImpl @Inject constructor(
             groqApi.generateContent(
                 authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                 request = GroqChatRequest(
-                    model = "openai/gpt-oss-20b",
+                    model = "openai/gpt-oss-120b",
                     messages = listOf(
                         GroqMessage(
                             role = "system",
@@ -245,8 +245,8 @@ class VideoRepositoryImpl @Inject constructor(
             "You are a professional Hindi video scriptwriter for RS Movie Spot. " +
                 "Create a script for a {format} on the topic \"{topic}\". " +
                 "Return ONLY a valid JSON array (no markdown, no explanation) where each item has: " +
-                "\"voiceover_text\" (natural engaging spoken Hindi in Devanagari script, 1-2 crisp sentences per scene) and " +
-                "\"image_prompt\" (detailed cinematic visual description in English for AI image generation, no text or watermarks)."
+                "\"voiceover_text\" (natural engaging spoken Hindi in clean Devanagari script; transliterate modern English terms accurately like बॉक्स ऑफिस, कलेक्शन, ट्रेलर instead of literal word-for-word translation; 1-2 crisp sentences per scene) and " +
+                "\"image_prompt\" (detailed English visual description keeping one consistent cinematic digital art style across all scenes, unambiguous nouns like 'Lord Rama' instead of 'Ram', no text or watermarks)."
     }
 }
 
