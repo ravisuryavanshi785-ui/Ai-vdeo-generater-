@@ -4,6 +4,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.Serializable
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
@@ -27,7 +28,9 @@ import kotlin.coroutines.resumeWithException
 class EdgeTtsApi @Inject constructor(
     baseOkHttpClient: OkHttpClient
 ) {
+    // Yahan HTTP/1.1 force kiya hai taaki Microsoft bot samajh kar 403 block na kare
     private val wsClient: OkHttpClient = baseOkHttpClient.newBuilder()
+        .protocols(listOf(Protocol.HTTP_1_1))
         .pingInterval(20, TimeUnit.SECONDS)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -43,19 +46,21 @@ class EdgeTtsApi @Inject constructor(
                 "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
                     "?TrustedClientToken=$trustedClientToken" +
                     "&Sec-MS-GEC=$secMsGec" +
-                    "&Sec-MS-GEC-Version=1-130.0.2849.68" +
+                    "&Sec-MS-GEC-Version=1-131.0.2903.86" +
                     "&ConnectionId=$connectionId"
 
             val wsRequest = Request.Builder()
                 .url(url)
                 .header("Pragma", "no-cache")
                 .header("Cache-Control", "no-cache")
+                .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+                .header("Accept-Encoding", "gzip, deflate, br")
+                .header("Accept-Language", "en-US,en;q=0.9")
                 .header(
                     "User-Agent",
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
                 )
-                .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
                 .build()
 
             val audioBuffer = ByteArrayOutputStream()
