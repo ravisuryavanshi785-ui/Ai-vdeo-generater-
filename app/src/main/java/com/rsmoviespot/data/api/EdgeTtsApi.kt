@@ -17,6 +17,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -24,8 +25,14 @@ import kotlin.coroutines.resumeWithException
 
 @Singleton
 class EdgeTtsApi @Inject constructor(
-    private val okHttpClient: OkHttpClient
+    baseOkHttpClient: OkHttpClient
 ) {
+    private val wsClient: OkHttpClient = baseOkHttpClient.newBuilder()
+        .pingInterval(20, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+
     suspend fun synthesize(request: EdgeTtsRequest): ResponseBody =
         suspendCancellableCoroutine { continuation ->
             val trustedClientToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
@@ -112,14 +119,15 @@ class EdgeTtsApi @Inject constructor(
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (continuation.isActive) {
+                        val code = response?.code?.let { " (HTTP $it)" }.orEmpty()
                         continuation.resumeWithException(
-                            IllegalStateException("Edge TTS WebSocket failed: ${t.message}", t)
+                            IllegalStateException("Edge TTS WebSocket failed$code: ${t.message}", t)
                         )
                     }
                 }
             }
 
-            val webSocket = okHttpClient.newWebSocket(wsRequest, listener)
+            val webSocket = wsClient.newWebSocket(wsRequest, listener)
             continuation.invokeOnCancellation {
                 webSocket.cancel()
             }
