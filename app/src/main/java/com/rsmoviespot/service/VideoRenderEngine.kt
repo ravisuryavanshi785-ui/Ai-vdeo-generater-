@@ -55,7 +55,7 @@ class VideoRenderEngine @Inject constructor(
 
         try {
             progress(2, "Generating script…")
-            val script = videoRepository.generateScript(topic)
+            val script = videoRepository.generateScript(topic, isShorts)
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
 
             val segmentFiles = mutableListOf<File>()
@@ -68,7 +68,7 @@ class VideoRenderEngine @Inject constructor(
                     "Creating scene ${index + 1} of $slabCount…"
                 )
 
-                val imageFile = File(renderDirectory, "slab_${index + 1}.jpg")
+                val imageFile = File(renderDirectory, "slab_${index + 1}.png")
                 val audioFile = File(renderDirectory, "slab_${index + 1}.mp3")
                 val segmentFile = File(renderDirectory, "segment_${index + 1}.mp4")
 
@@ -83,7 +83,7 @@ class VideoRenderEngine @Inject constructor(
                     )
                 }
 
-                videoRepository.generateImageForSlab(imagePrompt).use { body ->
+                videoRepository.generateImageForSlab(imagePrompt, isShorts).use { body ->
                     imageFile.outputStream().use { output ->
                         body.byteStream().use { input -> input.copyTo(output) }
                     }
