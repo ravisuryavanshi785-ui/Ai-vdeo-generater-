@@ -107,7 +107,7 @@ class VideoRenderEngine @Inject constructor(
                 )
 
                 runFfmpeg(
-                    createSegmentCommand(
+                    createSegmentArguments(
                         imageFile = imageFile,
                         audioFile = audioFile,
                         outputFile = segmentFile,
@@ -128,7 +128,7 @@ class VideoRenderEngine @Inject constructor(
             )
 
             val finalFile = File(renderDirectory, "final_video.mp4")
-            runFfmpeg(createConcatCommand(concatList, finalFile))
+            runFfmpeg(createConcatArguments(concatList, finalFile))
 
             progress(96, "Saving video to gallery…")
             val galleryUri = publishToMediaStore(finalFile, topic)
@@ -182,14 +182,14 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun createSegmentCommand(
+    private fun createSegmentArguments(
         imageFile: File,
         audioFile: File,
         outputFile: File,
         width: Int,
         height: Int,
         durationSeconds: Double
-    ): String {
+    ): Array<String> {
         val totalFrames = (durationSeconds * FRAME_RATE)
             .roundToInt()
             .coerceAtLeast(FRAME_RATE * 2)
@@ -205,66 +205,75 @@ class VideoRenderEngine @Inject constructor(
                 "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE," +
                 "format=yuv420p"
 
-        return listOf(
+        return arrayOf(
             "-y",
-            "-loop 1",
-            "-framerate $FRAME_RATE",
-            "-i ${quoteFfmpegPath(imageFile)}",
-            "-i ${quoteFfmpegPath(audioFile)}",
-            "-vf \"$filter\"",
-            "-map 0:v:0",
-            "-map 1:a:0",
-            "-af apad",
-            "-t $formattedDuration",
-            "-c:v libx264",
-            "-preset veryfast",
-            "-crf 21",
-            "-profile:v high",
-            "-pix_fmt yuv420p",
-            "-r $FRAME_RATE",
-            "-c:a aac",
-            "-b:a 192k",
-            "-ar 44100",
-            "-ac 2",
-            "-movflags +faststart",
-            quoteFfmpegPath(outputFile)
-        ).joinToString(" ")
+            "-i", imageFile.absolutePath,
+            "-i", audioFile.absolutePath,
+            "-vf", filter,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-af", "apad",
+            "-t", formattedDuration,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "21",
+            "-threads", "2",
+            "-pix_fmt", "yuv420p",
+            "-r", FRAME_RATE.toString(),
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar", "44100",
+            "-ac", "2",
+            "-movflags", "+faststart",
+            outputFile.absolutePath
+        )
     }
 
-    private fun createConcatCommand(
+    private fun createConcatArguments(
         concatList: File,
         outputFile: File
-    ): String = listOf(
+    ): Array<String> = arrayOf(
         "-y",
-        "-f concat",
-        "-safe 0",
-        "-i ${quoteFfmpegPath(concatList)}",
-        "-c copy",
-        "-movflags +faststart",
-        quoteFfmpegPath(outputFile)
-    ).joinToString(" ")
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatList.absolutePath,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        outputFile.absolutePath
+    )
 
-    private suspend fun runFfmpeg(command: String): FFmpegSession =
+    private suspend fun runFfmpeg(arguments: Array<String>): FFmpegSession =
         suspendCancellableCoroutine { continuation ->
-            val session = FFmpegKit.executeAsync(command) { completedSession ->
-                if (!continuation.isActive) return@executeAsync
+            try {
+                val session = FFmpegKit.executeWithArgumentsAsync(arguments) { completedSession ->
+                    if (!continuation.isActive) return@executeWithArgumentsAsync
 
-                if (ReturnCode.isSuccess(completedSession.returnCode)) {
-                    continuation.resume(completedSession)
-                } else {
-                    val details = completedSession.allLogsAsString
-                        ?.takeIf(String::isNotBlank)
-                        ?: completedSession.failStackTrace
-                        ?: "No FFmpeg error details available."
+                    if (ReturnCode.isSuccess(completedSession.returnCode)) {
+                        continuation.resume(completedSession)
+                    } else {
+                        val details = completedSession.allLogsAsString
+                            ?.takeIf(String::isNotBlank)
+                            ?: completedSession.failStackTrace
+                            ?: "No FFmpeg error details available."
 
+                        continuation.resumeWithException(
+                            IOException("FFmpeg failed: $details")
+                        )
+                    }
+                }
+
+                continuation.invokeOnCancellation {
+                    FFmpegKit.cancel(session.sessionId)
+                }
+            } catch (throwable: Throwable) {
+                if (continuation.isActive) {
                     continuation.resumeWithException(
-                        IOException("FFmpeg command failed: $details")
+                        IOException(
+                            "FFmpeg startup error (${throwable::class.java.simpleName}): ${throwable.message ?: "Unknown"}",
+                            throwable
+                        )
                     )
                 }
-            }
-
-            continuation.invokeOnCancellation {
-                FFmpegKit.cancel(session.sessionId)
             }
         }
 
@@ -322,9 +331,6 @@ class VideoRenderEngine @Inject constructor(
             .trim('_')
             .take(60)
             .ifBlank { "video" }
-
-    private fun quoteFfmpegPath(file: File): String =
-        "'${file.absolutePath.replace("'", "'\\''")}'"
 
     private fun escapeConcatPath(path: String): String =
         path.replace("\\", "\\\\").replace("'", "'\\''")
