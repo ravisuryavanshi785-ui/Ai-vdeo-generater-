@@ -78,7 +78,7 @@ object NetworkModule {
         json: Json
     ): HuggingFaceApi =
         Retrofit.Builder()
-            .baseUrl("https://router.huggingface.co/")
+            .baseUrl("https://api.endpoints.huggingface.cloud/")
             .client(client)
             .addConverterFactory(
                 json.asConverterFactory("application/json".toMediaType())
