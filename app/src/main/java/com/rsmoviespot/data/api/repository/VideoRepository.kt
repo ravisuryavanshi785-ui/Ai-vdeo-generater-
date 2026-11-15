@@ -8,12 +8,12 @@ import com.rsmoviespot.data.api.GeminiContent
 import com.rsmoviespot.data.api.GeminiGenerateContentRequest
 import com.rsmoviespot.data.api.GeminiPart
 import com.rsmoviespot.data.api.HuggingFaceApi
-import com.rsmoviespot.data.api.HuggingFaceImageRequest
+import com.rsmoviespot.data.api.TextToImageParameters
+import com.rsmoviespot.data.api.TextToImageRequest
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
 import dagger.Binds
 import dagger.Module
-import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.serialization.SerialName
@@ -64,9 +64,7 @@ class VideoRepositoryImpl @Inject constructor(
                     contents = listOf(
                         GeminiContent(
                             role = "user",
-                            parts = listOf(
-                                GeminiPart(text = "Generate the script now.")
-                            )
+                            parts = listOf(GeminiPart(text = "Generate the script now."))
                         )
                     )
                 )
@@ -129,7 +127,18 @@ class VideoRepositoryImpl @Inject constructor(
         return callWithHttpUrl {
             huggingFaceApi.generateImage(
                 authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
-                request = HuggingFaceImageRequest(inputs = prompt)
+                request = TextToImageRequest(
+                    inputs = prompt,
+                    model = "stabilityai/stable-diffusion-3-medium-diffusers",
+                    provider = "hf-inference",
+                    parameters = TextToImageParameters(
+                        guidance_scale = 7.5,
+                        num_inference_steps = 30,
+                        width = 768,
+                        height = 768,
+                        negative_prompt = "blurry, low quality"
+                    )
+                )
             )
         }
     }
@@ -179,15 +188,14 @@ class VideoRepositoryImpl @Inject constructor(
 
         const val SYSTEM_PROMPT_TEMPLATE =
             "You are a YouTube Shorts scriptwriter for RS Movie Spot. " +
-                "The topic is {topic}. Return only a valid JSON array of objects " +
-                "with 'voiceover_text' and 'image_prompt' fields."
+                "The topic is {topic}. Return only valid JSON array of objects " +
+                "with 'voiceover_text' and 'image_prompt'."
     }
 }
 
 @Module
 @InstallIn(SingletonComponent::class)
 abstract class VideoRepositoryModule {
-
     @Binds
     @Singleton
     abstract fun bindVideoRepository(
