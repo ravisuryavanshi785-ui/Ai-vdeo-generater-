@@ -70,7 +70,11 @@ android {
 
     packaging {
         resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += listOf(
+                "/META-INF/{AL2.0,LGPL2.1}",
+                "META-INF/INDEX.LIST",
+                "META-INF/DEPENDENCIES"
+            )
         }
         jniLibs {
             pickFirsts += listOf(
@@ -117,6 +121,9 @@ dependencies {
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // Real Microsoft Edge Neural TTS
+    implementation("io.github.whitemagic2014:tts-edge-java:1.3.4")
 
     // FFmpegKit (GPL build required for libx264)
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl:8.1.7")
