@@ -8,8 +8,8 @@ import retrofit2.http.Query
 
 interface GeminiApi {
 
-    // Yahan fix kiya hai: Ek single clean string bina extra quotes ke
-    @POST("v1beta/models/gemini-1.5-flash:generateContent")
+    // Yahan fix kiya hai: 1.5-pro-latest ki jagah active model gemini-2.0-flash
+    @POST("v1beta/models/gemini-2.0-flash:generateContent")
     suspend fun generateContent(
         @Query("key") apiKey: String,
         @Body request: GeminiGenerateContentRequest
