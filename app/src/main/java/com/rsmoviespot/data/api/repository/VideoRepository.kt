@@ -57,7 +57,8 @@ class VideoRepositoryImpl @Inject constructor(
                 groqApi.generateContent(
                     authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
                     request = GroqChatRequest(
-                        model = "llama3-70b-8192", // YAHAN FIX KIYA HAI: Galat model name hata kar 100% active Llama 3 model daal diya
+                        // YAHAN FIX KIYA HAI: Universal aur 100% active free tier model daal diya
+                        model = "llama-3.1-8b-instant", 
                         messages = listOf(
                             GroqMessage(
                                 role = "system",
