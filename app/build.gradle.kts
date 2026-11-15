@@ -21,17 +21,21 @@ android {
             useSupportLibrary = true
         }
 
-        // YAHAN FIX KIYA HAI: Gemini ki jagah Groq lagaya hai aur local.properties (findProperty) ka support add kiya hai
         val groqKey = (project.findProperty("GROQ_API_KEY") as? String ?: System.getenv("GROQ_API_KEY") ?: "")
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
-            
-        val huggingFaceKey = (project.findProperty("HUGGING_FACE_KEY") as? String ?: System.getenv("HUGGING_FACE_KEY") ?: "")
+
+        val cloudflareAccountId = (project.findProperty("CLOUDFLARE_ACCOUNT_ID") as? String ?: System.getenv("CLOUDFLARE_ACCOUNT_ID") ?: "")
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+
+        val cloudflareApiToken = (project.findProperty("CLOUDFLARE_API_TOKEN") as? String ?: System.getenv("CLOUDFLARE_API_TOKEN") ?: "")
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
 
         buildConfigField("String", "GROQ_API_KEY", "\"$groqKey\"")
-        buildConfigField("String", "HUGGING_FACE_KEY", "\"$huggingFaceKey\"")
+        buildConfigField("String", "CLOUDFLARE_ACCOUNT_ID", "\"$cloudflareAccountId\"")
+        buildConfigField("String", "CLOUDFLARE_API_TOKEN", "\"$cloudflareApiToken\"")
     }
 
     buildTypes {
