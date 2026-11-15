@@ -48,39 +48,74 @@ class VideoRepositoryImpl @Inject constructor(
     override suspend fun generateScript(topic: String): VideoScriptResponse {
         require(topic.isNotBlank()) { "Topic must not be blank." }
         require(BuildConfig.GEMINI_API_KEY.isNotBlank()) {
-            "GEMINI_API_KEY is empty. Check your API-key configuration."
+            "GEMINI_API_KEY is empty."
         }
 
         val prompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
 
-        val response = callWithHttpUrl {
-            geminiApi.generateContent(
-                apiKey = BuildConfig.GEMINI_API_KEY,
-                request = GeminiGenerateContentRequest(
-                    systemInstruction = GeminiContent(
-                        parts = listOf(GeminiPart(text = prompt))
-                    ),
-                    contents = listOf(
-                        GeminiContent(
-                            role = "user",
-                            parts = listOf(
-                                GeminiPart(text = "Generate the script now.")
+        return try {
+            val response = callWithHttpUrl {
+                geminiApi.generateContent(
+                    apiKey = BuildConfig.GEMINI_API_KEY,
+                    request = GeminiGenerateContentRequest(
+                        systemInstruction = GeminiContent(
+                            parts = listOf(GeminiPart(text = prompt))
+                        ),
+                        contents = listOf(
+                            GeminiContent(
+                                role = "user",
+                                parts = listOf(GeminiPart(text = "Generate the script now."))
                             )
                         )
                     )
                 )
+            }
+
+            val generatedText = response.candidates
+                .firstOrNull()
+                ?.content
+                ?.parts
+                ?.firstOrNull()
+                ?.text
+                ?: throw IllegalStateException("Gemini returned empty result.")
+
+            parseScriptResponse(generatedText)
+        } catch (e: HttpException) {
+            val errorBody = e.response()?.errorBody()?.string().orEmpty()
+            throw IllegalStateException(
+                "Gemini API error: HTTP ${e.code()} - $errorBody",
+                e
             )
         }
+    }
 
-        val generatedText = response.candidates
-            .firstOrNull()
-            ?.content
-            ?.parts
-            ?.firstOrNull()
-            ?.text
-            ?: throw IllegalStateException("Gemini returned no generated text.")
+    override suspend fun generateImageForSlab(prompt: String): ResponseBody {
+        require(prompt.isNotBlank()) { "Image prompt must not be blank." }
+        require(BuildConfig.HUGGING_FACE_KEY.isNotBlank()) {
+            "HUGGING_FACE_KEY is empty."
+        }
 
-        return parseScriptResponse(generatedText)
+        return callWithHttpUrl {
+            huggingFaceApi.generateImage(
+                authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
+                model = "stabilityai/stable-diffusion-2-1",
+                request = com.rsmoviespot.data.api.HuggingFaceImageRequest(
+                    inputs = prompt
+                )
+            )
+        }
+    }
+
+    override suspend fun generateAudioForSlab(text: String): ResponseBody {
+        require(text.isNotBlank()) { "Voiceover text must not be blank." }
+        return callWithHttpUrl {
+            edgeTtsApi.synthesize(
+                EdgeTtsRequest(
+                    text = text,
+                    voice = HINDI_VOICE
+                )
+            )
+        }
     }
 
     private fun parseScriptResponse(text: String): VideoScriptResponse {
@@ -97,8 +132,7 @@ class VideoRepositoryImpl @Inject constructor(
             is JsonArray -> root
             is JsonObject -> {
                 val array = root["slabs"] ?: root["scenes"]
-                    ?: error("Expected a 'slabs' or 'scenes' JSON array.")
-
+                    ?: error("Expected 'slabs' or 'scenes' JSON array.")
                 array as? JsonArray
                     ?: error("'slabs' or 'scenes' must be a JSON array.")
             }
@@ -107,7 +141,6 @@ class VideoRepositoryImpl @Inject constructor(
 
         val slabs = slabElements.mapIndexed { index, element ->
             val dto = json.decodeFromJsonElement<GeneratedSlabDto>(element)
-
             VideoSlab(
                 id = dto.id ?: index + 1,
                 voiceover_text = dto.voiceoverText,
@@ -119,37 +152,7 @@ class VideoRepositoryImpl @Inject constructor(
         return VideoScriptResponse(slabs = slabs)
     }
 
-    override suspend fun generateImageForSlab(prompt: String): ResponseBody {
-        require(prompt.isNotBlank()) { "Image prompt must not be blank." }
-        require(BuildConfig.HUGGING_FACE_KEY.isNotBlank()) {
-            "HUGGING_FACE_KEY is empty. Check your API-key configuration."
-        }
-
-        return callWithHttpUrl {
-            huggingFaceApi.generateImage(
-                authorization = "Bearer ${BuildConfig.HUGGING_FACE_KEY}",
-                model = "stabilityai/stable-diffusion-2-1",
-                request = HuggingFaceImageRequest(inputs = prompt)
-            )
-        }
-    }
-
-    override suspend fun generateAudioForSlab(text: String): ResponseBody {
-        require(text.isNotBlank()) { "Voiceover text must not be blank." }
-
-        return callWithHttpUrl {
-            edgeTtsApi.synthesize(
-                EdgeTtsRequest(
-                    text = text,
-                    voice = HINDI_VOICE
-                )
-            )
-        }
-    }
-
-    private suspend fun <T> callWithHttpUrl(
-        request: suspend () -> T
-    ): T {
+    private suspend fun <T> callWithHttpUrl(request: suspend () -> T): T {
         try {
             return request()
         } catch (error: HttpException) {
@@ -160,8 +163,9 @@ class VideoRepositoryImpl @Inject constructor(
                 ?.toString()
                 ?: "URL unavailable"
 
+            val body = error.response()?.errorBody()?.string().orEmpty()
             throw IllegalStateException(
-                "HTTP ${error.code()} Error at URL: $url",
+                "HTTP ${error.code()} Error at URL: $url. Body: $body",
                 error
             )
         }
@@ -189,7 +193,6 @@ class VideoRepositoryImpl @Inject constructor(
 @Module
 @InstallIn(SingletonComponent::class)
 abstract class VideoRepositoryModule {
-
     @Binds
     @Singleton
     abstract fun bindVideoRepository(
