@@ -13,6 +13,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.rsmoviespot.domain.models.VideoScriptResponse
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +26,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
 import javax.inject.Inject
 
 data class RenderServiceState(
@@ -60,6 +62,13 @@ class VideoRenderService : Service() {
                 val bgmUri = intent.getStringExtra(EXTRA_BGM_URI)
                     ?.takeIf { it.isNotBlank() }
                     ?.let { Uri.parse(it) }
+                val preGeneratedScript = intent.getStringExtra(EXTRA_SCRIPT_JSON)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { jsonStr ->
+                        runCatching {
+                            serviceJson.decodeFromString(VideoScriptResponse.serializer(), jsonStr)
+                        }.getOrNull()
+                    }
 
                 startAsForeground(
                     buildNotification("Preparing video render…", 0)
@@ -77,7 +86,7 @@ class VideoRenderService : Service() {
                     return START_NOT_STICKY
                 }
 
-                startRenderJob(topic, isShorts, bgmUri)
+                startRenderJob(topic, isShorts, bgmUri, preGeneratedScript)
             }
 
             ACTION_CANCEL_RENDER -> {
@@ -103,7 +112,12 @@ class VideoRenderService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startRenderJob(topic: String, isShorts: Boolean, customBgmUri: Uri?) {
+    private fun startRenderJob(
+        topic: String,
+        isShorts: Boolean,
+        customBgmUri: Uri?,
+        preGeneratedScript: VideoScriptResponse?
+    ) {
         if (renderJob?.isActive == true) return
 
         _renderState.value = RenderServiceState(
@@ -122,7 +136,8 @@ class VideoRenderService : Service() {
                 val result = videoRenderEngine.render(
                     topic = topic,
                     isShorts = isShorts,
-                    customBgmUri = customBgmUri
+                    customBgmUri = customBgmUri,
+                    preGeneratedScript = preGeneratedScript
                 ) { rawPercent, message ->
                     val percent = rawPercent.coerceIn(0, 100)
                     _renderState.update {
@@ -246,9 +261,12 @@ class VideoRenderService : Service() {
         const val EXTRA_TOPIC = "extra_topic"
         const val EXTRA_IS_SHORTS = "extra_is_shorts"
         const val EXTRA_BGM_URI = "extra_bgm_uri"
+        const val EXTRA_SCRIPT_JSON = "extra_script_json"
 
         private const val CHANNEL_ID = "video_render_channel"
         private const val NOTIFICATION_ID = 4101
+
+        private val serviceJson = Json { ignoreUnknownKeys = true }
 
         private val _renderState = MutableStateFlow(RenderServiceState())
         val renderState: StateFlow<RenderServiceState> = _renderState.asStateFlow()
@@ -257,13 +275,18 @@ class VideoRenderService : Service() {
             context: Context,
             topic: String,
             isShorts: Boolean,
-            bgmUri: Uri? = null
+            bgmUri: Uri? = null,
+            preGeneratedScript: VideoScriptResponse? = null
         ) {
+            val scriptJson = preGeneratedScript?.let {
+                serviceJson.encodeToString(VideoScriptResponse.serializer(), it)
+            }
             val intent = Intent(context, VideoRenderService::class.java)
                 .setAction(ACTION_START_RENDER)
                 .putExtra(EXTRA_TOPIC, topic)
                 .putExtra(EXTRA_IS_SHORTS, isShorts)
                 .putExtra(EXTRA_BGM_URI, bgmUri?.toString())
+                .putExtra(EXTRA_SCRIPT_JSON, scriptJson)
             ContextCompat.startForegroundService(context, intent)
         }
 
