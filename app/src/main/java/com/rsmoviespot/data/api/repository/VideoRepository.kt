@@ -28,7 +28,7 @@ import javax.inject.Singleton
 
 interface VideoRepository {
     suspend fun generateScript(topic: String, isShorts: Boolean = true): VideoScriptResponse
-    suspend fun generateImageForSlab(prompt: String): ResponseBody
+    suspend fun generateImageForSlab(prompt: String, isShorts: Boolean = true): ResponseBody
     suspend fun generateAudioForSlab(text: String): ResponseBody
 }
 
@@ -93,7 +93,10 @@ class VideoRepositoryImpl @Inject constructor(
         return parseScriptResponse(generatedText)
     }
 
-    override suspend fun generateImageForSlab(prompt: String): ResponseBody {
+    override suspend fun generateImageForSlab(
+        prompt: String,
+        isShorts: Boolean
+    ): ResponseBody {
         require(prompt.isNotBlank()) { "Image prompt must not be blank." }
         require(BuildConfig.CLOUDFLARE_ACCOUNT_ID.isNotBlank()) {
             "CLOUDFLARE_ACCOUNT_ID is empty."
@@ -102,13 +105,19 @@ class VideoRepositoryImpl @Inject constructor(
             "CLOUDFLARE_API_TOKEN is empty."
         }
 
+        val imageWidth = if (isShorts) SHORTS_IMAGE_WIDTH else LANDSCAPE_IMAGE_WIDTH
+        val imageHeight = if (isShorts) SHORTS_IMAGE_HEIGHT else LANDSCAPE_IMAGE_HEIGHT
+
         return callWithHttpUrl {
             cloudflareApi.generateImage(
                 authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
                 accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
                 model = "@cf/stabilityai/stable-diffusion-xl-base-1.0",
                 request = CloudflareImageRequest(
-                    prompt = prompt
+                    prompt = prompt,
+                    width = imageWidth,
+                    height = imageHeight,
+                    negativePrompt = DEFAULT_NEGATIVE_PROMPT
                 )
             )
         }
@@ -224,6 +233,13 @@ class VideoRepositoryImpl @Inject constructor(
 
     private companion object {
         const val HINDI_VOICE = "hi-IN-MadhurNeural"
+
+        const val SHORTS_IMAGE_WIDTH = 768
+        const val SHORTS_IMAGE_HEIGHT = 1344
+        const val LANDSCAPE_IMAGE_WIDTH = 1344
+        const val LANDSCAPE_IMAGE_HEIGHT = 768
+        const val DEFAULT_NEGATIVE_PROMPT =
+            "text, watermark, signature, logo, blurry, low quality, distorted, deformed"
 
         const val SYSTEM_PROMPT_TEMPLATE =
             "You are a professional Hindi video scriptwriter for RS Movie Spot. " +
