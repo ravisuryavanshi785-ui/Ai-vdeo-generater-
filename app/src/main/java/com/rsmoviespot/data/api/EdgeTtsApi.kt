@@ -1,24 +1,18 @@
 package com.rsmoviespot.data.api
 
+import android.content.Context
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.Serializable
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Protocol
-import okhttp3.Request
-import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
-import java.io.ByteArrayOutputStream
-import java.security.MessageDigest
-import java.text.SimpleDateFormat
+import java.io.File
 import java.util.Locale
-import java.util.TimeZone
 import java.util.UUID
-import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -26,143 +20,86 @@ import kotlin.coroutines.resumeWithException
 
 @Singleton
 class EdgeTtsApi @Inject constructor(
-    baseOkHttpClient: OkHttpClient
+    @ApplicationContext private val context: Context
 ) {
-    // Yahan HTTP/1.1 force kiya hai taaki Microsoft bot samajh kar 403 block na kare
-    private val wsClient: OkHttpClient = baseOkHttpClient.newBuilder()
-        .protocols(listOf(Protocol.HTTP_1_1))
-        .pingInterval(20, TimeUnit.SECONDS)
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+    private var tts: TextToSpeech? = null
+    private var isInitialized = false
+    private var isInitializing = false
+    private val pendingRequests = mutableListOf<() -> Unit>()
 
-    suspend fun synthesize(request: EdgeTtsRequest): ResponseBody =
-        suspendCancellableCoroutine { continuation ->
-            val trustedClientToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-            val secMsGec = generateSecMsGec(trustedClientToken)
-            val connectionId = UUID.randomUUID().toString().replace("-", "")
+    suspend fun synthesize(request: EdgeTtsRequest): ResponseBody = suspendCancellableCoroutine { continuation ->
+        val utteranceId = UUID.randomUUID().toString()
+        val tempFile = File(context.cacheDir, "$utteranceId.wav")
 
-            val url =
-                "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
-                    "?TrustedClientToken=$trustedClientToken" +
-                    "&Sec-MS-GEC=$secMsGec" +
-                    "&Sec-MS-GEC-Version=1-131.0.2903.86" +
-                    "&ConnectionId=$connectionId"
+        val executeSynthesis = {
+            val listener = object : UtteranceProgressListener() {
+                override fun onStart(id: String?) {}
 
-            val wsRequest = Request.Builder()
-                .url(url)
-                .header("Pragma", "no-cache")
-                .header("Cache-Control", "no-cache")
-                .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
-                .header("Accept-Encoding", "gzip, deflate, br")
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-                )
-                .build()
-
-            val audioBuffer = ByteArrayOutputStream()
-            val requestId = UUID.randomUUID().toString().replace("-", "")
-
-            val listener = object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    val timestamp = getEdgeTimestamp()
-                    val configMsg =
-                        "X-Timestamp:$timestamp\r\n" +
-                            "Content-Type:application/json; charset=utf-8\r\n" +
-                            "Path:speech.config\r\n\r\n" +
-                            """{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"${request.outputFormat}"}}}}"""
-
-                    val escapedText = escapeXml(request.text)
-                    val ssml =
-                        "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='hi-IN'>" +
-                            "<voice name='${request.voice}'>" +
-                            "<prosody pitch='+0Hz' rate='+0%' volume='+0%'>$escapedText</prosody>" +
-                            "</voice></speak>"
-
-                    val ssmlMsg =
-                        "X-RequestId:$requestId\r\n" +
-                            "Content-Type:application/ssml+xml\r\n" +
-                            "X-Timestamp:${timestamp}Z\r\n" +
-                            "Path:ssml\r\n\r\n" +
-                            ssml
-
-                    webSocket.send(configMsg)
-                    webSocket.send(ssmlMsg)
-                }
-
-                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    val data = bytes.toByteArray()
-                    if (data.size >= 2) {
-                        val headerLen = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
-                        val audioStart = 2 + headerLen
-                        if (audioStart < data.size) {
-                            audioBuffer.write(data, audioStart, data.size - audioStart)
-                        }
-                    }
-                }
-
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    if (text.contains("Path:turn.end")) {
-                        webSocket.close(1000, "Completed")
-                        val audioBytes = audioBuffer.toByteArray()
+                override fun onDone(id: String?) {
+                    if (id == utteranceId && tempFile.exists()) {
+                        val bytes = tempFile.readBytes()
+                        tempFile.delete() // Clean up storage
+                        
                         if (continuation.isActive) {
-                            if (audioBytes.isNotEmpty()) {
-                                continuation.resume(
-                                    audioBytes.toResponseBody("audio/mpeg".toMediaType())
-                                )
-                            } else {
-                                continuation.resumeWithException(
-                                    IllegalStateException("Edge TTS returned empty audio stream.")
-                                )
-                            }
+                            // VideoRepository ko lagega API se MP3 aaya, par ye local WAV bytes hain
+                            continuation.resume(bytes.toResponseBody("audio/wav".toMediaType()))
                         }
                     }
                 }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    if (continuation.isActive) {
-                        val code = response?.code?.let { " (HTTP $it)" }.orEmpty()
-                        continuation.resumeWithException(
-                            IllegalStateException("Edge TTS WebSocket failed$code: ${t.message}", t)
-                        )
+                override fun onError(id: String?) {
+                    if (id == utteranceId && continuation.isActive) {
+                        continuation.resumeWithException(Exception("Android Local TTS engine failed"))
                     }
                 }
             }
-
-            val webSocket = wsClient.newWebSocket(wsRequest, listener)
-            continuation.invokeOnCancellation {
-                webSocket.cancel()
+            
+            tts?.setOnUtteranceProgressListener(listener)
+            
+            // Network synthesis use karne ka try karega (better quality voice)
+            val params = Bundle().apply {
+                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
             }
+            
+            tts?.synthesizeToFile(request.text, params, tempFile, utteranceId)
         }
 
-    private fun getEdgeTimestamp(): String {
-        val sdf = SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'", Locale.US)
-        sdf.timeZone = TimeZone.getTimeZone("UTC")
-        return sdf.format(System.currentTimeMillis())
+        // Initialize TTS engine only once
+        if (isInitialized && tts != null) {
+            executeSynthesis()
+        } else {
+            pendingRequests.add(executeSynthesis)
+            if (!isInitializing) {
+                isInitializing = true
+                tts = TextToSpeech(context) { status ->
+                    if (status == TextToSpeech.SUCCESS) {
+                        // Hindi (India) set kar rahe hain
+                        tts?.language = Locale("hi", "IN")
+                        
+                        // Voice pitch & speed adjustments to sound more natural
+                        tts?.setPitch(1.0f)
+                        tts?.setSpeechRate(0.95f) 
+                        
+                        isInitialized = true
+                        pendingRequests.forEach { it.invoke() }
+                        pendingRequests.clear()
+                    } else {
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(Exception("Failed to initialize Android Text-to-Speech"))
+                        }
+                    }
+                    isInitializing = false
+                }
+            }
+        }
+        
+        continuation.invokeOnCancellation {
+            tts?.stop()
+        }
     }
-
-    private fun generateSecMsGec(trustedClientToken: String): String {
-        val winEpochSeconds = 11644473600L
-        var ticks = (System.currentTimeMillis() / 1000L) + winEpochSeconds
-        ticks -= ticks % 300L
-        val ticks100ns = ticks * 10_000_000L
-        val strToHash = "$ticks100ns$trustedClientToken"
-        val digest = MessageDigest.getInstance("SHA-256").digest(strToHash.toByteArray(Charsets.US_ASCII))
-        return digest.joinToString("") { "%02X".format(it) }
-    }
-
-    private fun escapeXml(input: String): String =
-        input
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\"", "&quot;")
-            .replace("'", "&apos;")
 }
 
+// Data class same rakhi hai taaki VideoRepositoryImpl crash na ho
 @Serializable
 data class EdgeTtsRequest(
     val text: String,
