@@ -2,7 +2,6 @@ package com.rsmoviespot.di
 
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.rsmoviespot.data.api.CloudflareApi
-import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.GroqApi
 import dagger.Module
 import dagger.Provides
@@ -85,19 +84,4 @@ object NetworkModule {
             )
             .build()
             .create(CloudflareApi::class.java)
-
-    @Provides
-    @Singleton
-    fun provideEdgeTtsApi(
-        client: OkHttpClient,
-        json: Json
-    ): EdgeTtsApi =
-        Retrofit.Builder()
-            .baseUrl("https://your-edge-tts-adapter.example/")
-            .client(client)
-            .addConverterFactory(
-                json.asConverterFactory("application/json".toMediaType())
-            )
-            .build()
-            .create(EdgeTtsApi::class.java)
 }
