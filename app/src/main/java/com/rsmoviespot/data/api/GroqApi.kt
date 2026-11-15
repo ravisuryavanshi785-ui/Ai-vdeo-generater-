@@ -17,15 +17,23 @@ interface GroqApi {
 
 @Serializable
 data class GroqChatRequest(
-    // YAHAN FIX KIYA HAI: '=' aur aage ki string hata di hai taaki Kotlin isey JSON se delete na kare
-    val model: String, 
+    val model: String,
     val messages: List<GroqMessage>,
-    val temperature: Double = 0.7
+    val temperature: Double,
+    @SerialName("max_tokens")
+    val maxTokens: Int,
+    @SerialName("response_format")
+    val responseFormat: GroqResponseFormat
+)
+
+@Serializable
+data class GroqResponseFormat(
+    val type: String
 )
 
 @Serializable
 data class GroqMessage(
-    val role: String, // "system", "user", ya "assistant"
+    val role: String,
     val content: String
 )
 
