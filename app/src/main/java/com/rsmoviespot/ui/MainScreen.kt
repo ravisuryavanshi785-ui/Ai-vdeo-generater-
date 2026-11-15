@@ -79,6 +79,8 @@ fun MainScreen(
         }
     }
 
+    val isBusy = state.isGenerating || state.isPreviewingScript
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background
     ) { contentPadding ->
@@ -114,11 +116,11 @@ fun MainScreen(
                 value = state.topic,
                 onValueChange = viewModel::onTopicChanged,
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Video topic") },
-                placeholder = { Text("e.g. Ramayana Box Office") },
+                label = { Text("Topic & instructions") },
+                placeholder = { Text("e.g. Shivaji Maharaj 1 minute epic story, 10 scenes") },
                 minLines = 2,
-                maxLines = 4,
-                enabled = !state.isGenerating,
+                maxLines = 5,
+                enabled = !isBusy,
                 keyboardOptions = KeyboardOptions(
                     capitalization = KeyboardCapitalization.Sentences
                 )
@@ -137,13 +139,13 @@ fun MainScreen(
                     FilterChip(
                         selected = state.isShorts,
                         onClick = { viewModel.onShortsChanged(true) },
-                        enabled = !state.isGenerating,
+                        enabled = !isBusy,
                         label = { Text("Shorts · 9:16") }
                     )
                     FilterChip(
                         selected = !state.isShorts,
                         onClick = { viewModel.onShortsChanged(false) },
-                        enabled = !state.isGenerating,
+                        enabled = !isBusy,
                         label = { Text("YouTube · 16:9") }
                     )
                 }
@@ -162,7 +164,7 @@ fun MainScreen(
                 ) {
                     OutlinedButton(
                         onClick = { bgmPickerLauncher.launch(arrayOf("audio/*")) },
-                        enabled = !state.isGenerating,
+                        enabled = !isBusy,
                         modifier = Modifier.weight(1f)
                     ) {
                         Text(
@@ -174,7 +176,7 @@ fun MainScreen(
                     if (state.selectedBgmUri != null) {
                         TextButton(
                             onClick = viewModel::clearBgm,
-                            enabled = !state.isGenerating
+                            enabled = !isBusy
                         ) {
                             Text("Reset")
                         }
@@ -182,27 +184,84 @@ fun MainScreen(
                 }
             }
 
-            Button(
-                onClick = onGenerateClick,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                enabled = !state.isGenerating && state.topic.isNotBlank(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                if (state.isGenerating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.height(20.dp),
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        strokeWidth = 2.dp
+                OutlinedButton(
+                    onClick = viewModel::previewScript,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(56.dp),
+                    enabled = !isBusy && state.topic.isNotBlank()
+                ) {
+                    if (state.isPreviewingScript) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.height(18.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text(
+                            text = if (state.draftScript != null) "Regenerate" else "Preview Script",
+                            maxLines = 1
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = onGenerateClick,
+                    modifier = Modifier
+                        .weight(1.3f)
+                        .height(56.dp),
+                    enabled = !isBusy && state.topic.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
                     )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text("Generating…")
-                } else {
-                    Text("Generate Video", fontWeight = FontWeight.Bold)
+                ) {
+                    if (state.isGenerating) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.height(20.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text("Rendering…")
+                    } else {
+                        Text("Generate Video", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            val draftScript = state.draftScript
+            if (draftScript != null && !state.isGenerating) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "Script Preview (${draftScript.slabs.size} scenes · Editable)",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        draftScript.slabs.forEachIndexed { index, slab ->
+                            OutlinedTextField(
+                                value = slab.voiceover_text,
+                                onValueChange = { viewModel.onSlabVoiceoverChanged(index, it) },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("Scene ${index + 1} (${slab.sfx_cue})") },
+                                minLines = 2,
+                                maxLines = 4
+                            )
+                        }
+                    }
                 }
             }
 
