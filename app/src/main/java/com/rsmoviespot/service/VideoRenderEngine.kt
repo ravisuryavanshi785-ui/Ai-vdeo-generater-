@@ -15,14 +15,22 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 import java.util.UUID
 import javax.inject.Inject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.PI
+import kotlin.math.exp
+import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.random.Random
 
 data class VideoRenderResult(
     val galleryUri: Uri,
@@ -38,6 +46,7 @@ class VideoRenderEngine @Inject constructor(
     suspend fun render(
         topic: String,
         isShorts: Boolean,
+        customBgmUri: Uri? = null,
         progress: (Int, String) -> Unit = { _, _ -> }
     ): VideoRenderResult = withContext(Dispatchers.IO) {
         require(topic.isNotBlank()) { "Topic must not be blank." }
@@ -58,11 +67,14 @@ class VideoRenderEngine @Inject constructor(
             val script = videoRepository.generateScript(topic, isShorts)
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
 
-            // Same seed across all scenes improves character and style consistency.
-            val videoSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
+            val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
                 .coerceAtLeast(1000)
 
-            val bgmBedFile = prepareBgmBed(renderDirectory, script.bgm_mood)
+            val bgmBedFile = prepareBgmBed(
+                renderDirectory = renderDirectory,
+                mood = script.bgm_mood,
+                customBgmUri = customBgmUri
+            )
 
             val segmentFiles = mutableListOf<File>()
             val slabCount = script.slabs.size
@@ -79,17 +91,21 @@ class VideoRenderEngine @Inject constructor(
                 val mixedAudioFile = File(renderDirectory, "mixed_${index + 1}.m4a")
                 val segmentFile = File(renderDirectory, "segment_${index + 1}.mp4")
 
-                val imagePrompt = buildConsistentImagePrompt(
+                val imagePrompt = buildSceneImagePrompt(
                     characterBible = script.character_bible,
                     visualStyle = script.visual_style,
                     scenePrompt = slab.image_prompt,
+                    hasCharacter = slab.has_character,
                     isShorts = isShorts
                 )
+
+                // Vary seed per scene so poses/scenes stay fresh while character_bible locks appearance.
+                val sceneSeed = baseSeed + (index * 37)
 
                 videoRepository.generateImageForSlab(
                     prompt = imagePrompt,
                     isShorts = isShorts,
-                    seed = videoSeed
+                    seed = sceneSeed
                 ).use { body ->
                     imageFile.outputStream().use { output ->
                         body.byteStream().use { input -> input.copyTo(output) }
@@ -164,73 +180,57 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun buildConsistentImagePrompt(
+    private fun buildSceneImagePrompt(
         characterBible: String,
         visualStyle: String,
         scenePrompt: String,
+        hasCharacter: Boolean,
         isShorts: Boolean
     ): String = buildString {
-        if (characterBible.isNotBlank()) {
-            append("Main character (strictly identical across every scene): ")
+        if (hasCharacter && characterBible.isNotBlank()) {
+            append("Character appearance: ")
             append(characterBible.trim())
             append(". ")
         }
-        append("Scene action: ")
         append(scenePrompt.trim())
         if (visualStyle.isNotBlank()) {
-            append(". Art style & lighting: ")
+            append(". Style: ")
             append(visualStyle.trim())
         }
         append(
             if (isShorts) {
-                ", single cohesive cinematic frame, vertical portrait composition, 9:16 aspect ratio"
+                ", single cohesive cinematic frame, vertical 9:16 composition"
             } else {
-                ", single cohesive cinematic frame, horizontal landscape composition, 16:9 aspect ratio"
+                ", single cohesive cinematic frame, horizontal 16:9 composition"
             }
         )
     }
 
-    private suspend fun prepareBgmBed(
+    private fun prepareBgmBed(
         renderDirectory: File,
-        mood: String
+        mood: String,
+        customBgmUri: Uri?
     ): File? {
+        if (customBgmUri != null) {
+            val copiedCustom = runCatching {
+                val outFile = File(renderDirectory, "custom_bgm.audio")
+                context.contentResolver.openInputStream(customBgmUri)?.use { input ->
+                    outFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                outFile.takeIf { it.exists() && it.length() > 1024L }
+            }.getOrNull()
+            if (copiedCustom != null) return copiedCustom
+        }
+
         val rawResourceFile = copyOptionalRawAudio(renderDirectory, mood)
         if (rawResourceFile != null) return rawResourceFile
 
-        val synthesizedBgm = File(renderDirectory, "bgm_bed.wav")
-        val lavfiExpression = when (mood.lowercase()) {
-            "devotional" ->
-                "aevalsrc='0.22*sin(2*PI*130.81*t)+0.16*sin(2*PI*196.00*t)+0.10*sin(2*PI*261.63*t)':s=44100:d=20"
-            "suspense" ->
-                "aevalsrc='0.35*sin(2*PI*58*t)*exp(-3*mod(t,1.0))+0.15*sin(2*PI*62*t)':s=44100:d=20"
-            "sci_fi" ->
-                "aevalsrc='0.25*sin(2*PI*73.42*t)+0.18*sin(2*PI*110*t)*sin(2*PI*0.4*t)+0.12*sin(2*PI*220*t)':s=44100:d=20"
-            "emotional" ->
-                "aevalsrc='0.24*sin(2*PI*174.61*t)+0.16*sin(2*PI*220.00*t)+0.12*sin(2*PI*261.63*t)':s=44100:d=20"
-            else ->
-                // epic_dark: deep pulsing war-drum sub-bass + cinematic harmonic drone
-                "aevalsrc='0.45*sin(2*PI*55*t)*exp(-4.5*mod(t,0.75))+0.22*sin(2*PI*110*t)+0.12*sin(2*PI*165*t)':s=44100:d=20"
-        }
-
-        val success = runCatching {
-            runFfmpeg(
-                arrayOf(
-                    "-y",
-                    "-f", "lavfi",
-                    "-i", lavfiExpression,
-                    "-af", "lowpass=f=360,aecho=0.8:0.85:70:0.45",
-                    "-ar", "44100",
-                    "-ac", "2",
-                    synthesizedBgm.absolutePath
-                )
-            )
-        }.isSuccess
-
-        return if (success && synthesizedBgm.exists() && synthesizedBgm.length() > 0L) {
-            synthesizedBgm
-        } else {
-            null
-        }
+        // Built-in pure Kotlin 16-bit WAV music bed (phone-speaker audible mid-range chords + beat)
+        val synthFile = File(renderDirectory, "bgm_bed.wav")
+        return runCatching {
+            writeCinematicBgmWav(synthFile, mood)
+            synthFile.takeIf { it.exists() && it.length() > 1024L }
+        }.getOrNull()
     }
 
     private fun copyOptionalRawAudio(renderDirectory: File, mood: String): File? {
@@ -248,46 +248,165 @@ class VideoRenderEngine @Inject constructor(
         return null
     }
 
-    private suspend fun synthesizeSceneSfx(
+    private fun writeCinematicBgmWav(outputFile: File, mood: String) {
+        val sampleRate = 44100
+        val durationSeconds = 16
+        val totalSamples = sampleRate * durationSeconds
+
+        // 4 chords x 4 seconds each; frequencies in 130Hz–554Hz so phone speakers play them clearly.
+        val chords: Array<DoubleArray> = when (mood.lowercase()) {
+            "devotional" -> arrayOf(
+                doubleArrayOf(130.81, 196.00, 261.63, 329.63),
+                doubleArrayOf(174.61, 220.00, 261.63, 349.23),
+                doubleArrayOf(196.00, 246.94, 293.66, 392.00),
+                doubleArrayOf(130.81, 196.00, 261.63, 329.63)
+            )
+            "emotional" -> arrayOf(
+                doubleArrayOf(174.61, 220.00, 261.63, 349.23),
+                doubleArrayOf(130.81, 196.00, 261.63, 329.63),
+                doubleArrayOf(146.83, 220.00, 293.66, 349.23),
+                doubleArrayOf(196.00, 246.94, 293.66, 392.00)
+            )
+            else -> arrayOf(
+                // epic_dark / suspense / sci_fi: D minor dramatic progression
+                doubleArrayOf(146.83, 220.00, 293.66, 349.23), // Dm
+                doubleArrayOf(116.54, 174.61, 233.08, 293.66), // Bb
+                doubleArrayOf(130.81, 196.00, 261.63, 329.63), // C
+                doubleArrayOf(110.00, 164.81, 220.00, 277.18)  // A
+            )
+        }
+
+        val beatDuration = 0.5
+        val chordDuration = 4.0
+
+        writeMono16BitWav(outputFile, sampleRate, totalSamples) { i ->
+            val t = i.toDouble() / sampleRate
+            val chordIndex = ((t / chordDuration).toInt()).coerceIn(0, chords.size - 1)
+            val chordLocalT = t - chordIndex * chordDuration
+            val chord = chords[chordIndex]
+
+            // Smooth cross-envelope per 4s chord so there are zero clicks
+            val chordEnv = (chordLocalT / 0.15).coerceAtMost(1.0) *
+                ((chordDuration - chordLocalT) / 0.15).coerceAtMost(1.0)
+            val lfo = 0.85 + 0.15 * sin(2.0 * PI * 0.5 * t)
+
+            var pad = 0.0
+            for (freq in chord) {
+                pad += sin(2.0 * PI * freq * t) * 0.18 +
+                    sin(2.0 * PI * freq * 2.0 * t) * 0.06
+            }
+            pad *= chordEnv * lfo
+
+            // Punchy drum thump every 0.5s (audible 140Hz -> 65Hz transient)
+            val beatT = t % beatDuration
+            val drumEnv = exp(-14.0 * beatT)
+            val drumFreq = 65.0 + 95.0 * exp(-25.0 * beatT)
+            val drum = sin(2.0 * PI * drumFreq * beatT) * drumEnv * 0.42
+
+            (pad + drum).coerceIn(-0.95, 0.95)
+        }
+    }
+
+    private fun synthesizeSceneSfxWav(
         renderDirectory: File,
         sceneIndex: Int,
         sfxCue: String
     ): File? {
         val sfxFile = File(renderDirectory, "sfx_${sceneIndex + 1}.wav")
-        val (lavfiSource, filter) = when (sfxCue.lowercase()) {
-            "thunder" ->
-                "anoisesrc=color=brown:amplitude=0.85:r=44100:d=2.2" to
-                    "lowpass=f=240,aecho=0.8:0.85:110:0.5,afade=t=out:st=0.8:d=1.4"
-            "fire" ->
-                "anoisesrc=color=pink:amplitude=0.28:r=44100:d=3.0" to
-                    "bandpass=f=1200:w=800,tremolo=f=8:d=0.65,afade=t=out:st=1.8:d=1.2"
-            "sword" ->
-                "aevalsrc='0.45*sin(2*PI*1750*t)*exp(-9*t)+0.35*sin(2*PI*2450*t)*exp(-11*t)':s=44100:d=0.6" to
-                    "highpass=f=800,aecho=0.8:0.7:40:0.3"
-            "boom" ->
-                "aevalsrc='0.8*sin(2*PI*(95-55*min(t,0.7))*t)*exp(-3.2*t)':s=44100:d=1.3" to
-                    "lowpass=f=220"
-            else ->
-                // whoosh
-                "anoisesrc=color=pink:amplitude=0.45:r=44100:d=0.65" to
-                    "bandpass=f=650:w=420,afade=t=in:st=0:d=0.25,afade=t=out:st=0.3:d=0.35"
+        val sampleRate = 44100
+        val rand = Random(sceneIndex * 131 + sfxCue.hashCode())
+
+        return runCatching {
+            when (sfxCue.lowercase()) {
+                "thunder" -> {
+                    val total = (sampleRate * 1.6).toInt()
+                    var lp = 0.0
+                    writeMono16BitWav(sfxFile, sampleRate, total) { i ->
+                        val t = i.toDouble() / sampleRate
+                        val white = rand.nextDouble(-1.0, 1.0)
+                        lp = lp * 0.94 + white * 0.06
+                        val crack = exp(-12.0 * t) * white * 0.35
+                        val rumble = exp(-1.8 * t) * lp * 2.4
+                        (crack + rumble).coerceIn(-0.95, 0.95)
+                    }
+                }
+                "sword" -> {
+                    val total = (sampleRate * 0.55).toInt()
+                    writeMono16BitWav(sfxFile, sampleRate, total) { i ->
+                        val t = i.toDouble() / sampleRate
+                        val env = exp(-8.0 * t)
+                        val metallic = sin(2.0 * PI * 1450.0 * t) * 0.45 +
+                            sin(2.0 * PI * 2180.0 * t) * 0.30 +
+                            sin(2.0 * PI * 3120.0 * t) * 0.15
+                        (metallic * env).coerceIn(-0.95, 0.95)
+                    }
+                }
+                "boom" -> {
+                    val total = (sampleRate * 1.0).toInt()
+                    writeMono16BitWav(sfxFile, sampleRate, total) { i ->
+                        val t = i.toDouble() / sampleRate
+                        val env = exp(-4.2 * t)
+                        val freq = 60.0 + 110.0 * exp(-9.0 * t)
+                        val sub = sin(2.0 * PI * freq * t) * 0.75 +
+                            sin(2.0 * PI * freq * 2.0 * t) * 0.25
+                        (sub * env).coerceIn(-0.95, 0.95)
+                    }
+                }
+                else -> {
+                    // whoosh / fire
+                    val total = (sampleRate * 0.65).toInt()
+                    var bp = 0.0
+                    writeMono16BitWav(sfxFile, sampleRate, total) { i ->
+                        val t = i.toDouble() / sampleRate
+                        val env = sin(PI * (t / 0.65).coerceIn(0.0, 1.0)).pow(1.4)
+                        val white = rand.nextDouble(-1.0, 1.0)
+                        bp = bp * 0.85 + white * 0.15
+                        (bp * env * 1.6).coerceIn(-0.95, 0.95)
+                    }
+                }
+            }
+            sfxFile.takeIf { it.exists() && it.length() > 512L }
+        }.getOrNull()
+    }
+
+    private inline fun writeMono16BitWav(
+        file: File,
+        sampleRate: Int,
+        totalSamples: Int,
+        sampleProvider: (Int) -> Double
+    ) {
+        val dataSize = totalSamples * 2
+        BufferedOutputStream(file.outputStream(), 16384).use { out ->
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+                put("RIFF".toByteArray(Charsets.US_ASCII))
+                putInt(36 + dataSize)
+                put("WAVE".toByteArray(Charsets.US_ASCII))
+                put("fmt ".toByteArray(Charsets.US_ASCII))
+                putInt(16)
+                putShort(1)
+                putShort(1)
+                putInt(sampleRate)
+                putInt(sampleRate * 2)
+                putShort(2)
+                putShort(16)
+                put("data".toByteArray(Charsets.US_ASCII))
+                putInt(dataSize)
+            }
+            out.write(header.array())
+
+            val chunkBuffer = ByteBuffer.allocate(8192).order(ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until totalSamples) {
+                val sample = (sampleProvider(i).coerceIn(-1.0, 1.0) * 32767.0).toInt().toShort()
+                chunkBuffer.putShort(sample)
+                if (!chunkBuffer.hasRemaining()) {
+                    out.write(chunkBuffer.array(), 0, chunkBuffer.position())
+                    chunkBuffer.clear()
+                }
+            }
+            if (chunkBuffer.position() > 0) {
+                out.write(chunkBuffer.array(), 0, chunkBuffer.position())
+            }
         }
-
-        val success = runCatching {
-            runFfmpeg(
-                arrayOf(
-                    "-y",
-                    "-f", "lavfi",
-                    "-i", lavfiSource,
-                    "-af", filter,
-                    "-ar", "44100",
-                    "-ac", "2",
-                    sfxFile.absolutePath
-                )
-            )
-        }.isSuccess
-
-        return if (success && sfxFile.exists() && sfxFile.length() > 0L) sfxFile else null
     }
 
     private suspend fun mixSceneAudioSafely(
@@ -301,7 +420,7 @@ class VideoRenderEngine @Inject constructor(
     ): File {
         if (bgmBedFile == null) return voiceFile
 
-        val sfxFile = synthesizeSceneSfx(renderDirectory, sceneIndex, sfxCue)
+        val sfxFile = synthesizeSceneSfxWav(renderDirectory, sceneIndex, sfxCue)
         val formattedDuration = String.format(Locale.US, "%.2f", durationSeconds)
 
         val args = if (sfxFile != null) {
@@ -312,8 +431,8 @@ class VideoRenderEngine @Inject constructor(
                 "-i", sfxFile.absolutePath,
                 "-filter_complex",
                 "[0:a]apad,volume=1.0[v];" +
-                    "[1:a]volume=0.18[b];" +
-                    "[2:a]volume=0.32[s];" +
+                    "[1:a]volume=0.28[b];" +
+                    "[2:a]volume=0.38[s];" +
                     "[v][b][s]amix=inputs=3:duration=first:normalize=0[out]",
                 "-map", "[out]",
                 "-t", formattedDuration,
@@ -330,7 +449,7 @@ class VideoRenderEngine @Inject constructor(
                 "-stream_loop", "-1", "-i", bgmBedFile.absolutePath,
                 "-filter_complex",
                 "[0:a]apad,volume=1.0[v];" +
-                    "[1:a]volume=0.18[b];" +
+                    "[1:a]volume=0.28[b];" +
                     "[v][b]amix=inputs=2:duration=first:normalize=0[out]",
                 "-map", "[out]",
                 "-t", formattedDuration,
@@ -407,25 +526,20 @@ class VideoRenderEngine @Inject constructor(
             (durationSeconds - 0.25).coerceAtLeast(0.5)
         )
 
-        // 1.5x supersample prevents zoompan subpixel jitter while staying light on mobile RAM
         val upWidth = (width * 3) / 2
         val upHeight = (height * 3) / 2
 
         val motionFilter = when (sceneIndex % 4) {
             0 ->
-                // Dramatic Zoom In
                 "zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
                     "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
             1 ->
-                // Dramatic Zoom Out
                 "zoompan=z='if(lte(on,1),1.18,max(1.0,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
                     "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
             2 ->
-                // Cinematic Horizontal Pan
                 "zoompan=z='1.14':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':" +
                     "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
             else ->
-                // Cinematic Vertical Reveal Tilt
                 "zoompan=z='1.14':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
                     "d=$totalFrames:s=${width}x${height}:fps=$FRAME_RATE"
         }
@@ -577,6 +691,6 @@ class VideoRenderEngine @Inject constructor(
         const val FRAME_RATE = 25
         const val AUDIO_TAIL_PADDING_SECONDS = 0.35
         const val MIN_SEGMENT_DURATION_SECONDS = 3.0
-        const val DEFAULT_SEGMENT_DURATION_SECONDS = 6.0
+        const val DEFAULT_SEGMENT_DURATION_SECONDS = 5.0
     }
 }
