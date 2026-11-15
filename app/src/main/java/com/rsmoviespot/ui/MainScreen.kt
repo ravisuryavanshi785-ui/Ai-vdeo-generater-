@@ -25,9 +25,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -35,6 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -50,8 +53,13 @@ fun MainScreen(
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { _ ->
-        // Permission mile ya na mile, foreground service render start ho jayega
         viewModel.startGeneratingVideo()
+    }
+
+    val bgmPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        viewModel.onBgmSelected(uri)
     }
 
     val onGenerateClick: () -> Unit = {
@@ -138,6 +146,39 @@ fun MainScreen(
                         enabled = !state.isGenerating,
                         label = { Text("YouTube · 16:9") }
                     )
+                }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Background music (optional)",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = { bgmPickerLauncher.launch(arrayOf("audio/*")) },
+                        enabled = !state.isGenerating,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(
+                            text = state.selectedBgmName,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (state.selectedBgmUri != null) {
+                        TextButton(
+                            onClick = viewModel::clearBgm,
+                            enabled = !state.isGenerating
+                        ) {
+                            Text("Reset")
+                        }
+                    }
                 }
             }
 
