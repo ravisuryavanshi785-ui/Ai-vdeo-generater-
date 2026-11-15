@@ -64,9 +64,9 @@ class VideoRepositoryImpl @Inject constructor(
         }
 
         val defaultFormatGuide = if (isShorts) {
-            "Vertical 9:16 YouTube Shorts. Unless the user specifies another length or scene count, create 7 to 8 punchy scenes (~35-45 seconds total)."
+            "Vertical 9:16 YouTube Shorts. Unless the user specifies another length or scene count, create 7 to 8 tightly connected scenes (~40-50 seconds total)."
         } else {
-            "Horizontal 16:9 YouTube video. Unless the user specifies another length or scene count, create 9 to 12 detailed scenes (~60-80 seconds total)."
+            "Horizontal 16:9 YouTube video. Unless the user specifies another length or scene count, create 9 to 12 tightly connected scenes (~65-85 seconds total)."
         }
 
         val userPrompt = buildString {
@@ -74,6 +74,7 @@ class VideoRepositoryImpl @Inject constructor(
             appendLine(topic.trim())
             appendLine()
             appendLine("Format guideline: $defaultFormatGuide")
+            appendLine("Narrative mandate: Write ONE seamless, gripping Hindi story from start to finish where every scene flows naturally out of the previous scene. NEVER write disconnected encyclopedia facts or standalone summaries.")
             appendLine("If the user mentioned a specific duration (e.g. '1 minute', '30 sec'), exact scene count, specific style, or specific plot points, OBEY the user request above everything else.")
         }
 
@@ -100,7 +101,7 @@ class VideoRepositoryImpl @Inject constructor(
                                     content = userPrompt
                                 )
                             ),
-                            temperature = 0.8,
+                            temperature = 0.75,
                             maxTokens = 4096,
                             responseFormat = GroqResponseFormat(type = "json_object")
                         )
@@ -324,22 +325,27 @@ class VideoRepositoryImpl @Inject constructor(
             "text, watermark, signature, logo, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers, collage, split screen"
 
         const val SYSTEM_PROMPT =
-            "You are an elite Hindi storytelling scriptwriter and film director for RS Movie Spot. " +
-                "Your #1 priority is to STRICTLY obey every instruction in the user's request (duration, scene count, story angle, tone, facts). " +
-                "Write gripping, goosebumps-inducing spoken Hindi narration like top Indian YouTube storytellers — NOT dry Wikipedia facts. " +
-                "Start Scene 1 with an irresistible hook question or dramatic statement. Keep each scene connected smoothly to the next. " +
-                "In Hindi text, spell words accurately (e.g., करोड़, बॉक्स ऑफिस, ट्रेलर, छत्रपति शिवाजी महाराज) and avoid stiff literal translations. " +
-                "If user asks for ~1 minute, generate around 11-13 crisp scenes (each ~4.5-5 seconds, 12-16 words). For ~30 seconds, generate 6-7 crisp scenes (10-13 words). " +
-                "Return ONLY valid JSON matching this schema:\n" +
+            "You are an elite Hindi cinematic storyteller (like Nitish Rajput / Dhruv Rathee / top Indian documentary narrators) for RS Movie Spot.\n" +
+                "Your #1 problem to AVOID: NEVER write disconnected Wikipedia facts or bullet-point trivia across scenes! Every scene must feel like the very next breath of ONE gripping story.\n\n" +
+                "STRICT STORYTELLING RULES:\n" +
+                "1. FIRST write the ENTIRE story in the \"continuous_script\" JSON field as ONE unbroken spoken Hindi monologue with a clear arc: Hook -> Rising Tension -> Turning Point -> Climax -> Goosebumps Ending.\n" +
+                "2. THEN split that exact \"continuous_script\" sequentially into \"slabs\" (14-20 spoken Hindi words per slab for ~5 sec each, or as requested by user duration). Do NOT summarize or rewrite it into isolated facts inside slabs — reading all slabs back-to-back must sound like one smooth voiceover!\n" +
+                "3. SCENE-TO-SCENE CONTINUATION: Every slab (except the last) MUST leave curiosity or connect directly to the next slab using natural spoken Hindi bridges like: \"लेकिन असली खेल तो तब शुरू हुआ जब...\", \"मगर सामने जो खड़ा था...\", \"और तभी उन्होंने एक ऐसी चाल चली...\", \"यहीं से पूरी कहानी पलट गई...\", \"पर सवाल ये था कि...\".\n" +
+                "4. NO TEXTBOOK TONE: Use natural, emotional spoken Hindi in accurate Devanagari (e.g., करोड़, बॉक्स ऑफिस, छत्रपति शिवाजी महाराज). Avoid dry phrases like \"उनका जन्म ... में हुआ था\", \"उल्लेखनीय है कि\".\n" +
+                "5. BAD (Disconnected Facts) vs GOOD (Connected Story):\n" +
+                "   BAD: Scene 1: \"शिवाजी महाराज का जन्म 1630 में हुआ।\" | Scene 2: \"उन्होंने 16 साल की उम्र में तोरणा किला जीता।\" | Scene 3: \"उनकी सेना बहुत बहादुर थी।\"\n" +
+                "   GOOD: Scene 1: \"सोचिए, सिर्फ सोलह साल की उम्र में एक लड़का मुगलों की सबसे बड़ी सल्तनत से टकराने निकल पड़ा...\" | Scene 2: \"लेकिन किसी ने नहीं सोचा था कि सह्याद्रि की पहाड़ियों से उठा ये तूफान...\" | Scene 3: \"एक रात चुपचाप तोरणा किले के दरवाज़े तोड़कर इतिहास की सबसे बड़ी जंग शुरू कर देगा!\"\n\n" +
+                "Return ONLY valid JSON matching this exact schema (keep \"continuous_script\" BEFORE \"slabs\"):\n" +
                 "{\n" +
                 "  \"character_bible\": \"Exact unchanging visual look of main character in English (age, face, beard, exact outfit/armor colors, weapon)\",\n" +
                 "  \"visual_style\": \"One unified cinematic art style, color palette, and dramatic lighting\",\n" +
                 "  \"bgm_mood\": \"epic_dark | devotional | suspense | sci_fi | emotional\",\n" +
+                "  \"continuous_script\": \"Full unbroken connected Hindi narration from hook to ending\",\n" +
                 "  \"slabs\": [\n" +
                 "    {\n" +
-                "      \"voiceover_text\": \"Punchy spoken Hindi narration in Devanagari\",\n" +
+                "      \"voiceover_text\": \"Exact next sequential chunk of continuous_script in Devanagari\",\n" +
                 "      \"has_character\": true,\n" +
-                "      \"image_prompt\": \"Specific English visual scene with camera angle, action, and setting (vary shots: wide battle, fort silhouette, close-up eyes, crowd, palace map). Set has_character=false when character is not in frame.\",\n" +
+                "      \"image_prompt\": \"Specific English visual scene matching this exact moment in the story (vary camera angles: wide battle, fort silhouette, close-up eyes, war map, crowd). Set has_character=false when character is not in frame.\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
                 "    }\n" +
                 "  ]\n" +
