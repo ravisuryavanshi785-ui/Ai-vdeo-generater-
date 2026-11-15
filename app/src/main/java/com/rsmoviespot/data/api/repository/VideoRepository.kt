@@ -14,6 +14,8 @@ import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -25,6 +27,7 @@ import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.ResponseBody
 import retrofit2.HttpException
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -126,7 +129,7 @@ class VideoRepositoryImpl @Inject constructor(
                     height = imageHeight,
                     negativePrompt = DEFAULT_NEGATIVE_PROMPT,
                     seed = seed,
-                    numSteps = 20,
+                    numSteps = 16,
                     guidance = 7.5
                 )
             )
@@ -231,22 +234,44 @@ class VideoRepositoryImpl @Inject constructor(
     }
 
     private suspend fun <T> callWithHttpUrl(request: suspend () -> T): T {
-        try {
-            return request()
-        } catch (error: HttpException) {
-            val url = error.response()
-                ?.raw()
-                ?.request
-                ?.url
-                ?.toString()
-                ?: "URL unavailable"
+        var lastError: Throwable? = null
 
-            val body = error.response()?.errorBody()?.string().orEmpty()
-            throw IllegalStateException(
-                "HTTP ${error.code()} Error at URL: $url. Body: $body",
-                error
-            )
+        repeat(MAX_API_ATTEMPTS) { attempt ->
+            try {
+                return request()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: HttpException) {
+                val code = error.code()
+                val url = error.response()
+                    ?.raw()
+                    ?.request
+                    ?.url
+                    ?.toString()
+                    ?: "URL unavailable"
+                val body = error.response()?.errorBody()?.string().orEmpty()
+                val wrapped = IllegalStateException(
+                    "HTTP $code Error at URL: $url. Body: $body",
+                    error
+                )
+                lastError = wrapped
+                // Retry only on transient rate-limit / server errors
+                if ((code == 429 || code in 500..599) && attempt < MAX_API_ATTEMPTS - 1) {
+                    delay(1500L * (attempt + 1))
+                } else {
+                    throw wrapped
+                }
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt < MAX_API_ATTEMPTS - 1) {
+                    delay(1500L * (attempt + 1))
+                } else {
+                    throw error
+                }
+            }
         }
+
+        throw lastError ?: IllegalStateException("API request failed.")
     }
 
     @Serializable
@@ -263,6 +288,7 @@ class VideoRepositoryImpl @Inject constructor(
     )
 
     private companion object {
+        const val MAX_API_ATTEMPTS = 3
         const val HINDI_VOICE = "hi-IN-MadhurNeural"
 
         const val SHORTS_IMAGE_WIDTH = 768
