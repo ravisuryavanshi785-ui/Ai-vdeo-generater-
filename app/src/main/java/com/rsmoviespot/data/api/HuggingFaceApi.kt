@@ -8,14 +8,17 @@ import retrofit2.http.POST
 
 interface HuggingFaceApi {
 
-    @POST("hf-inference/models/stabilityai/stable-diffusion-3-medium-diffusers")
+    @POST("v1/text-to-image")
     suspend fun generateImage(
         @Header("Authorization") authorization: String,
-        @Body request: HuggingFaceImageRequest
+        @Body request: TextToImageRequest
     ): ResponseBody
 }
 
 @Serializable
-data class HuggingFaceImageRequest(
-    val inputs: String
+data class TextToImageRequest(
+    val inputs: String,
+    val model: String = "stabilityai/stable-diffusion-3-medium-diffusers",
+    val provider: String = "hf-inference",
+    val parameters: Map<String, @Serializable(with = AnySerializer::class) Any>? = null
 )
