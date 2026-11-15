@@ -1,17 +1,18 @@
 package com.rsmoviespot.ui
 
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.rsmoviespot.service.VideoRenderEngine
+import com.rsmoviespot.service.VideoRenderService
 import dagger.hilt.android.lifecycle.HiltViewModel
-import javax.inject.Inject
-import kotlinx.coroutines.CancellationException
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 data class VideoUiState(
     val topic: String = "",
@@ -25,11 +26,27 @@ data class VideoUiState(
 
 @HiltViewModel
 class VideoViewModel @Inject constructor(
-    private val videoRenderEngine: VideoRenderEngine
+    @ApplicationContext private val context: Context
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(VideoUiState())
     val uiState: StateFlow<VideoUiState> = _uiState.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            VideoRenderService.renderState.collect { serviceState ->
+                _uiState.update { current ->
+                    current.copy(
+                        isGenerating = serviceState.isGenerating,
+                        progressText = serviceState.progressText,
+                        progressPercentage = serviceState.progressPercentage,
+                        statusMessage = serviceState.statusMessage,
+                        generatedVideoUri = serviceState.generatedVideoUri
+                    )
+                }
+            }
+        }
+    }
 
     fun onTopicChanged(topic: String) {
         _uiState.update { it.copy(topic = topic) }
@@ -51,52 +68,10 @@ class VideoViewModel @Inject constructor(
             return
         }
 
-        _uiState.update {
-            it.copy(
-                isGenerating = true,
-                progressText = "Starting video generation…",
-                progressPercentage = 0,
-                statusMessage = "",
-                generatedVideoUri = null
-            )
-        }
-
-        viewModelScope.launch {
-            try {
-                val result = videoRenderEngine.render(
-                    topic = topic,
-                    isShorts = currentState.isShorts
-                ) { percent, message ->
-                    _uiState.update {
-                        it.copy(
-                            progressPercentage = percent.coerceIn(0, 100),
-                            progressText = message
-                        )
-                    }
-                }
-
-                _uiState.update {
-                    it.copy(
-                        progressPercentage = 100,
-                        progressText = "Video saved to your gallery.",
-                        statusMessage = "Video generation complete.",
-                        generatedVideoUri = result.galleryUri
-                    )
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                _uiState.update {
-                    it.copy(
-                        statusMessage = error.message
-                            ?.takeIf(String::isNotBlank)
-                            ?.let { message -> "Generation failed: $message" }
-                            ?: "Video generation failed. Please try again."
-                    )
-                }
-            } finally {
-                _uiState.update { it.copy(isGenerating = false) }
-            }
-        }
+        VideoRenderService.startRender(
+            context = context,
+            topic = topic,
+            isShorts = currentState.isShorts
+        )
     }
 }
