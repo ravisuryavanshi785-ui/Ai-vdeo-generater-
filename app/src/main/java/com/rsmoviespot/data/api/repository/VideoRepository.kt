@@ -27,7 +27,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 interface VideoRepository {
-    suspend fun generateScript(topic: String): VideoScriptResponse
+    suspend fun generateScript(topic: String, isShorts: Boolean = true): VideoScriptResponse
     suspend fun generateImageForSlab(prompt: String): ResponseBody
     suspend fun generateAudioForSlab(text: String): ResponseBody
 }
@@ -44,48 +44,53 @@ class VideoRepositoryImpl @Inject constructor(
         isLenient = true
     }
 
-    override suspend fun generateScript(topic: String): VideoScriptResponse {
+    override suspend fun generateScript(
+        topic: String,
+        isShorts: Boolean
+    ): VideoScriptResponse {
         require(topic.isNotBlank()) { "Topic must not be blank." }
         require(BuildConfig.GROQ_API_KEY.isNotBlank()) {
             "GROQ_API_KEY is empty."
         }
 
-        val prompt = SYSTEM_PROMPT_TEMPLATE.replace("{topic}", topic.trim())
+        val formatInstruction = if (isShorts) {
+            "YouTube Shorts (vertical 9:16, 5 to 6 punchy scenes, hook in scene 1)"
+        } else {
+            "YouTube landscape video (16:9, 6 to 8 engaging storytelling scenes)"
+        }
 
-        return try {
-            val response = callWithHttpUrl {
-                groqApi.generateContent(
-                    authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
-                    request = GroqChatRequest(
-                        model = "openai/gpt-oss-20b",
-                        messages = listOf(
-                            GroqMessage(
-                                role = "system",
-                                content = prompt
-                            ),
-                            GroqMessage(
-                                role = "user",
-                                content = "Generate the script now."
-                            )
+        val systemPrompt = SYSTEM_PROMPT_TEMPLATE
+            .replace("{format}", formatInstruction)
+            .replace("{topic}", topic.trim())
+
+        val response = callWithHttpUrl {
+            groqApi.generateContent(
+                authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
+                request = GroqChatRequest(
+                    model = "openai/gpt-oss-20b",
+                    messages = listOf(
+                        GroqMessage(
+                            role = "system",
+                            content = systemPrompt
+                        ),
+                        GroqMessage(
+                            role = "user",
+                            content = "Create the JSON script for topic: ${topic.trim()}"
                         )
-                    )
+                    ),
+                    temperature = 0.7
                 )
-            }
-
-            val generatedText = response.choices
-                .firstOrNull()
-                ?.message
-                ?.content
-                ?: throw IllegalStateException("Groq returned empty result.")
-
-            parseScriptResponse(generatedText)
-        } catch (e: HttpException) {
-            val errorBody = e.response()?.errorBody()?.string().orEmpty()
-            throw IllegalStateException(
-                "Groq API error: HTTP ${e.code()} -$errorBody",
-                e
             )
         }
+
+        val generatedText = response.choices
+            .firstOrNull()
+            ?.message
+            ?.content
+            ?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("Groq returned empty result.")
+
+        return parseScriptResponse(generatedText)
     }
 
     override suspend fun generateImageForSlab(prompt: String): ResponseBody {
@@ -111,8 +116,7 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateAudioForSlab(text: String): ResponseBody {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
-        
-        // Yahan se callWithHttpUrl hata diya hai kyunki EdgeTtsApi ab Retrofit use nahi karta
+
         return edgeTtsApi.synthesize(
             EdgeTtsRequest(
                 text = text,
@@ -121,38 +125,73 @@ class VideoRepositoryImpl @Inject constructor(
         )
     }
 
-    private fun parseScriptResponse(text: String): VideoScriptResponse {
-        val cleaned = text
-            .trim()
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-
-        val root = json.parseToJsonElement(cleaned)
+    private fun parseScriptResponse(rawText: String): VideoScriptResponse {
+        val extractedJson = extractJsonPayload(rawText)
+        val root = json.parseToJsonElement(extractedJson)
 
         val slabElements: List<JsonElement> = when (root) {
             is JsonArray -> root
             is JsonObject -> {
-                val array = root["slabs"] ?: root["scenes"]
-                    ?: error("Expected 'slabs' or 'scenes' JSON array.")
+                val array = root["slabs"]
+                    ?: root["scenes"]
+                    ?: root["script"]
+                    ?: root.values.firstOrNull { it is JsonArray }
+                    ?: error("Expected a JSON array of scenes in Groq response.")
+
                 array as? JsonArray
                     ?: error("'slabs' or 'scenes' must be a JSON array.")
             }
             else -> error("Groq response must be a JSON array or object.")
         }
 
-        val slabs = slabElements.mapIndexed { index, element ->
+        val slabs = slabElements.mapIndexedNotNull { index, element ->
             val dto = json.decodeFromJsonElement<GeneratedSlabDto>(element)
-            VideoSlab(
-                id = dto.id ?: index + 1,
-                voiceover_text = dto.voiceoverText,
-                image_prompt = dto.imagePrompt
-            )
+            val voiceover = dto.voiceoverText.trim()
+            val prompt = dto.imagePrompt.trim()
+            if (voiceover.isBlank() || prompt.isBlank()) {
+                null
+            } else {
+                VideoSlab(
+                    id = dto.id ?: index + 1,
+                    voiceover_text = voiceover,
+                    image_prompt = prompt
+                )
+            }
         }
 
         require(slabs.isNotEmpty()) { "Groq returned an empty script." }
         return VideoScriptResponse(slabs = slabs)
+    }
+
+    private fun extractJsonPayload(rawText: String): String {
+        val withoutFences = rawText
+            .trim()
+            .replace(Regex("^```(?:json)?\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*```$"), "")
+            .trim()
+
+        val firstBracket = withoutFences.indexOf('[')
+        val firstBrace = withoutFences.indexOf('{')
+
+        return when {
+            firstBracket != -1 && (firstBrace == -1 || firstBracket < firstBrace) -> {
+                val lastBracket = withoutFences.lastIndexOf(']')
+                if (lastBracket > firstBracket) {
+                    withoutFences.substring(firstBracket, lastBracket + 1)
+                } else {
+                    withoutFences
+                }
+            }
+            firstBrace != -1 -> {
+                val lastBrace = withoutFences.lastIndexOf('}')
+                if (lastBrace > firstBrace) {
+                    withoutFences.substring(firstBrace, lastBrace + 1)
+                } else {
+                    withoutFences
+                }
+            }
+            else -> withoutFences
+        }
     }
 
     private suspend fun <T> callWithHttpUrl(request: suspend () -> T): T {
@@ -187,9 +226,11 @@ class VideoRepositoryImpl @Inject constructor(
         const val HINDI_VOICE = "hi-IN-MadhurNeural"
 
         const val SYSTEM_PROMPT_TEMPLATE =
-            "You are a YouTube Shorts scriptwriter for RS Movie Spot. " +
-                "The topic is {topic}. Return only a valid JSON array of objects " +
-                "with 'voiceover_text' and 'image_prompt' fields."
+            "You are a professional Hindi video scriptwriter for RS Movie Spot. " +
+                "Create a script for a {format} on the topic \"{topic}\". " +
+                "Return ONLY a valid JSON array (no markdown, no explanation) where each item has: " +
+                "\"voiceover_text\" (natural engaging spoken Hindi in Devanagari script, 1-2 crisp sentences per scene) and " +
+                "\"image_prompt\" (detailed cinematic visual description in English for AI image generation, no text or watermarks)."
     }
 }
 
