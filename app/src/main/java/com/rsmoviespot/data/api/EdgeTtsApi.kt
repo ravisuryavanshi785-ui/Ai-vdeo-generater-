@@ -82,7 +82,8 @@ class EdgeTtsApi @Inject constructor(
                 .storage(tempDir.absolutePath)
                 .fileName(fileBaseName)
                 .overwrite(true)
-                .voiceRate("+10%")
+                .voiceRate(TRAILER_VOICE_RATE)
+                .voicePitch(TRAILER_VOICE_PITCH)
                 .enableVttFile()
                 .formatMp3()
                 .trans()
@@ -279,6 +280,8 @@ class EdgeTtsApi @Inject constructor(
     private companion object {
         const val MAX_CHUNK_LENGTH = 160
         const val MAX_ATTEMPTS = 3
+        const val TRAILER_VOICE_RATE = "+14%"
+        const val TRAILER_VOICE_PITCH = "-3Hz"
     }
 }
 
