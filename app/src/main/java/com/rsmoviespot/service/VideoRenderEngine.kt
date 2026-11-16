@@ -2,11 +2,20 @@ package com.rsmoviespot.service
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
@@ -141,14 +150,14 @@ class VideoRenderEngine @Inject constructor(
                 )
 
                 val imageFile = File(renderDirectory, "slab_${index + 1}.png")
+                val captionFile = File(renderDirectory, "caption_${index + 1}.png")
                 val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
 
                 val imagePrompt = buildSceneImagePrompt(
                     characterBible = script.character_bible,
                     visualStyle = script.visual_style,
                     scenePrompt = slab.image_prompt,
-                    hasCharacter = slab.has_character,
-                    isShorts = isShorts
+                    hasCharacter = slab.has_character
                 )
 
                 val sceneSeed = baseSeed + (index * 37)
@@ -164,6 +173,15 @@ class VideoRenderEngine @Inject constructor(
                 }
                 validateImageFile(imageFile, index + 1)
 
+                val captionStripHeight = runCatching {
+                    createCaptionOverlayPng(
+                        text = slab.voiceover_text,
+                        videoWidth = width,
+                        isShorts = isShorts,
+                        outputFile = captionFile
+                    )
+                }.getOrNull()
+
                 val renderProgress = 12 + (((index + 0.5) * 70) / slabCount).roundToInt()
                 progress(
                     renderProgress.coerceIn(12, 82),
@@ -175,6 +193,8 @@ class VideoRenderEngine @Inject constructor(
                         sceneIndex = index,
                         totalScenes = slabCount,
                         imageFile = imageFile,
+                        captionFile = captionFile.takeIf { captionStripHeight != null && it.exists() },
+                        captionHeight = captionStripHeight ?: 0,
                         outputFile = videoSegmentFile,
                         width = width,
                         height = height,
@@ -241,6 +261,124 @@ class VideoRenderEngine @Inject constructor(
         slabs.joinToString(separator = " ") { it.voiceover_text.trim() }
             .replace(Regex("\\s+"), " ")
             .trim()
+
+    private fun createCaptionOverlayPng(
+        text: String,
+        videoWidth: Int,
+        isShorts: Boolean,
+        outputFile: File
+    ): Int? {
+        val cleanText = text.trim()
+        if (cleanText.isBlank()) return null
+
+        val horizontalMargin = if (isShorts) 110 else 180
+        val maxTextWidth = (videoWidth - horizontalMargin * 2).coerceAtLeast(320)
+        val boxPadX = if (isShorts) 28f else 32f
+        val boxPadY = if (isShorts) 18f else 16f
+        val maxStripHeight = if (isShorts) 430 else 300
+
+        var fontSize = if (isShorts) 50f else 42f
+        lateinit var fillPaint: TextPaint
+        lateinit var layout: StaticLayout
+
+        // Step font down if a scene has longer text so captions stay crisp in 2-4 lines.
+        while (fontSize >= 32f) {
+            fillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFFFFE135.toInt()
+                textSize = fontSize
+                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            }
+            layout = StaticLayout.Builder.obtain(
+                cleanText,
+                0,
+                cleanText.length,
+                fillPaint,
+                maxTextWidth
+            )
+                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setLineSpacing(6f, 1.05f)
+                .setIncludePad(true)
+                .build()
+
+            if (layout.lineCount <= 4 && (layout.height + boxPadY * 2 + 24f) <= maxStripHeight) {
+                break
+            }
+            fontSize -= 4f
+        }
+
+        val strokePaint = TextPaint(fillPaint).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = if (isShorts) 10f else 8f
+            strokeJoin = Paint.Join.ROUND
+            strokeMiter = 10f
+            color = Color.BLACK
+        }
+
+        val strokeLayout = StaticLayout.Builder.obtain(
+            cleanText,
+            0,
+            cleanText.length,
+            strokePaint,
+            maxTextWidth
+        )
+            .setAlignment(Layout.Alignment.ALIGN_CENTER)
+            .setLineSpacing(6f, 1.05f)
+            .setIncludePad(true)
+            .build()
+
+        var maxLineWidth = 0f
+        for (line in 0 until layout.lineCount) {
+            val w = layout.getLineWidth(line)
+            if (w > maxLineWidth) maxLineWidth = w
+        }
+        val contentWidth = maxLineWidth.coerceAtLeast(160f).coerceAtMost(maxTextWidth.toFloat())
+        val contentHeight = layout.height.toFloat().coerceAtLeast(60f)
+
+        val stripHeight = ((contentHeight + boxPadY * 2 + 28f).roundToInt())
+            .coerceIn(110, maxStripHeight)
+            .let { if (it % 2 == 0) it else it + 1 }
+
+        val bitmap = Bitmap.createBitmap(videoWidth, stripHeight, Bitmap.Config.ARGB_8888)
+        try {
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(Color.TRANSPARENT)
+
+            val boxWidth = (contentWidth + boxPadX * 2).coerceAtMost(videoWidth - 48f)
+            val boxHeight = contentHeight + boxPadY * 2
+            val boxLeft = (videoWidth - boxWidth) / 2f
+            val boxTop = ((stripHeight - boxHeight) / 2f).coerceAtLeast(4f)
+            val boxRect = RectF(boxLeft, boxTop, boxLeft + boxWidth, boxTop + boxHeight)
+
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xAA000000.toInt()
+                style = Paint.Style.FILL
+            }
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0x66FFE135.toInt()
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            }
+
+            canvas.drawRoundRect(boxRect, 22f, 22f, bgPaint)
+            canvas.drawRoundRect(boxRect, 22f, 22f, borderPaint)
+
+            val textX = (videoWidth - maxTextWidth) / 2f
+            val textY = boxTop + boxPadY
+
+            canvas.save()
+            canvas.translate(textX, textY)
+            strokeLayout.draw(canvas)
+            layout.draw(canvas)
+            canvas.restore()
+
+            outputFile.outputStream().use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            return stripHeight
+        } finally {
+            bitmap.recycle()
+        }
+    }
 
     private fun computeSceneFrameCounts(
         slabs: List<VideoSlab>,
@@ -395,26 +533,30 @@ class VideoRenderEngine @Inject constructor(
         characterBible: String,
         visualStyle: String,
         scenePrompt: String,
-        hasCharacter: Boolean,
-        isShorts: Boolean
-    ): String = buildString {
-        if (hasCharacter && characterBible.isNotBlank()) {
-            append("Character appearance: ")
-            append(characterBible.trim())
-            append(". ")
-        }
-        append(scenePrompt.trim())
-        if (visualStyle.isNotBlank()) {
-            append(". Style: ")
-            append(visualStyle.trim())
-        }
-        append(
-            if (isShorts) {
-                ", single cohesive cinematic frame, vertical 9:16 composition"
-            } else {
-                ", single cohesive cinematic frame, horizontal 16:9 composition"
+        hasCharacter: Boolean
+    ): String {
+        val sanitizedScene = scenePrompt
+            .replace(
+                Regex(
+                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay)\\b",
+                    RegexOption.IGNORE_CASE
+                ),
+                "dramatic cinematic background"
+            )
+            .trim()
+
+        return buildString {
+            if (hasCharacter && characterBible.isNotBlank()) {
+                append("Character appearance: ")
+                append(characterBible.trim())
+                append(". ")
             }
-        )
+            append(sanitizedScene)
+            if (visualStyle.isNotBlank()) {
+                append(". Style: ")
+                append(visualStyle.trim())
+            }
+        }
     }
 
     private fun prepareBgmBed(
@@ -485,7 +627,6 @@ class VideoRenderEngine @Inject constructor(
         val sampleRate = 44100
         val style = resolveBgmStyle(mood)
 
-        // Shift key and arpeggio pattern per topic so no two videos sound identical.
         val semitoneShifts = intArrayOf(-3, -2, 0, 2, 3)
         val semitoneShift = semitoneShifts[(bgmSeed and 0x7FFFFFFF) % semitoneShifts.size]
         val pitchScale = 2.0.pow(semitoneShift / 12.0)
@@ -497,83 +638,83 @@ class VideoRenderEngine @Inject constructor(
 
         when (style) {
             BgmStyle.COMEDY_ROAST -> {
-                beatDuration = 0.50 // 120 BPM bouncy
-                beatsPerLoop = 32   // 16.0s seamless loop
+                beatDuration = 0.50
+                beatsPerLoop = 32
                 baseChords = arrayOf(
-                    doubleArrayOf(261.63, 329.63, 392.00, 523.25), // C
-                    doubleArrayOf(196.00, 246.94, 293.66, 392.00), // G
-                    doubleArrayOf(220.00, 261.63, 329.63, 440.00), // Am
-                    doubleArrayOf(174.61, 220.00, 261.63, 349.23)  // F
+                    doubleArrayOf(261.63, 329.63, 392.00, 523.25),
+                    doubleArrayOf(196.00, 246.94, 293.66, 392.00),
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00),
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23)
                 )
             }
             BgmStyle.SUSPENSE_THRILLER -> {
-                beatDuration = 0.75 // 80 BPM tense clock
-                beatsPerLoop = 16   // 12.0s seamless loop
+                beatDuration = 0.75
+                beatsPerLoop = 16
                 baseChords = arrayOf(
-                    doubleArrayOf(164.81, 196.00, 246.94, 329.63), // Em
-                    doubleArrayOf(164.81, 174.61, 220.00, 349.23), // F/E tension
-                    doubleArrayOf(164.81, 196.00, 246.94, 329.63), // Em
-                    doubleArrayOf(155.56, 185.00, 220.00, 311.13)  // D#dim
+                    doubleArrayOf(164.81, 196.00, 246.94, 329.63),
+                    doubleArrayOf(164.81, 174.61, 220.00, 349.23),
+                    doubleArrayOf(164.81, 196.00, 246.94, 329.63),
+                    doubleArrayOf(155.56, 185.00, 220.00, 311.13)
                 )
             }
             BgmStyle.EMOTIONAL_SAD -> {
-                beatDuration = 0.80 // 75 BPM gentle piano
-                beatsPerLoop = 16   // 12.8s seamless loop
+                beatDuration = 0.80
+                beatsPerLoop = 16
                 baseChords = arrayOf(
-                    doubleArrayOf(220.00, 261.63, 329.63, 440.00), // Am
-                    doubleArrayOf(174.61, 220.00, 261.63, 349.23), // F
-                    doubleArrayOf(130.81, 196.00, 261.63, 329.63), // C
-                    doubleArrayOf(196.00, 246.94, 293.66, 392.00)  // G
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00),
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23),
+                    doubleArrayOf(130.81, 196.00, 261.63, 329.63),
+                    doubleArrayOf(196.00, 246.94, 293.66, 392.00)
                 )
             }
             BgmStyle.DEVOTIONAL -> {
-                beatDuration = 0.75 // 80 BPM serene
-                beatsPerLoop = 16   // 12.0s seamless loop
+                beatDuration = 0.75
+                beatsPerLoop = 16
                 baseChords = arrayOf(
-                    doubleArrayOf(130.81, 196.00, 261.63, 293.66), // Csus2
-                    doubleArrayOf(174.61, 220.00, 261.63, 392.00), // Fadd9
-                    doubleArrayOf(196.00, 261.63, 293.66, 392.00), // Gsus4
-                    doubleArrayOf(130.81, 196.00, 261.63, 329.63)  // C
+                    doubleArrayOf(130.81, 196.00, 261.63, 293.66),
+                    doubleArrayOf(174.61, 220.00, 261.63, 392.00),
+                    doubleArrayOf(196.00, 261.63, 293.66, 392.00),
+                    doubleArrayOf(130.81, 196.00, 261.63, 329.63)
                 )
             }
             BgmStyle.SCI_FI_TECH -> {
-                beatDuration = 0.50 // 120 BPM synthwave
-                beatsPerLoop = 32   // 16.0s seamless loop
+                beatDuration = 0.50
+                beatsPerLoop = 32
                 baseChords = arrayOf(
-                    doubleArrayOf(220.00, 261.63, 329.63, 440.00), // Am
-                    doubleArrayOf(174.61, 220.00, 261.63, 349.23), // F
-                    doubleArrayOf(146.83, 220.00, 293.66, 349.23), // Dm
-                    doubleArrayOf(164.81, 207.65, 246.94, 329.63)  // E
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00),
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23),
+                    doubleArrayOf(146.83, 220.00, 293.66, 349.23),
+                    doubleArrayOf(164.81, 207.65, 246.94, 329.63)
                 )
             }
             BgmStyle.MOTIVATIONAL -> {
-                beatDuration = 0.60 // 100 BPM inspiring
-                beatsPerLoop = 32   // 19.2s seamless loop
+                beatDuration = 0.60
+                beatsPerLoop = 32
                 baseChords = arrayOf(
-                    doubleArrayOf(174.61, 220.00, 261.63, 349.23), // F
-                    doubleArrayOf(196.00, 246.94, 293.66, 392.00), // G
-                    doubleArrayOf(164.81, 196.00, 246.94, 329.63), // Em
-                    doubleArrayOf(220.00, 261.63, 329.63, 440.00)  // Am
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23),
+                    doubleArrayOf(196.00, 246.94, 293.66, 392.00),
+                    doubleArrayOf(164.81, 196.00, 246.94, 329.63),
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00)
                 )
             }
             BgmStyle.HORROR_DARK -> {
-                beatDuration = 0.80 // 75 BPM eerie
-                beatsPerLoop = 16   // 12.8s seamless loop
+                beatDuration = 0.80
+                beatsPerLoop = 16
                 baseChords = arrayOf(
-                    doubleArrayOf(138.59, 164.81, 207.65, 277.18), // C#m
-                    doubleArrayOf(138.59, 196.00, 246.94, 293.66), // tritone tension
-                    doubleArrayOf(146.83, 174.61, 220.00, 293.66), // Dm
-                    doubleArrayOf(138.59, 196.00, 233.08, 277.18)  // dim
+                    doubleArrayOf(138.59, 164.81, 207.65, 277.18),
+                    doubleArrayOf(138.59, 196.00, 246.94, 293.66),
+                    doubleArrayOf(146.83, 174.61, 220.00, 293.66),
+                    doubleArrayOf(138.59, 196.00, 233.08, 277.18)
                 )
             }
             BgmStyle.EPIC_ACTION -> {
-                beatDuration = 0.46875 // 128 BPM driving war rhythm
-                beatsPerLoop = 32      // 15.0s seamless loop
+                beatDuration = 0.46875
+                beatsPerLoop = 32
                 baseChords = arrayOf(
-                    doubleArrayOf(146.83, 220.00, 293.66, 349.23), // Dm
-                    doubleArrayOf(116.54, 174.61, 233.08, 293.66), // Bb
-                    doubleArrayOf(130.81, 196.00, 261.63, 329.63), // C
-                    doubleArrayOf(110.00, 164.81, 220.00, 277.18)  // A
+                    doubleArrayOf(146.83, 220.00, 293.66, 349.23),
+                    doubleArrayOf(116.54, 174.61, 233.08, 293.66),
+                    doubleArrayOf(130.81, 196.00, 261.63, 329.63),
+                    doubleArrayOf(110.00, 164.81, 220.00, 277.18)
                 )
             }
         }
@@ -602,7 +743,6 @@ class VideoRenderEngine @Inject constructor(
             val halfBeatT = t % (beatDuration * 0.5)
             val quarterBeatT = t % (beatDuration * 0.25)
 
-            // Smooth cross-envelope so loop boundary at 0 / loopDuration never clicks.
             val loopEnv = (t / 0.04).coerceAtMost(1.0) *
                 ((loopDuration - t) / 0.04).coerceAtMost(1.0)
             val chordEnv = (chordLocalT / 0.12).coerceAtMost(1.0) *
@@ -610,7 +750,6 @@ class VideoRenderEngine @Inject constructor(
 
             val sample = when (style) {
                 BgmStyle.COMEDY_ROAST -> {
-                    // Bouncy staccato pluck chords on every half-beat + cheerful bass + off-beat snap
                     val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
                     val pluckFreq = chord[arpOrder[stepIdx]] * 1.5
                     val pluckEnv = exp(-12.0 * halfBeatT)
@@ -620,7 +759,6 @@ class VideoRenderEngine @Inject constructor(
                     val bassFreq = chord[0] * 0.5
                     val bass = sin(2.0 * PI * bassFreq * beatT) * exp(-7.5 * beatT) * 0.34
 
-                    // Crisp snappy clap on odd beats (2 and 4)
                     val isSnareBeat = (beatNumber % 2 == 1)
                     val snap = if (isSnareBeat) {
                         rand.nextDouble(-1.0, 1.0) * exp(-28.0 * beatT) * 0.26
@@ -629,7 +767,6 @@ class VideoRenderEngine @Inject constructor(
                     pluck + bass + snap
                 }
                 BgmStyle.SUSPENSE_THRILLER -> {
-                    // Ticking clock every half beat + slow heartbeat + eerie glassy chime on bar start
                     val tick = (sin(2.0 * PI * 1950.0 * halfBeatT) * 0.5 +
                         rand.nextDouble(-1.0, 1.0) * 0.5) * exp(-55.0 * halfBeatT) * 0.22
 
@@ -646,7 +783,6 @@ class VideoRenderEngine @Inject constructor(
                     tick + heartbeat + bell + lowDrone
                 }
                 BgmStyle.EMOTIONAL_SAD -> {
-                    // Warm felt piano chords + delicate top melody notes (NO drums)
                     val pianoAttack = (chordLocalT / 0.025).coerceAtMost(1.0)
                     val pianoDecay = exp(-1.4 * chordLocalT)
                     var piano = 0.0
@@ -665,7 +801,6 @@ class VideoRenderEngine @Inject constructor(
                     piano + melody + warmPad
                 }
                 BgmStyle.DEVOTIONAL -> {
-                    // Serene tanpura drone + bansuri vibrato melody + soft temple chime
                     val drone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.22 +
                         sin(2.0 * PI * chord[1] * t) * 0.12 +
                         sin(2.0 * PI * chord[2] * t) * 0.08) * chordEnv
@@ -683,7 +818,6 @@ class VideoRenderEngine @Inject constructor(
                     drone + flute + bell
                 }
                 BgmStyle.SCI_FI_TECH -> {
-                    // Fast 16th-note cyber synth arpeggio + punchy electronic kick + octave pad
                     val stepIdx = ((t / (beatDuration * 0.25)).toInt()) % arpOrder.size
                     val arpFreq = chord[arpOrder[stepIdx]] * 2.0
                     val arp = (sin(2.0 * PI * arpFreq * quarterBeatT) +
@@ -702,7 +836,6 @@ class VideoRenderEngine @Inject constructor(
                     arp + pad + kick + hat
                 }
                 BgmStyle.MOTIVATIONAL -> {
-                    // Bright uplifting plucks + warm anthem pad + steady kick
                     val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
                     val arpFreq = chord[arpOrder[stepIdx]] * 1.5
                     val arp = sin(2.0 * PI * arpFreq * halfBeatT) * exp(-7.5 * halfBeatT) * 0.28
@@ -718,7 +851,6 @@ class VideoRenderEngine @Inject constructor(
                     arp + pad + kick
                 }
                 BgmStyle.HORROR_DARK -> {
-                    // Unsettling low drone + eerie shimmer + sparse metallic echo
                     val lfo = 0.70 + 0.30 * sin(2.0 * PI * 0.35 * t)
                     val drone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.28 +
                         sin(2.0 * PI * chord[1] * t) * 0.16 +
@@ -732,7 +864,6 @@ class VideoRenderEngine @Inject constructor(
                     drone + metalHit
                 }
                 BgmStyle.EPIC_ACTION -> {
-                    // Double-hit war drums + rich brassy fifths + heroic rising arpeggio
                     var brass = 0.0
                     for (freq in chord) {
                         brass += sin(2.0 * PI * freq * t) * 0.14 +
@@ -1033,6 +1164,8 @@ class VideoRenderEngine @Inject constructor(
         sceneIndex: Int,
         totalScenes: Int,
         imageFile: File,
+        captionFile: File?,
+        captionHeight: Int,
         outputFile: File,
         width: Int,
         height: Int,
@@ -1052,22 +1185,55 @@ class VideoRenderEngine @Inject constructor(
 
         val motionFilter = when (sceneIndex % 4) {
             0 ->
-                "zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
+                "zoompan=z='min(zoom+0.0025,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
             1 ->
-                "zoompan=z='if(lte(on,1),1.18,max(1.0,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
+                "zoompan=z='if(lte(on,1),1.25,max(1.0,zoom-0.0025))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
             2 ->
-                "zoompan=z='1.14':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':" +
+                "zoompan=z='1.20':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
             else ->
-                "zoompan=z='1.14':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
+                "zoompan=z='1.20':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
         }
 
         val edgeFades = buildString {
             if (sceneIndex == 0) append("fade=t=in:st=0:d=0.22,")
             if (sceneIndex == totalScenes - 1) append("fade=t=out:st=$fadeOutStart:d=0.28,")
+        }
+
+        if (captionFile != null && captionHeight > 0) {
+            val overlayY = if (height > width) {
+                (height - captionHeight - 370).coerceAtLeast(0)
+            } else {
+                (height - captionHeight - 55).coerceAtLeast(0)
+            }
+
+            val filterComplex =
+                "[0:v]scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
+                    "crop=$upWidth:$upHeight," +
+                    "setsar=1," +
+                    "$motionFilter[bg];" +
+                    "[bg][1:v]overlay=0:$overlayY:eof_action=repeat:format=auto," +
+                    "${edgeFades}format=yuv420p[vout]"
+
+            return arrayOf(
+                "-y",
+                "-i", imageFile.absolutePath,
+                "-i", captionFile.absolutePath,
+                "-filter_complex", filterComplex,
+                "-map", "[vout]",
+                "-frames:v", frames.toString(),
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "21",
+                "-threads", "2",
+                "-pix_fmt", "yuv420p",
+                "-r", FRAME_RATE.toString(),
+                outputFile.absolutePath
+            )
         }
 
         val filter =
