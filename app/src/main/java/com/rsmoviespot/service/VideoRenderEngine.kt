@@ -7,7 +7,6 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -195,7 +194,8 @@ class VideoRenderEngine @Inject constructor(
                         videoRepository.downloadRealPhoto(
                             query = slab.real_photo_query,
                             usedUrls = usedRealPhotoUrls,
-                            destinationFile = rawRealFile
+                            destinationFile = rawRealFile,
+                            preferPortrait = isShorts
                         )
                     }.getOrDefault(false)
 
@@ -346,84 +346,93 @@ class VideoRenderEngine @Inject constructor(
             val srcAspect = srcW.toFloat() / srcH.toFloat()
             val dstAspect = targetWidth.toFloat() / targetHeight.toFloat()
 
-            val bgCropRect = if (srcAspect > dstAspect) {
-                val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
-                val left = (srcW - cropW) / 2
-                Rect(left, 0, left + cropW, srcH)
-            } else {
-                val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
-                val top = (srcH - cropH) / 2
-                Rect(0, top, srcW, top + cropH)
-            }
-
-            val blurW = (targetWidth / 18).coerceAtLeast(36)
-            val blurH = (targetHeight / 18).coerceAtLeast(36)
-            tinyBitmap = Bitmap.createBitmap(blurW, blurH, Bitmap.Config.ARGB_8888)
-            val tinyCanvas = Canvas(tinyBitmap)
-            tinyCanvas.drawBitmap(
-                srcBitmap,
-                bgCropRect,
-                Rect(0, 0, blurW, blurH),
-                Paint(Paint.FILTER_BITMAP_FLAG)
-            )
-
             outBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(outBitmap)
 
-            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(
-                tinyBitmap,
-                null,
-                Rect(0, 0, targetWidth, targetHeight),
-                bgPaint
-            )
-            canvas.drawColor(0x9E080A0C.toInt())
+            // Full-bleed upper-biased portrait/square fill (ZERO borders!)
+            if (srcAspect <= 1.08f && targetHeight > targetWidth) {
+                val cropRect = if (srcAspect > dstAspect) {
+                    val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
+                    val left = (srcW - cropW) / 2
+                    Rect(left, 0, left + cropW, srcH)
+                } else {
+                    val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
+                    val top = ((srcH - cropH) * 0.16f).roundToInt().coerceIn(0, srcH - cropH)
+                    Rect(0, top, srcW, top + cropH)
+                }
+                canvas.drawBitmap(
+                    srcBitmap,
+                    cropRect,
+                    Rect(0, 0, targetWidth, targetHeight),
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                )
+            } else if (targetWidth >= targetHeight && srcAspect >= 1.25f) {
+                // Full-bleed landscape YouTube 16:9
+                val cropRect = if (srcAspect > dstAspect) {
+                    val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
+                    val left = (srcW - cropW) / 2
+                    Rect(left, 0, left + cropW, srcH)
+                } else {
+                    val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
+                    val top = ((srcH - cropH) * 0.22f).roundToInt().coerceIn(0, srcH - cropH)
+                    Rect(0, top, srcW, top + cropH)
+                }
+                canvas.drawBitmap(
+                    srcBitmap,
+                    cropRect,
+                    Rect(0, 0, targetWidth, targetHeight),
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                )
+            } else {
+                // Wide landscape photo in 9:16 Shorts:
+                // 1) Rich glowing blurred backdrop (no heavy black bars!)
+                val bgCropRect = if (srcAspect > dstAspect) {
+                    val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
+                    val left = (srcW - cropW) / 2
+                    Rect(left, 0, left + cropW, srcH)
+                } else {
+                    val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
+                    val top = (srcH - cropH) / 2
+                    Rect(0, top, srcW, top + cropH)
+                }
 
-            val isPortrait = targetHeight > targetWidth
-            val padX = if (isPortrait) 48f else 140f
-            val topMargin = if (isPortrait) 150f else 70f
-            val bottomMargin = if (isPortrait) 500f else 140f
-            val availW = (targetWidth - padX * 2f).coerceAtLeast(240f)
-            val availH = (targetHeight - topMargin - bottomMargin).coerceAtLeast(240f)
+                val blurW = (targetWidth / 24).coerceAtLeast(32)
+                val blurH = (targetHeight / 24).coerceAtLeast(32)
+                tinyBitmap = Bitmap.createBitmap(blurW, blurH, Bitmap.Config.ARGB_8888)
+                Canvas(tinyBitmap).drawBitmap(
+                    srcBitmap,
+                    bgCropRect,
+                    Rect(0, 0, blurW, blurH),
+                    Paint(Paint.FILTER_BITMAP_FLAG)
+                )
 
-            val scale = minOf(availW / srcW.toFloat(), availH / srcH.toFloat())
-            val drawW = srcW * scale
-            val drawH = srcH * scale
-            val left = (targetWidth - drawW) / 2f
-            val top = topMargin + (availH - drawH) * 0.40f
-            val cardRect = RectF(left, top, left + drawW, top + drawH)
+                canvas.drawBitmap(
+                    tinyBitmap,
+                    null,
+                    Rect(0, 0, targetWidth, targetHeight),
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                )
+                // Gentle dim so backdrop stays colorful and matches the photo instead of black bars
+                canvas.drawColor(0x3D000000)
 
-            val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0x88000000.toInt()
-                style = Paint.Style.FILL
+                // 2) Edge-to-edge full-width photo with gentle 20% side trim so it fills height cleanly
+                val trimmedW = (srcW * 0.80f).roundToInt().coerceIn(1, srcW)
+                val trimLeft = (srcW - trimmedW) / 2
+                val fgCrop = Rect(trimLeft, 0, trimLeft + trimmedW, srcH)
+                val fgAspect = trimmedW.toFloat() / srcH.toFloat()
+
+                val drawW = targetWidth.toFloat()
+                val drawH = (drawW / fgAspect).coerceAtMost(targetHeight * 0.72f)
+                val top = ((targetHeight - drawH) * 0.36f).coerceAtLeast(80f)
+                val dstRect = RectF(0f, top, drawW, top + drawH)
+
+                canvas.drawBitmap(
+                    srcBitmap,
+                    fgCrop,
+                    dstRect,
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                )
             }
-            val shadowRect = RectF(
-                cardRect.left + 8f,
-                cardRect.top + 14f,
-                cardRect.right + 8f,
-                cardRect.bottom + 14f
-            )
-            canvas.drawRoundRect(shadowRect, 30f, 30f, shadowPaint)
-
-            val clipPath = Path().apply {
-                addRoundRect(cardRect, 28f, 28f, Path.Direction.CW)
-            }
-            canvas.save()
-            canvas.clipPath(clipPath)
-            canvas.drawBitmap(
-                srcBitmap,
-                null,
-                cardRect,
-                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            )
-            canvas.restore()
-
-            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0x55FFFFFF
-                style = Paint.Style.STROKE
-                strokeWidth = 3f
-            }
-            canvas.drawRoundRect(cardRect, 28f, 28f, borderPaint)
 
             outputFile.outputStream().use { out ->
                 outBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
@@ -692,32 +701,45 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
+    private fun sanitizePromptText(raw: String): String =
+        raw
+            .replace(
+                Regex(
+                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay)\\b",
+                    RegexOption.IGNORE_CASE
+                ),
+                "dramatic packed Indian cinema theater"
+            )
+            .replace(Regex("\\banimals?\\b", RegexOption.IGNORE_CASE), "intense Bollywood action film")
+            .replace(Regex("\\bspirits?\\b", RegexOption.IGNORE_CASE), "fierce police thriller")
+            .replace(Regex("\\bdark violence\\b|\\bbrutal violence\\b|\\bviolence\\b", RegexOption.IGNORE_CASE), "gritty dramatic action confrontation in moody night rain")
+            .replace(Regex("\\bblood rivers?\\b|\\brivers of blood\\b", RegexOption.IGNORE_CASE), "dramatic crimson-lit action showdown with flying sparks")
+            .replace(Regex("\\bbox[- ]?office\\b", RegexOption.IGNORE_CASE), "cheering packed Indian cinema hall")
+            .replace(Regex("\\bclose[- ]?up(?:\\s+of)?(?:\\s+a)?(?:\\s+woman'?s?)?\\s+eyes?\\b", RegexOption.IGNORE_CASE), "dramatic medium shot of intense Indian action hero")
+            .replace(Regex("\\bunreal engine(?:\\s*5)?\\b", RegexOption.IGNORE_CASE), "live-action 35mm cinema still")
+            .replace(Regex("\\babstract\\b", RegexOption.IGNORE_CASE), "realistic live-action")
+            .trim()
+
     private fun buildSceneImagePrompt(
         characterBible: String,
         visualStyle: String,
         scenePrompt: String,
         hasCharacter: Boolean
     ): String {
-        val sanitizedScene = scenePrompt
-            .replace(
-                Regex(
-                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay)\\b",
-                    RegexOption.IGNORE_CASE
-                ),
-                "dramatic cinematic background"
-            )
-            .trim()
+        val cleanScene = sanitizePromptText(scenePrompt)
+        val cleanBible = sanitizePromptText(characterBible)
+        val cleanStyle = sanitizePromptText(visualStyle)
 
         return buildString {
-            if (hasCharacter && characterBible.isNotBlank()) {
+            if (hasCharacter && cleanBible.isNotBlank()) {
                 append("Character appearance: ")
-                append(characterBible.trim())
+                append(cleanBible)
                 append(". ")
             }
-            append(sanitizedScene)
-            if (visualStyle.isNotBlank()) {
+            append(cleanScene)
+            if (cleanStyle.isNotBlank()) {
                 append(". Style: ")
-                append(visualStyle.trim())
+                append(cleanStyle)
             }
         }
     }
