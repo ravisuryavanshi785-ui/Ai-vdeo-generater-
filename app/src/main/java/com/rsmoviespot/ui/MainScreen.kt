@@ -89,8 +89,6 @@ fun MainScreen(
         labelColor = Color.White
     )
     val chipBorder = FilterChipDefaults.filterChipBorder(
-        enabled = true,
-        selected = false,
         borderColor = BorderGreen,
         selectedBorderColor = NeonGreen
     )
@@ -324,7 +322,7 @@ fun MainScreen(
                     }
                     Spacer(modifier = Modifier.height(10.dp))
                     LinearProgressIndicator(
-                        progress = { (uiState.progressPercentage / 100f).coerceIn(0f, 1f) },
+                        progress = (uiState.progressPercentage / 100f).coerceIn(0f, 1f),
                         modifier = Modifier.fillMaxWidth(),
                         color = NeonGreen,
                         trackColor = Color(0xFF263327)
