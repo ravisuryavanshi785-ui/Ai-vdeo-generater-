@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -145,6 +146,13 @@ class VideoRenderService : Service() {
             generatedVideoUri = null
         )
 
+        val wakeLock = runCatching {
+            val pm = getSystemService(PowerManager::class.java)
+            pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RSMovieSpot::RenderLock")?.apply {
+                acquire(15 * 60 * 1000L)
+            }
+        }.getOrNull()
+
         renderJob = serviceScope.launch {
             var lastPercent = -1
             var lastMessage = ""
@@ -221,6 +229,10 @@ class VideoRenderService : Service() {
                 )
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()
+            } finally {
+                runCatching {
+                    if (wakeLock?.isHeld == true) wakeLock.release()
+                }
             }
         }
     }
