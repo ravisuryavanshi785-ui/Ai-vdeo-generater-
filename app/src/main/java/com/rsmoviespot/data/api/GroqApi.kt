@@ -13,6 +13,12 @@ interface GroqApi {
         @Header("Authorization") authHeader: String,
         @Body request: GroqChatRequest
     ): GroqChatResponse
+
+    @POST("chat/completions")
+    suspend fun generateContentPlain(
+        @Header("Authorization") authHeader: String,
+        @Body request: GroqPlainChatRequest
+    ): GroqChatResponse
 }
 
 @Serializable
@@ -24,6 +30,15 @@ data class GroqChatRequest(
     val maxTokens: Int,
     @SerialName("response_format")
     val responseFormat: GroqResponseFormat
+)
+
+@Serializable
+data class GroqPlainChatRequest(
+    val model: String,
+    val messages: List<GroqMessage>,
+    val temperature: Double,
+    @SerialName("max_tokens")
+    val maxTokens: Int
 )
 
 @Serializable
