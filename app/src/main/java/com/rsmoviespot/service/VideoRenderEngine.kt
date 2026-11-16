@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -20,11 +19,18 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
 import com.rsmoviespot.data.repository.VideoRepository
+import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
+import com.rsmoviespot.domain.models.VoiceGender
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
 import java.io.File
@@ -50,10 +56,11 @@ data class VideoRenderResult(
     val height: Int
 )
 
-private data class VttCue(
+private data class PopCaptionChunk(
+    val file: File,
+    val stripHeight: Int,
     val startSeconds: Double,
-    val endSeconds: Double,
-    val cleanLength: Int
+    val endSeconds: Double
 )
 
 private enum class BgmStyle {
@@ -76,6 +83,8 @@ class VideoRenderEngine @Inject constructor(
         isShorts: Boolean,
         customBgmUri: Uri? = null,
         preGeneratedScript: VideoScriptResponse? = null,
+        language: VideoLanguage = VideoLanguage.AUTO,
+        voiceGender: VoiceGender = VoiceGender.MALE,
         progress: (Int, String) -> Unit = { _, _ -> }
     ): VideoRenderResult = withContext(Dispatchers.IO) {
         require(topic.isNotBlank()) { "Topic must not be blank." }
@@ -97,31 +106,47 @@ class VideoRenderEngine @Inject constructor(
                 preGeneratedScript
             } else {
                 progress(2, "Generating story script…")
-                videoRepository.generateScript(topic, isShorts)
+                videoRepository.generateScript(
+                    topic = topic,
+                    isShorts = isShorts,
+                    language = language,
+                    voiceGender = voiceGender
+                )
             }
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
+
+            val activeVoiceName = if (language != VideoLanguage.AUTO) {
+                language.resolveVoice(voiceGender)
+            } else {
+                script.voice_name.ifBlank { VideoLanguage.HINDI.resolveVoice(voiceGender) }
+            }
 
             val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
                 .coerceAtLeast(1000)
 
-            progress(7, "Recording continuous voiceover…")
-            val fullNarrationText = buildContinuousNarrationText(script.slabs)
-            val fullVoiceFile = File(renderDirectory, "full_voice.mp3")
-            val ttsResult = videoRepository.generateContinuousAudioWithVtt(fullNarrationText)
-            fullVoiceFile.writeBytes(ttsResult.audioBytes)
-            if (!fullVoiceFile.exists() || fullVoiceFile.length() == 0L) {
-                throw IOException("Generated voiceover audio is empty.")
-            }
-
-            val rawAudioDuration = getAudioDurationSeconds(fullVoiceFile)
-            val totalVideoDuration = rawAudioDuration + AUDIO_TAIL_PADDING_SECONDS
-
-            val sceneFramesList = computeSceneFrameCounts(
+            progress(7, "Recording dynamic voiceover…")
+            val trimmedVoiceWavs = synthesizeAndTrimVoiceClips(
+                renderDirectory = renderDirectory,
                 slabs = script.slabs,
-                vttContent = ttsResult.vttContent,
-                rawAudioDuration = rawAudioDuration,
-                totalVideoDuration = totalVideoDuration
+                voiceName = activeVoiceName
             )
+
+            val voiceListFile = File(renderDirectory, "voice_parts.txt")
+            voiceListFile.writeText(
+                trimmedVoiceWavs.joinToString("\n") { "file '${escapeConcatPath(it.absolutePath)}'" } + "\n"
+            )
+            val fullVoiceFile = File(renderDirectory, "full_voice.wav")
+            runFfmpeg(createConcatArguments(voiceListFile, fullVoiceFile))
+
+            val sceneDurations = trimmedVoiceWavs.map { wavFile ->
+                getPcmWavDurationSeconds(wavFile).coerceAtLeast(0.60)
+            }.toMutableList()
+            sceneDurations[sceneDurations.lastIndex] =
+                sceneDurations.last() + AUDIO_TAIL_PADDING_SECONDS
+
+            val sceneFramesList = sceneDurations.map { dur ->
+                (dur * FRAME_RATE).roundToInt().coerceAtLeast(MIN_SCENE_FRAMES)
+            }
             val totalFrames = sceneFramesList.sum()
             val exactVideoDuration = totalFrames.toDouble() / FRAME_RATE
 
@@ -143,14 +168,13 @@ class VideoRenderEngine @Inject constructor(
             val slabCount = script.slabs.size
 
             script.slabs.forEachIndexed { index, slab ->
-                val baseProgress = 12 + (index * 70 / slabCount)
+                val baseProgress = 14 + (index * 68 / slabCount)
                 progress(
-                    baseProgress.coerceIn(12, 82),
+                    baseProgress.coerceIn(14, 82),
                     "Creating scene ${index + 1} of $slabCount…"
                 )
 
                 val imageFile = File(renderDirectory, "slab_${index + 1}.png")
-                val captionFile = File(renderDirectory, "caption_${index + 1}.png")
                 val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
 
                 val imagePrompt = buildSceneImagePrompt(
@@ -173,18 +197,21 @@ class VideoRenderEngine @Inject constructor(
                 }
                 validateImageFile(imageFile, index + 1)
 
-                val captionStripHeight = runCatching {
-                    createCaptionOverlayPng(
-                        text = slab.voiceover_text,
+                val segmentExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
+                val popCaptions = runCatching {
+                    createPopCaptionOverlays(
+                        renderDirectory = renderDirectory,
+                        sceneIndex = index,
+                        fullSceneText = slab.voiceover_text,
+                        sceneDurationSeconds = segmentExactDuration,
                         videoWidth = width,
-                        isShorts = isShorts,
-                        outputFile = captionFile
+                        isShorts = isShorts
                     )
-                }.getOrNull()
+                }.getOrDefault(emptyList())
 
-                val renderProgress = 12 + (((index + 0.5) * 70) / slabCount).roundToInt()
+                val renderProgress = 14 + (((index + 0.5) * 68) / slabCount).roundToInt()
                 progress(
-                    renderProgress.coerceIn(12, 82),
+                    renderProgress.coerceIn(14, 82),
                     "Animating scene ${index + 1} of $slabCount…"
                 )
 
@@ -193,8 +220,7 @@ class VideoRenderEngine @Inject constructor(
                         sceneIndex = index,
                         totalScenes = slabCount,
                         imageFile = imageFile,
-                        captionFile = captionFile.takeIf { captionStripHeight != null && it.exists() },
-                        captionHeight = captionStripHeight ?: 0,
+                        popCaptions = popCaptions,
                         outputFile = videoSegmentFile,
                         width = width,
                         height = height,
@@ -215,7 +241,7 @@ class VideoRenderEngine @Inject constructor(
             val silentVideoFile = File(renderDirectory, "silent_video.mp4")
             runFfmpeg(createConcatArguments(concatList, silentVideoFile))
 
-            progress(90, "Mixing continuous voice, BGM & SFX…")
+            progress(90, "Mastering studio voice, BGM & SFX…")
             val sfxTrackFile = synthesizeTimedSfxTrackWav(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
@@ -257,12 +283,146 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun buildContinuousNarrationText(slabs: List<VideoSlab>): String =
-        slabs.joinToString(separator = " ") { it.voiceover_text.trim() }
-            .replace(Regex("\\s+"), " ")
-            .trim()
+    private suspend fun synthesizeAndTrimVoiceClips(
+        renderDirectory: File,
+        slabs: List<VideoSlab>,
+        voiceName: String
+    ): List<File> = coroutineScope {
+        val semaphore = Semaphore(4)
+        val rawFiles = slabs.mapIndexed { index, slab ->
+            async(Dispatchers.IO) {
+                semaphore.withPermit {
+                    val rawMp3 = File(renderDirectory, "raw_voice_${index + 1}.mp3")
+                    val bytes = videoRepository.generateDynamicVoiceClip(
+                        text = slab.voiceover_text,
+                        voiceName = voiceName,
+                        emotion = slab.voice_emotion
+                    )
+                    rawMp3.writeBytes(bytes)
+                    if (!rawMp3.exists() || rawMp3.length() == 0L) {
+                        throw IOException("Voice generation returned empty audio for scene ${index + 1}.")
+                    }
+                    rawMp3
+                }
+            }
+        }.awaitAll()
 
-    private fun createCaptionOverlayPng(
+        val wavFiles = mutableListOf<File>()
+        rawFiles.forEachIndexed { index, rawMp3 ->
+            val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
+            val isLast = index == rawFiles.lastIndex
+            val microBreath = if (isLast) 0.02 else 0.06
+
+            val trimmedOk = runCatching {
+                runFfmpeg(
+                    arrayOf(
+                        "-y",
+                        "-i", rawMp3.absolutePath,
+                        "-af",
+                        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB," +
+                            "areverse," +
+                            "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB," +
+                            "areverse," +
+                            "apad=pad_dur=$microBreath",
+                        "-ar", "44100",
+                        "-ac", "1",
+                        "-c:a", "pcm_s16le",
+                        trimmedWav.absolutePath
+                    )
+                )
+            }.isSuccess
+
+            if (!trimmedOk || !trimmedWav.exists() || trimmedWav.length() <= 44L) {
+                runFfmpeg(
+                    arrayOf(
+                        "-y",
+                        "-i", rawMp3.absolutePath,
+                        "-ar", "44100",
+                        "-ac", "1",
+                        "-c:a", "pcm_s16le",
+                        trimmedWav.absolutePath
+                    )
+                )
+            }
+            wavFiles += trimmedWav
+        }
+        wavFiles
+    }
+
+    private fun getPcmWavDurationSeconds(wavFile: File): Double {
+        val dataBytes = (wavFile.length() - 44L).coerceAtLeast(0L)
+        return dataBytes.toDouble() / (44100.0 * 2.0)
+    }
+
+    private fun createPopCaptionOverlays(
+        renderDirectory: File,
+        sceneIndex: Int,
+        fullSceneText: String,
+        sceneDurationSeconds: Double,
+        videoWidth: Int,
+        isShorts: Boolean
+    ): List<PopCaptionChunk> {
+        val chunksText = splitIntoPopChunks(fullSceneText, maxWordsPerChunk = if (isShorts) 4 else 6)
+        if (chunksText.isEmpty()) return emptyList()
+
+        val weights = chunksText.map { chunk ->
+            chunk.count { !it.isWhitespace() }.coerceAtLeast(1).toDouble()
+        }
+        val totalWeight = weights.sum().coerceAtLeast(1.0)
+
+        val result = mutableListOf<PopCaptionChunk>()
+        var cursorTime = 0.0
+
+        chunksText.forEachIndexed { chunkIdx, chunkText ->
+            val chunkDur = (weights[chunkIdx] / totalWeight) * sceneDurationSeconds
+            val startTime = cursorTime
+            val endTime = if (chunkIdx == chunksText.lastIndex) {
+                sceneDurationSeconds + 0.05
+            } else {
+                cursorTime + chunkDur
+            }
+            cursorTime += chunkDur
+
+            val pngFile = File(renderDirectory, "pop_${sceneIndex + 1}_${chunkIdx + 1}.png")
+            val stripHeight = renderCaptionPng(
+                text = chunkText,
+                videoWidth = videoWidth,
+                isShorts = isShorts,
+                outputFile = pngFile
+            )
+            if (stripHeight != null && pngFile.exists()) {
+                result += PopCaptionChunk(
+                    file = pngFile,
+                    stripHeight = stripHeight,
+                    startSeconds = startTime,
+                    endSeconds = endTime
+                )
+            }
+        }
+        return result
+    }
+
+    private fun splitIntoPopChunks(text: String, maxWordsPerChunk: Int): List<String> {
+        val words = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (words.isEmpty()) return emptyList()
+        if (words.size <= maxWordsPerChunk) return listOf(words.joinToString(" "))
+
+        val chunks = mutableListOf<String>()
+        var idx = 0
+        while (idx < words.size) {
+            val remaining = words.size - idx
+            val takeCount = when {
+                remaining <= maxWordsPerChunk -> remaining
+                remaining == maxWordsPerChunk + 1 -> maxWordsPerChunk - 1
+                else -> maxWordsPerChunk
+            }
+            chunks += words.subList(idx, idx + takeCount).joinToString(" ")
+            idx += takeCount
+        }
+        return chunks
+    }
+
+    private fun renderCaptionPng(
         text: String,
         videoWidth: Int,
         isShorts: Boolean,
@@ -271,18 +431,17 @@ class VideoRenderEngine @Inject constructor(
         val cleanText = text.trim()
         if (cleanText.isBlank()) return null
 
-        val horizontalMargin = if (isShorts) 110 else 180
+        val horizontalMargin = if (isShorts) 105 else 180
         val maxTextWidth = (videoWidth - horizontalMargin * 2).coerceAtLeast(320)
-        val boxPadX = if (isShorts) 28f else 32f
+        val boxPadX = if (isShorts) 30f else 34f
         val boxPadY = if (isShorts) 18f else 16f
-        val maxStripHeight = if (isShorts) 430 else 300
+        val maxStripHeight = if (isShorts) 320 else 240
 
-        var fontSize = if (isShorts) 50f else 42f
+        var fontSize = if (isShorts) 56f else 46f
         lateinit var fillPaint: TextPaint
         lateinit var layout: StaticLayout
 
-        // Step font down if a scene has longer text so captions stay crisp in 2-4 lines.
-        while (fontSize >= 32f) {
+        while (fontSize >= 36f) {
             fillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = 0xFFFFE135.toInt()
                 textSize = fontSize
@@ -296,11 +455,11 @@ class VideoRenderEngine @Inject constructor(
                 maxTextWidth
             )
                 .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                .setLineSpacing(6f, 1.05f)
+                .setLineSpacing(4f, 1.04f)
                 .setIncludePad(true)
                 .build()
 
-            if (layout.lineCount <= 4 && (layout.height + boxPadY * 2 + 24f) <= maxStripHeight) {
+            if (layout.lineCount <= 2 && (layout.height + boxPadY * 2 + 24f) <= maxStripHeight) {
                 break
             }
             fontSize -= 4f
@@ -308,7 +467,7 @@ class VideoRenderEngine @Inject constructor(
 
         val strokePaint = TextPaint(fillPaint).apply {
             style = Paint.Style.STROKE
-            strokeWidth = if (isShorts) 10f else 8f
+            strokeWidth = if (isShorts) 11f else 9f
             strokeJoin = Paint.Join.ROUND
             strokeMiter = 10f
             color = Color.BLACK
@@ -322,7 +481,7 @@ class VideoRenderEngine @Inject constructor(
             maxTextWidth
         )
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
-            .setLineSpacing(6f, 1.05f)
+            .setLineSpacing(4f, 1.04f)
             .setIncludePad(true)
             .build()
 
@@ -332,10 +491,10 @@ class VideoRenderEngine @Inject constructor(
             if (w > maxLineWidth) maxLineWidth = w
         }
         val contentWidth = maxLineWidth.coerceAtLeast(160f).coerceAtMost(maxTextWidth.toFloat())
-        val contentHeight = layout.height.toFloat().coerceAtLeast(60f)
+        val contentHeight = layout.height.toFloat().coerceAtLeast(56f)
 
         val stripHeight = ((contentHeight + boxPadY * 2 + 28f).roundToInt())
-            .coerceIn(110, maxStripHeight)
+            .coerceIn(100, maxStripHeight)
             .let { if (it % 2 == 0) it else it + 1 }
 
         val bitmap = Bitmap.createBitmap(videoWidth, stripHeight, Bitmap.Config.ARGB_8888)
@@ -354,13 +513,13 @@ class VideoRenderEngine @Inject constructor(
                 style = Paint.Style.FILL
             }
             val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0x66FFE135.toInt()
+                color = 0x77FFE135.toInt()
                 style = Paint.Style.STROKE
                 strokeWidth = 3f
             }
 
-            canvas.drawRoundRect(boxRect, 22f, 22f, bgPaint)
-            canvas.drawRoundRect(boxRect, 22f, 22f, borderPaint)
+            canvas.drawRoundRect(boxRect, 24f, 24f, bgPaint)
+            canvas.drawRoundRect(boxRect, 24f, 24f, borderPaint)
 
             val textX = (videoWidth - maxTextWidth) / 2f
             val textY = boxTop + boxPadY
@@ -378,155 +537,6 @@ class VideoRenderEngine @Inject constructor(
         } finally {
             bitmap.recycle()
         }
-    }
-
-    private fun computeSceneFrameCounts(
-        slabs: List<VideoSlab>,
-        vttContent: String?,
-        rawAudioDuration: Double,
-        totalVideoDuration: Double
-    ): List<Int> {
-        val count = slabs.size
-        val totalFrames = (totalVideoDuration * FRAME_RATE)
-            .roundToInt()
-            .coerceAtLeast(count * MIN_SCENE_FRAMES)
-
-        if (count == 1) return listOf(totalFrames)
-
-        val cues = parseVttCues(vttContent)
-        val sceneWeights = slabs.map { computeSpeakingWeight(it.voiceover_text) }
-        val totalWeight = sceneWeights.sum().coerceAtLeast(1.0)
-
-        val boundaryTimes = DoubleArray(count + 1)
-        boundaryTimes[0] = 0.0
-        boundaryTimes[count] = totalVideoDuration
-
-        if (cues.isNotEmpty()) {
-            val totalCueChars = cues.sumOf { it.cleanLength }.coerceAtLeast(1)
-            val vttEnd = cues.last().endSeconds.coerceAtLeast(0.5)
-            val timeScale = (rawAudioDuration / vttEnd).coerceIn(0.85, 1.18)
-
-            val cleanSceneLengths = slabs.map { cleanCharCount(it.voiceover_text).coerceAtLeast(1) }
-            val totalSceneChars = cleanSceneLengths.sum().coerceAtLeast(1)
-
-            var cumulativeSceneChars = 0
-            for (i in 0 until count - 1) {
-                cumulativeSceneChars += cleanSceneLengths[i]
-                val targetCueChar = (cumulativeSceneChars.toDouble() / totalSceneChars) * totalCueChars
-                val mappedVttTime = lookupTimeInVttCues(cues, targetCueChar)
-                boundaryTimes[i + 1] = (mappedVttTime * timeScale).coerceIn(0.0, rawAudioDuration)
-            }
-        } else {
-            var cumulativeWeight = 0.0
-            for (i in 0 until count - 1) {
-                cumulativeWeight += sceneWeights[i]
-                boundaryTimes[i + 1] = (cumulativeWeight / totalWeight) * rawAudioDuration
-            }
-        }
-
-        val boundaryFrames = IntArray(count + 1)
-        boundaryFrames[0] = 0
-        boundaryFrames[count] = totalFrames
-
-        val minFramesPerScene = MIN_SCENE_FRAMES.coerceAtMost((totalFrames / count).coerceAtLeast(1))
-        for (i in 1 until count) {
-            val minAllowed = i * minFramesPerScene
-            val maxAllowed = totalFrames - (count - i) * minFramesPerScene
-            val rawFrame = (boundaryTimes[i] * FRAME_RATE).roundToInt()
-            boundaryFrames[i] = rawFrame.coerceIn(minAllowed, maxAllowed)
-            if (boundaryFrames[i] < boundaryFrames[i - 1] + minFramesPerScene) {
-                boundaryFrames[i] = (boundaryFrames[i - 1] + minFramesPerScene).coerceAtMost(maxAllowed)
-            }
-        }
-
-        return List(count) { i ->
-            (boundaryFrames[i + 1] - boundaryFrames[i]).coerceAtLeast(1)
-        }
-    }
-
-    private fun parseVttCues(vttContent: String?): List<VttCue> {
-        if (vttContent.isNullOrBlank()) return emptyList()
-
-        val timeRegex = Regex(
-            """(\d{1,2}:)?\d{2}:\d{2}[.,]\d{3}\s*-->\s*(\d{1,2}:)?\d{2}:\d{2}[.,]\d{3}"""
-        )
-        val lines = vttContent.lines()
-        val cues = mutableListOf<VttCue>()
-
-        var i = 0
-        while (i < lines.size) {
-            val line = lines[i].trim()
-            if (timeRegex.containsMatchIn(line)) {
-                val parts = line.split("-->")
-                if (parts.size >= 2) {
-                    val start = parseVttTimestamp(parts[0].trim())
-                    val endToken = parts[1].trim().substringBefore(' ')
-                    val end = parseVttTimestamp(endToken)
-
-                    val textBuilder = StringBuilder()
-                    var j = i + 1
-                    while (j < lines.size && lines[j].isNotBlank()) {
-                        if (textBuilder.isNotEmpty()) textBuilder.append(' ')
-                        textBuilder.append(lines[j].trim())
-                        j++
-                    }
-
-                    val cueChars = cleanCharCount(
-                        textBuilder.toString().replace(Regex("<[^>]+>"), "")
-                    ).coerceAtLeast(1)
-
-                    if (start != null && end != null && end >= start) {
-                        cues += VttCue(start, end, cueChars)
-                    }
-                    i = j
-                    continue
-                }
-            }
-            i++
-        }
-        return cues
-    }
-
-    private fun parseVttTimestamp(token: String): Double? {
-        val normalized = token.replace(',', '.').trim()
-        val parts = normalized.split(':')
-        return when (parts.size) {
-            3 -> {
-                val h = parts[0].toDoubleOrNull() ?: return null
-                val m = parts[1].toDoubleOrNull() ?: return null
-                val s = parts[2].toDoubleOrNull() ?: return null
-                h * 3600.0 + m * 60.0 + s
-            }
-            2 -> {
-                val m = parts[0].toDoubleOrNull() ?: return null
-                val s = parts[1].toDoubleOrNull() ?: return null
-                m * 60.0 + s
-            }
-            else -> null
-        }
-    }
-
-    private fun lookupTimeInVttCues(cues: List<VttCue>, targetChar: Double): Double {
-        var acc = 0.0
-        for (cue in cues) {
-            val len = cue.cleanLength.toDouble().coerceAtLeast(1.0)
-            if (targetChar <= acc + len) {
-                val fraction = ((targetChar - acc) / len).coerceIn(0.0, 1.0)
-                return cue.startSeconds + (cue.endSeconds - cue.startSeconds) * fraction
-            }
-            acc += len
-        }
-        return cues.last().endSeconds
-    }
-
-    private fun cleanCharCount(text: String): Int =
-        text.count { !it.isWhitespace() && it !in "।.,!?;:\"'()-–—" }
-
-    private fun computeSpeakingWeight(text: String): Double {
-        val chars = cleanCharCount(text).coerceAtLeast(1)
-        val majorPauses = text.count { it in "।!?." }
-        val minorPauses = text.count { it in ",;:" }
-        return chars + (majorPauses * 8.0) + (minorPauses * 4.0)
     }
 
     private fun buildSceneImagePrompt(
@@ -1018,9 +1028,14 @@ class VideoRenderEngine @Inject constructor(
         totalDurationSeconds: Double,
         outputFile: File
     ): File? {
-        if (bgmBedFile == null && sfxTrackFile == null) return null
-
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
+        val voiceFilter =
+            "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS," +
+                "highpass=f=85," +
+                "equalizer=f=180:t=o:w=1.2:g=3.5," +
+                "equalizer=f=3200:t=o:w=1.5:g=3.0," +
+                "acompressor=threshold=-16dB:ratio=3:attack=5:release=60," +
+                "volume=1.15[v]"
 
         val args = when {
             bgmBedFile != null && sfxTrackFile != null -> arrayOf(
@@ -1029,7 +1044,7 @@ class VideoRenderEngine @Inject constructor(
                 "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
                 "-i", sfxTrackFile.absolutePath,
                 "-filter_complex",
-                "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
+                "$voiceFilter;" +
                     "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.25[b];" +
                     "[2:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
                     "[v][b][s]amix=inputs=3:duration=first:normalize=0[aout]",
@@ -1046,9 +1061,25 @@ class VideoRenderEngine @Inject constructor(
                 "-i", fullVoiceFile.absolutePath,
                 "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
                 "-filter_complex",
-                "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
+                "$voiceFilter;" +
                     "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.25[b];" +
                     "[v][b]amix=inputs=2:duration=first:normalize=0[aout]",
+                "-map", "[aout]",
+                "-t", formattedDuration,
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "44100",
+                "-ac", "2",
+                outputFile.absolutePath
+            )
+            sfxTrackFile != null -> arrayOf(
+                "-y",
+                "-i", fullVoiceFile.absolutePath,
+                "-i", sfxTrackFile.absolutePath,
+                "-filter_complex",
+                "$voiceFilter;" +
+                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
+                    "[v][s]amix=inputs=2:duration=first:normalize=0[aout]",
                 "-map", "[aout]",
                 "-t", formattedDuration,
                 "-c:a", "aac",
@@ -1060,12 +1091,9 @@ class VideoRenderEngine @Inject constructor(
             else -> arrayOf(
                 "-y",
                 "-i", fullVoiceFile.absolutePath,
-                "-i", sfxTrackFile!!.absolutePath,
                 "-filter_complex",
-                "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
-                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
-                    "[v][s]amix=inputs=2:duration=first:normalize=0[aout]",
-                "-map", "[aout]",
+                "$voiceFilter",
+                "-map", "[v]",
                 "-t", formattedDuration,
                 "-c:a", "aac",
                 "-b:a", "192k",
@@ -1139,33 +1167,11 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun getAudioDurationSeconds(audioFile: File): Double {
-        val retriever = MediaMetadataRetriever()
-        return try {
-            retriever.setDataSource(audioFile.absolutePath)
-            val durationMs = retriever
-                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLongOrNull()
-                ?: 0L
-
-            if (durationMs > 200L) {
-                (durationMs / 1000.0).coerceAtLeast(MIN_TOTAL_DURATION_SECONDS)
-            } else {
-                DEFAULT_TOTAL_DURATION_SECONDS
-            }
-        } catch (_: Exception) {
-            DEFAULT_TOTAL_DURATION_SECONDS
-        } finally {
-            runCatching { retriever.release() }
-        }
-    }
-
     private fun createVideoOnlySegmentArguments(
         sceneIndex: Int,
         totalScenes: Int,
         imageFile: File,
-        captionFile: File?,
-        captionHeight: Int,
+        popCaptions: List<PopCaptionChunk>,
         outputFile: File,
         width: Int,
         height: Int,
@@ -1203,26 +1209,44 @@ class VideoRenderEngine @Inject constructor(
             if (sceneIndex == totalScenes - 1) append("fade=t=out:st=$fadeOutStart:d=0.28,")
         }
 
-        if (captionFile != null && captionHeight > 0) {
-            val overlayY = if (height > width) {
-                (height - captionHeight - 370).coerceAtLeast(0)
-            } else {
-                (height - captionHeight - 55).coerceAtLeast(0)
+        val baseGrade = "eq=contrast=1.06:saturation=1.10,vignette=PI/6"
+
+        if (popCaptions.isNotEmpty()) {
+            val args = mutableListOf("-y", "-i", imageFile.absolutePath)
+            popCaptions.forEach { chunk ->
+                args += "-i"
+                args += chunk.file.absolutePath
             }
 
-            val filterComplex =
+            val filterBuilder = StringBuilder()
+            filterBuilder.append(
                 "[0:v]scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
                     "crop=$upWidth:$upHeight," +
                     "setsar=1," +
-                    "$motionFilter[bg];" +
-                    "[bg][1:v]overlay=0:$overlayY:eof_action=repeat:format=auto," +
-                    "${edgeFades}format=yuv420p[vout]"
+                    "$motionFilter," +
+                    "$baseGrade[bg0];"
+            )
 
-            return arrayOf(
-                "-y",
-                "-i", imageFile.absolutePath,
-                "-i", captionFile.absolutePath,
-                "-filter_complex", filterComplex,
+            popCaptions.forEachIndexed { idx, chunk ->
+                val inputIndex = idx + 1
+                val prevLabel = "bg$idx"
+                val nextLabel = if (idx == popCaptions.lastIndex) "vcap" else "bg${idx + 1}"
+                val overlayY = if (height > width) {
+                    (height - chunk.stripHeight - 380).coerceAtLeast(0)
+                } else {
+                    (height - chunk.stripHeight - 55).coerceAtLeast(0)
+                }
+                val st = String.format(Locale.US, "%.2f", chunk.startSeconds)
+                val en = String.format(Locale.US, "%.2f", chunk.endSeconds)
+                filterBuilder.append(
+                    "[$prevLabel][$inputIndex:v]overlay=0:$overlayY:eof_action=repeat:enable='between(t,$st,$en)'[$nextLabel];"
+                )
+            }
+
+            filterBuilder.append("[vcap]${edgeFades}format=yuv420p[vout]")
+
+            args += listOf(
+                "-filter_complex", filterBuilder.toString(),
                 "-map", "[vout]",
                 "-frames:v", frames.toString(),
                 "-an",
@@ -1234,6 +1258,7 @@ class VideoRenderEngine @Inject constructor(
                 "-r", FRAME_RATE.toString(),
                 outputFile.absolutePath
             )
+            return args.toTypedArray()
         }
 
         val filter =
@@ -1241,6 +1266,7 @@ class VideoRenderEngine @Inject constructor(
                 "crop=$upWidth:$upHeight," +
                 "setsar=1," +
                 "$motionFilter," +
+                "$baseGrade," +
                 edgeFades +
                 "format=yuv420p"
 
@@ -1373,7 +1399,5 @@ class VideoRenderEngine @Inject constructor(
         const val FRAME_RATE = 25
         const val MIN_SCENE_FRAMES = 15
         const val AUDIO_TAIL_PADDING_SECONDS = 0.35
-        const val MIN_TOTAL_DURATION_SECONDS = 6.0
-        const val DEFAULT_TOTAL_DURATION_SECONDS = 30.0
     }
 }
