@@ -13,7 +13,9 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
+import com.rsmoviespot.domain.models.VoiceGender
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -69,6 +71,12 @@ class VideoRenderService : Service() {
                             serviceJson.decodeFromString(VideoScriptResponse.serializer(), jsonStr)
                         }.getOrNull()
                     }
+                val language = intent.getStringExtra(EXTRA_LANGUAGE)
+                    ?.let { name -> runCatching { VideoLanguage.valueOf(name) }.getOrNull() }
+                    ?: VideoLanguage.AUTO
+                val voiceGender = intent.getStringExtra(EXTRA_VOICE_GENDER)
+                    ?.let { name -> runCatching { VoiceGender.valueOf(name) }.getOrNull() }
+                    ?: VoiceGender.MALE
 
                 startAsForeground(
                     buildNotification("Preparing video render…", 0)
@@ -86,7 +94,14 @@ class VideoRenderService : Service() {
                     return START_NOT_STICKY
                 }
 
-                startRenderJob(topic, isShorts, bgmUri, preGeneratedScript)
+                startRenderJob(
+                    topic = topic,
+                    isShorts = isShorts,
+                    customBgmUri = bgmUri,
+                    preGeneratedScript = preGeneratedScript,
+                    language = language,
+                    voiceGender = voiceGender
+                )
             }
 
             ACTION_CANCEL_RENDER -> {
@@ -116,7 +131,9 @@ class VideoRenderService : Service() {
         topic: String,
         isShorts: Boolean,
         customBgmUri: Uri?,
-        preGeneratedScript: VideoScriptResponse?
+        preGeneratedScript: VideoScriptResponse?,
+        language: VideoLanguage,
+        voiceGender: VoiceGender
     ) {
         if (renderJob?.isActive == true) return
 
@@ -137,7 +154,9 @@ class VideoRenderService : Service() {
                     topic = topic,
                     isShorts = isShorts,
                     customBgmUri = customBgmUri,
-                    preGeneratedScript = preGeneratedScript
+                    preGeneratedScript = preGeneratedScript,
+                    language = language,
+                    voiceGender = voiceGender
                 ) { rawPercent, message ->
                     val percent = rawPercent.coerceIn(0, 100)
                     _renderState.update {
@@ -262,6 +281,8 @@ class VideoRenderService : Service() {
         const val EXTRA_IS_SHORTS = "extra_is_shorts"
         const val EXTRA_BGM_URI = "extra_bgm_uri"
         const val EXTRA_SCRIPT_JSON = "extra_script_json"
+        const val EXTRA_LANGUAGE = "extra_language"
+        const val EXTRA_VOICE_GENDER = "extra_voice_gender"
 
         private const val CHANNEL_ID = "video_render_channel"
         private const val NOTIFICATION_ID = 4101
@@ -276,7 +297,9 @@ class VideoRenderService : Service() {
             topic: String,
             isShorts: Boolean,
             bgmUri: Uri? = null,
-            preGeneratedScript: VideoScriptResponse? = null
+            preGeneratedScript: VideoScriptResponse? = null,
+            language: VideoLanguage = VideoLanguage.AUTO,
+            voiceGender: VoiceGender = VoiceGender.MALE
         ) {
             val scriptJson = preGeneratedScript?.let {
                 serviceJson.encodeToString(VideoScriptResponse.serializer(), it)
@@ -287,6 +310,8 @@ class VideoRenderService : Service() {
                 .putExtra(EXTRA_IS_SHORTS, isShorts)
                 .putExtra(EXTRA_BGM_URI, bgmUri?.toString())
                 .putExtra(EXTRA_SCRIPT_JSON, scriptJson)
+                .putExtra(EXTRA_LANGUAGE, language.name)
+                .putExtra(EXTRA_VOICE_GENDER, voiceGender.name)
             ContextCompat.startForegroundService(context, intent)
         }
 
