@@ -430,8 +430,16 @@ fun MainScreen(
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
+                        val visualTag = if (
+                            slab.visual_source == "real_photo" &&
+                            slab.real_photo_query.isNotBlank()
+                        ) {
+                            "Real Photo: ${slab.real_photo_query}"
+                        } else {
+                            "AI Image"
+                        }
                         Text(
-                            text = "Scene ${index + 1} · ${slab.voice_emotion} · ${slab.sfx_cue}",
+                            text = "Scene ${index + 1} · $visualTag · ${slab.voice_emotion} · ${slab.sfx_cue}",
                             color = TextMuted,
                             fontSize = 12.sp
                         )
