@@ -6,7 +6,9 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.rsmoviespot.data.repository.VideoRepository
+import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
+import com.rsmoviespot.domain.models.VoiceGender
 import com.rsmoviespot.service.VideoRenderService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -21,6 +23,8 @@ import javax.inject.Inject
 data class VideoUiState(
     val topic: String = "",
     val isShorts: Boolean = true,
+    val selectedLanguage: VideoLanguage = VideoLanguage.AUTO,
+    val selectedGender: VoiceGender = VoiceGender.MALE,
     val selectedBgmUri: Uri? = null,
     val selectedBgmName: String = "Built-in Cinematic BGM",
     val isPreviewingScript: Boolean = false,
@@ -65,6 +69,14 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(isShorts = isShorts, draftScript = null) }
     }
 
+    fun onLanguageSelected(language: VideoLanguage) {
+        _uiState.update { it.copy(selectedLanguage = language, draftScript = null) }
+    }
+
+    fun onGenderSelected(gender: VoiceGender) {
+        _uiState.update { it.copy(selectedGender = gender, draftScript = null) }
+    }
+
     fun onBgmSelected(uri: Uri?) {
         if (uri == null) return
         val fileName = resolveDisplayName(uri) ?: "Custom Audio"
@@ -106,7 +118,12 @@ class VideoViewModel @Inject constructor(
                 )
             }
             try {
-                val script = videoRepository.generateScript(topic, currentState.isShorts)
+                val script = videoRepository.generateScript(
+                    topic = topic,
+                    isShorts = currentState.isShorts,
+                    language = currentState.selectedLanguage,
+                    voiceGender = currentState.selectedGender
+                )
                 _uiState.update {
                     it.copy(
                         isPreviewingScript = false,
@@ -153,7 +170,9 @@ class VideoViewModel @Inject constructor(
             topic = topic,
             isShorts = currentState.isShorts,
             bgmUri = currentState.selectedBgmUri,
-            preGeneratedScript = currentState.draftScript
+            preGeneratedScript = currentState.draftScript,
+            language = currentState.selectedLanguage,
+            voiceGender = currentState.selectedGender
         )
     }
 
