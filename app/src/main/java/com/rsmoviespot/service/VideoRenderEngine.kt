@@ -3,9 +3,12 @@ package com.rsmoviespot.service
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaScannerConnection
@@ -168,36 +171,74 @@ class VideoRenderEngine @Inject constructor(
 
             val videoSegmentFiles = mutableListOf<File>()
             val slabCount = script.slabs.size
+            val usedRealPhotoUrls = mutableSetOf<String>()
 
             script.slabs.forEachIndexed { index, slab ->
                 val baseProgress = 14 + (index * 68 / slabCount)
-                progress(
-                    baseProgress.coerceIn(14, 82),
+                val wantsRealPhoto = slab.visual_source.equals("real_photo", ignoreCase = true) &&
+                    slab.real_photo_query.isNotBlank()
+
+                val statusLabel = if (wantsRealPhoto) {
+                    "Fetching real photo (${slab.real_photo_query})…"
+                } else {
                     "Creating scene ${index + 1} of $slabCount…"
-                )
+                }
+                progress(baseProgress.coerceIn(14, 82), statusLabel)
 
                 val imageFile = File(renderDirectory, "slab_${index + 1}.png")
                 val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
 
-                val imagePrompt = buildSceneImagePrompt(
-                    characterBible = script.character_bible,
-                    visualStyle = script.visual_style,
-                    scenePrompt = slab.image_prompt,
-                    hasCharacter = slab.has_character
-                )
+                var preparedRealPhoto = false
+                if (wantsRealPhoto) {
+                    val rawRealFile = File(renderDirectory, "real_raw_${index + 1}.img")
+                    val downloaded = runCatching {
+                        videoRepository.downloadRealPhoto(
+                            query = slab.real_photo_query,
+                            usedUrls = usedRealPhotoUrls,
+                            destinationFile = rawRealFile
+                        )
+                    }.getOrDefault(false)
 
-                val sceneSeed = baseSeed + (index * 37)
-
-                videoRepository.generateImageForSlab(
-                    prompt = imagePrompt,
-                    isShorts = isShorts,
-                    seed = sceneSeed
-                ).use { body ->
-                    imageFile.outputStream().use { output ->
-                        body.byteStream().use { input -> input.copyTo(output) }
+                    if (downloaded) {
+                        preparedRealPhoto = runCatching {
+                            composeStudioFrameFromRealPhoto(
+                                rawFile = rawRealFile,
+                                outputFile = imageFile,
+                                targetWidth = width,
+                                targetHeight = height
+                            )
+                        }.getOrDefault(false)
                     }
+                    rawRealFile.delete()
                 }
-                validateImageFile(imageFile, index + 1)
+
+                if (!preparedRealPhoto) {
+                    if (wantsRealPhoto) {
+                        progress(
+                            baseProgress.coerceIn(14, 82),
+                            "Generating AI scene ${index + 1} of $slabCount…"
+                        )
+                    }
+                    val imagePrompt = buildSceneImagePrompt(
+                        characterBible = script.character_bible,
+                        visualStyle = script.visual_style,
+                        scenePrompt = slab.image_prompt,
+                        hasCharacter = slab.has_character
+                    )
+
+                    val sceneSeed = baseSeed + (index * 37)
+
+                    videoRepository.generateImageForSlab(
+                        prompt = imagePrompt,
+                        isShorts = isShorts,
+                        seed = sceneSeed
+                    ).use { body ->
+                        imageFile.outputStream().use { output ->
+                            body.byteStream().use { input -> input.copyTo(output) }
+                        }
+                    }
+                    validateImageFile(imageFile, index + 1)
+                }
 
                 val segmentExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
                 val popCaptions = runCatching {
@@ -282,6 +323,116 @@ class VideoRenderEngine @Inject constructor(
             )
         } finally {
             renderDirectory.deleteRecursively()
+        }
+    }
+
+    private fun composeStudioFrameFromRealPhoto(
+        rawFile: File,
+        outputFile: File,
+        targetWidth: Int,
+        targetHeight: Int
+    ): Boolean {
+        val srcBitmap = BitmapFactory.decodeFile(rawFile.absolutePath) ?: return false
+        if (srcBitmap.width <= 0 || srcBitmap.height <= 0) {
+            srcBitmap.recycle()
+            return false
+        }
+
+        var tinyBitmap: Bitmap? = null
+        var outBitmap: Bitmap? = null
+        try {
+            val srcW = srcBitmap.width
+            val srcH = srcBitmap.height
+            val srcAspect = srcW.toFloat() / srcH.toFloat()
+            val dstAspect = targetWidth.toFloat() / targetHeight.toFloat()
+
+            val bgCropRect = if (srcAspect > dstAspect) {
+                val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
+                val left = (srcW - cropW) / 2
+                Rect(left, 0, left + cropW, srcH)
+            } else {
+                val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
+                val top = (srcH - cropH) / 2
+                Rect(0, top, srcW, top + cropH)
+            }
+
+            val blurW = (targetWidth / 18).coerceAtLeast(36)
+            val blurH = (targetHeight / 18).coerceAtLeast(36)
+            tinyBitmap = Bitmap.createBitmap(blurW, blurH, Bitmap.Config.ARGB_8888)
+            val tinyCanvas = Canvas(tinyBitmap)
+            tinyCanvas.drawBitmap(
+                srcBitmap,
+                bgCropRect,
+                Rect(0, 0, blurW, blurH),
+                Paint(Paint.FILTER_BITMAP_FLAG)
+            )
+
+            outBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(outBitmap)
+
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            canvas.drawBitmap(
+                tinyBitmap,
+                null,
+                Rect(0, 0, targetWidth, targetHeight),
+                bgPaint
+            )
+            canvas.drawColor(0x9E080A0C.toInt())
+
+            val isPortrait = targetHeight > targetWidth
+            val padX = if (isPortrait) 48f else 140f
+            val topMargin = if (isPortrait) 150f else 70f
+            val bottomMargin = if (isPortrait) 500f else 140f
+            val availW = (targetWidth - padX * 2f).coerceAtLeast(240f)
+            val availH = (targetHeight - topMargin - bottomMargin).coerceAtLeast(240f)
+
+            val scale = minOf(availW / srcW.toFloat(), availH / srcH.toFloat())
+            val drawW = srcW * scale
+            val drawH = srcH * scale
+            val left = (targetWidth - drawW) / 2f
+            val top = topMargin + (availH - drawH) * 0.40f
+            val cardRect = RectF(left, top, left + drawW, top + drawH)
+
+            val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0x88000000.toInt()
+                style = Paint.Style.FILL
+            }
+            val shadowRect = RectF(
+                cardRect.left + 8f,
+                cardRect.top + 14f,
+                cardRect.right + 8f,
+                cardRect.bottom + 14f
+            )
+            canvas.drawRoundRect(shadowRect, 30f, 30f, shadowPaint)
+
+            val clipPath = Path().apply {
+                addRoundRect(cardRect, 28f, 28f, Path.Direction.CW)
+            }
+            canvas.save()
+            canvas.clipPath(clipPath)
+            canvas.drawBitmap(
+                srcBitmap,
+                null,
+                cardRect,
+                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            )
+            canvas.restore()
+
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0x55FFFFFF
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            }
+            canvas.drawRoundRect(cardRect, 28f, 28f, borderPaint)
+
+            outputFile.outputStream().use { out ->
+                outBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            return outputFile.exists() && outputFile.length() > 1024L
+        } finally {
+            tinyBitmap?.recycle()
+            outBitmap?.recycle()
+            srcBitmap.recycle()
         }
     }
 
