@@ -4,7 +4,8 @@ import kotlinx.serialization.Serializable
 
 enum class VoiceGender(val label: String) {
     MALE("Male"),
-    FEMALE("Female")
+    FEMALE("Female"),
+    MY_VOICE("My Voice")
 }
 
 enum class VideoLanguage(
@@ -31,8 +32,12 @@ enum class VideoLanguage(
     JAPANESE("Japanese", "natural Japanese", "ja-JP-KeitaNeural", "ja-JP-NanamiNeural"),
     ARABIC("Arabic", "natural Arabic", "ar-SA-HamedNeural", "ar-SA-ZariyahNeural");
 
-    fun resolveVoice(gender: VoiceGender): String =
-        if (gender == VoiceGender.FEMALE) femaleVoice else maleVoice
+    fun resolveVoice(gender: VoiceGender, cloneBaseIsFemale: Boolean = false): String =
+        when (gender) {
+            VoiceGender.FEMALE -> femaleVoice
+            VoiceGender.MALE -> maleVoice
+            VoiceGender.MY_VOICE -> if (cloneBaseIsFemale) femaleVoice else maleVoice
+        }
 }
 
 @Serializable
