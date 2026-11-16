@@ -22,6 +22,8 @@ import androidx.core.content.FileProvider
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
+import com.rsmoviespot.data.api.PersonalVoiceApi
+import com.rsmoviespot.data.local.VoiceCloneStore
 import com.rsmoviespot.data.repository.VideoRepository
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
@@ -80,6 +82,8 @@ private enum class BgmStyle {
 
 class VideoRenderEngine @Inject constructor(
     private val videoRepository: VideoRepository,
+    private val voiceCloneStore: VoiceCloneStore,
+    private val personalVoiceApi: PersonalVoiceApi,
     @ApplicationContext private val context: Context
 ) {
     suspend fun render(
@@ -105,6 +109,13 @@ class VideoRenderEngine @Inject constructor(
         }
 
         try {
+            val cloneConfig = voiceCloneStore.getConfig()
+            val scriptGender = if (voiceGender == VoiceGender.MY_VOICE) {
+                if (cloneConfig.baseIsFemale) VoiceGender.FEMALE else VoiceGender.MALE
+            } else {
+                voiceGender
+            }
+
             val script = if (preGeneratedScript != null && preGeneratedScript.slabs.isNotEmpty()) {
                 progress(4, "Using your approved script…")
                 preGeneratedScript
@@ -114,25 +125,29 @@ class VideoRenderEngine @Inject constructor(
                     topic = topic,
                     isShorts = isShorts,
                     language = language,
-                    voiceGender = voiceGender
+                    voiceGender = scriptGender
                 )
             }
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
 
             val activeVoiceName = if (language != VideoLanguage.AUTO) {
-                language.resolveVoice(voiceGender)
+                language.resolveVoice(voiceGender, cloneConfig.baseIsFemale)
             } else {
-                script.voice_name.ifBlank { VideoLanguage.HINDI.resolveVoice(voiceGender) }
+                script.voice_name.ifBlank {
+                    VideoLanguage.HINDI.resolveVoice(voiceGender, cloneConfig.baseIsFemale)
+                }
             }
 
             val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
                 .coerceAtLeast(1000)
 
-            progress(7, "Recording dynamic voiceover…")
+            progress(7, "Recording base voiceover…")
             val trimmedVoiceWavs = synthesizeAndTrimVoiceClips(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
-                voiceName = activeVoiceName
+                voiceName = activeVoiceName,
+                voiceGender = voiceGender,
+                progress = progress
             )
 
             val voiceListFile = File(renderDirectory, "voice_parts.txt")
@@ -443,7 +458,9 @@ class VideoRenderEngine @Inject constructor(
     private suspend fun synthesizeAndTrimVoiceClips(
         renderDirectory: File,
         slabs: List<VideoSlab>,
-        voiceName: String
+        voiceName: String,
+        voiceGender: VoiceGender,
+        progress: (Int, String) -> Unit
     ): List<File> = coroutineScope {
         val semaphore = Semaphore(4)
         val rawFiles = slabs.mapIndexed { index, slab ->
@@ -462,10 +479,44 @@ class VideoRenderEngine @Inject constructor(
                     rawMp3
                 }
             }
-        }.awaitAll()
+        }.awaitAll().toMutableList()
+
+        if (voiceGender == VoiceGender.MY_VOICE) {
+            val config = voiceCloneStore.getConfig()
+            val sampleFile = voiceCloneStore.getSampleFile()
+            if (config.isReady && sampleFile != null) {
+                progress(10, "Cloning your voice on Modal GPU…")
+                val clonedMap = runCatching {
+                    personalVoiceApi.cloneClips(
+                        config = config,
+                        sampleFile = sampleFile,
+                        rawAudioFiles = rawFiles,
+                        slabs = slabs
+                    ) { done, total ->
+                        val clonePct = 10 + ((done * 3) / total.coerceAtLeast(1))
+                        progress(clonePct.coerceIn(10, 13), "Cloning your voice ($done/$total)…")
+                    }
+                }.onFailure { err ->
+                    val shortReason = err.message?.take(45).orEmpty().ifBlank { "server unavailable" }
+                    progress(12, "Voice clone fallback ($shortReason) — using Edge voice…")
+                }.getOrNull()
+
+                if (clonedMap != null) {
+                    clonedMap.forEach { (idx, wavBytes) ->
+                        if (idx in rawFiles.indices) {
+                            val clonedWav = File(renderDirectory, "cloned_voice_${idx + 1}.wav")
+                            clonedWav.writeBytes(wavBytes)
+                            rawFiles[idx] = clonedWav
+                        }
+                    }
+                }
+            } else {
+                progress(12, "My Voice setup incomplete — using Edge fallback voice…")
+            }
+        }
 
         val wavFiles = mutableListOf<File>()
-        rawFiles.forEachIndexed { index, rawMp3 ->
+        rawFiles.forEachIndexed { index, rawAudio ->
             val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
             val isLast = index == rawFiles.lastIndex
             val microBreath = if (isLast) 0.02 else 0.06
@@ -474,7 +525,7 @@ class VideoRenderEngine @Inject constructor(
                 runFfmpeg(
                     arrayOf(
                         "-y",
-                        "-i", rawMp3.absolutePath,
+                        "-i", rawAudio.absolutePath,
                         "-af",
                         "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB," +
                             "areverse," +
@@ -493,7 +544,7 @@ class VideoRenderEngine @Inject constructor(
                 runFfmpeg(
                     arrayOf(
                         "-y",
-                        "-i", rawMp3.absolutePath,
+                        "-i", rawAudio.absolutePath,
                         "-ar", "44100",
                         "-ac", "1",
                         "-c:a", "pcm_s16le",
@@ -1234,7 +1285,6 @@ class VideoRenderEngine @Inject constructor(
     ): File? {
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
 
-        // 1) Apply Studio Mic EQ on single-input voice (no amix / no apad!)
         val eqVoiceFile = File(renderDirectory, "voice_eq.wav")
         val eqOk = runCatching {
             runFfmpeg(
@@ -1260,7 +1310,6 @@ class VideoRenderEngine @Inject constructor(
             fullVoiceFile
         }
 
-        // 2) Ensure BGM is mono 44.1kHz PCM WAV (single-input conversion only if custom mp3)
         val bgmWavFile = if (bgmBedFile != null) {
             if (bgmBedFile.extension.equals("wav", ignoreCase = true)) {
                 bgmBedFile
@@ -1285,7 +1334,6 @@ class VideoRenderEngine @Inject constructor(
             null
         }
 
-        // 3) Mix Voice + looped BGM + SFX in Kotlin PCM (zero FFmpeg amix deadlock!)
         val mixedWavFile = File(renderDirectory, "mixed_master.wav")
         val kotlinMixOk = runCatching {
             val voiceSamples = readMono16BitWavSamples(voiceSource)
@@ -1308,7 +1356,6 @@ class VideoRenderEngine @Inject constructor(
 
         if (!kotlinMixOk) return null
 
-        // 4) Single-input AAC encode
         val aacOk = runCatching {
             runFfmpeg(
                 arrayOf(
