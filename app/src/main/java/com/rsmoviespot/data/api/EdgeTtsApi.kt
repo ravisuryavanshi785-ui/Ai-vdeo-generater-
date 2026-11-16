@@ -37,15 +37,53 @@ class EdgeTtsApi @Inject constructor(
         return result.audioBytes.toResponseBody("audio/mpeg".toMediaType())
     }
 
+    suspend fun synthesizeSpeechClip(
+        text: String,
+        voice: String,
+        rate: String = DEFAULT_VOICE_RATE,
+        pitch: String = DEFAULT_VOICE_PITCH
+    ): ByteArray = withContext(Dispatchers.IO) {
+        val cleanText = text.trim()
+        require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
+
+        val edgeResult = runCatching {
+            synthesizeWithEdgeNeural(
+                text = cleanText,
+                voiceName = voice,
+                rate = rate,
+                pitch = pitch,
+                withVtt = false
+            )
+        }.getOrNull()
+
+        if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
+            return@withContext edgeResult.audioBytes
+        }
+
+        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, voice)
+        if (fallbackBytes.isEmpty()) {
+            throw IOException("TTS produced empty audio output.")
+        }
+        fallbackBytes
+    }
+
     suspend fun synthesizeWithSubtitles(
         text: String,
-        voice: String
+        voice: String,
+        rate: String = DEFAULT_VOICE_RATE,
+        pitch: String = DEFAULT_VOICE_PITCH
     ): EdgeTtsSynthesisResult = withContext(Dispatchers.IO) {
         val cleanText = text.trim()
         require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
 
         val edgeResult = runCatching {
-            synthesizeWithEdgeNeural(cleanText, voice)
+            synthesizeWithEdgeNeural(
+                text = cleanText,
+                voiceName = voice,
+                rate = rate,
+                pitch = pitch,
+                withVtt = true
+            )
         }.getOrNull()
 
         if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
@@ -65,7 +103,10 @@ class EdgeTtsApi @Inject constructor(
 
     private fun synthesizeWithEdgeNeural(
         text: String,
-        voiceName: String
+        voiceName: String,
+        rate: String,
+        pitch: String,
+        withVtt: Boolean
     ): EdgeTtsSynthesisResult {
         val voice = findEdgeVoice(voiceName)
             ?: throw IOException("Edge Neural voice not found: $voiceName")
@@ -77,14 +118,19 @@ class EdgeTtsApi @Inject constructor(
 
         try {
             val fileBaseName = "voice"
-            val resultName = TTS(voice, text)
+            val builder = TTS(voice, text)
                 .findHeadHook()
                 .storage(tempDir.absolutePath)
                 .fileName(fileBaseName)
                 .overwrite(true)
-                .voiceRate(TRAILER_VOICE_RATE)
-                .voicePitch(TRAILER_VOICE_PITCH)
-                .enableVttFile()
+                .voiceRate(rate)
+                .voicePitch(pitch)
+
+            if (withVtt) {
+                builder.enableVttFile()
+            }
+
+            val resultName = builder
                 .formatMp3()
                 .trans()
 
@@ -110,14 +156,17 @@ class EdgeTtsApi @Inject constructor(
                 throw IOException("Edge TTS output file is empty.")
             }
 
-            val vttFile = File(tempDir, "${outputFile.nameWithoutExtension}.vtt").takeIf { it.exists() }
-                ?: File(tempDir, "$fileBaseName.vtt").takeIf { it.exists() }
-                ?: tempDir.listFiles()?.firstOrNull {
-                    it.isFile && it.extension.equals("vtt", ignoreCase = true) && it.length() > 0L
-                }
-
-            val vttText = vttFile?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
-                ?.takeIf { it.isNotBlank() }
+            val vttText = if (withVtt) {
+                val vttFile = File(tempDir, "${outputFile.nameWithoutExtension}.vtt").takeIf { it.exists() }
+                    ?: File(tempDir, "$fileBaseName.vtt").takeIf { it.exists() }
+                    ?: tempDir.listFiles()?.firstOrNull {
+                        it.isFile && it.extension.equals("vtt", ignoreCase = true) && it.length() > 0L
+                    }
+                vttFile?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
+                    ?.takeIf { it.isNotBlank() }
+            } else {
+                null
+            }
 
             return EdgeTtsSynthesisResult(
                 audioBytes = bytes,
@@ -130,8 +179,22 @@ class EdgeTtsApi @Inject constructor(
 
     private fun findEdgeVoice(requestedVoice: String): Voice? {
         val voices = TTSVoice.provides()
-        return voices.firstOrNull { it.shortName.equals(requestedVoice, ignoreCase = true) }
-            ?: voices.firstOrNull { it.shortName.equals("hi-IN-MadhurNeural", ignoreCase = true) }
+        val exact = voices.firstOrNull { it.shortName.equals(requestedVoice, ignoreCase = true) }
+        if (exact != null) return exact
+
+        val locale = requestedVoice.split('-').take(2).joinToString("-")
+        val langPrefix = requestedVoice.substringBefore('-').trim()
+
+        if (locale.isNotBlank()) {
+            val localeMatch = voices.firstOrNull { it.locale.equals(locale, ignoreCase = true) }
+            if (localeMatch != null) return localeMatch
+        }
+        if (langPrefix.length in 2..3) {
+            val langMatch = voices.firstOrNull { it.locale.startsWith(langPrefix, ignoreCase = true) }
+            if (langMatch != null) return langMatch
+        }
+
+        return voices.firstOrNull { it.shortName.equals("hi-IN-MadhurNeural", ignoreCase = true) }
             ?: voices.firstOrNull { it.shortName.equals("hi-IN-SwaraNeural", ignoreCase = true) }
             ?: voices.firstOrNull { it.locale.startsWith("hi", ignoreCase = true) }
     }
@@ -280,8 +343,8 @@ class EdgeTtsApi @Inject constructor(
     private companion object {
         const val MAX_CHUNK_LENGTH = 160
         const val MAX_ATTEMPTS = 3
-        const val TRAILER_VOICE_RATE = "+14%"
-        const val TRAILER_VOICE_PITCH = "-3Hz"
+        const val DEFAULT_VOICE_RATE = "+14%"
+        const val DEFAULT_VOICE_PITCH = "-2Hz"
     }
 }
 
