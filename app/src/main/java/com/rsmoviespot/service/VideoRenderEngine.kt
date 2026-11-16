@@ -16,6 +16,7 @@ import android.provider.MediaStore
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
+import androidx.core.content.FileProvider
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
@@ -270,11 +271,11 @@ class VideoRenderEngine @Inject constructor(
             )
 
             progress(96, "Saving video to gallery…")
-            val galleryUri = publishToMediaStore(finalFile, topic)
+            val actionUri = publishToMediaStore(finalFile, topic)
             progress(100, "Video ready")
 
             VideoRenderResult(
-                galleryUri = galleryUri,
+                galleryUri = actionUri,
                 segmentCount = videoSegmentFiles.size,
                 width = width,
                 height = height
@@ -1339,51 +1340,64 @@ class VideoRenderEngine @Inject constructor(
             "Rendered video file is missing or empty (${sourceFile.length()} bytes)."
         }
 
-        val resolver = context.contentResolver
         val nowMs = System.currentTimeMillis()
         val nowSec = nowMs / 1000L
-        val displayName = "${safeFileName(topic)}_$nowMs.mp4"
+        val fileBase = "RSMovieSpot_${safeFileName(topic)}_$nowMs"
+        val displayName = "$fileBase.mp4"
 
+        val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
+        exportDir.listFiles()?.forEach { oldFile ->
+            if (oldFile.isFile) oldFile.delete()
+        }
+        val exportCopy = File(exportDir, displayName)
+        sourceFile.copyTo(exportCopy, overwrite = true)
+
+        val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Video.Media.TITLE, displayName.removeSuffix(".mp4"))
+            put(MediaStore.Video.Media.TITLE, fileBase)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
             put(MediaStore.Video.Media.DATE_ADDED, nowSec)
             put(MediaStore.Video.Media.DATE_MODIFIED, nowSec)
-            put(MediaStore.Video.Media.SIZE, sourceFile.length())
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.Video.Media.DATE_TAKEN, nowMs)
                 put(
                     MediaStore.Video.Media.RELATIVE_PATH,
-                    "${Environment.DIRECTORY_DCIM}/RSMovieSpot"
+                    "${Environment.DIRECTORY_DCIM}/Camera"
                 )
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
         }
 
-        val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        val uri = resolver.insert(collection, values)
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val galleryUri = resolver.insert(collection, values)
             ?: throw IOException("Could not create a MediaStore video entry.")
 
         try {
-            val output = resolver.openOutputStream(uri, "w")
+            val output = resolver.openOutputStream(galleryUri)
                 ?: throw IOException("Could not open MediaStore output stream.")
 
             output.use { destination ->
                 sourceFile.inputStream().use { input -> input.copyTo(destination) }
+                destination.flush()
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val completedValues = ContentValues().apply {
                     put(MediaStore.Video.Media.IS_PENDING, 0)
                 }
-                resolver.update(uri, completedValues, null, null)
+                resolver.update(galleryUri, completedValues, null, null)
             }
 
             runCatching {
                 resolver.query(
-                    uri,
+                    galleryUri,
                     arrayOf(MediaStore.Video.Media.DATA),
                     null,
                     null,
@@ -1402,20 +1416,26 @@ class VideoRenderEngine @Inject constructor(
                     }
                 }
             }
-
-            return uri
         } catch (error: Exception) {
-            resolver.delete(uri, null, null)
+            resolver.delete(galleryUri, null, null)
             throw error
         }
+
+        return runCatching {
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                exportCopy
+            )
+        }.getOrDefault(galleryUri)
     }
 
     private fun safeFileName(value: String): String =
         value.trim()
             .replace(Regex("[^A-Za-z0-9._-]+"), "_")
             .trim('_')
-            .take(60)
-            .ifBlank { "RSMovieSpot" }
+            .take(50)
+            .ifBlank { "Video" }
 
     private fun escapeConcatPath(path: String): String =
         path.replace("\\", "\\\\").replace("'", "'\\''")
