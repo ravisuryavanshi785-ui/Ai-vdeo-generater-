@@ -61,7 +61,8 @@ interface VideoRepository {
     suspend fun downloadRealPhoto(
         query: String,
         usedUrls: MutableSet<String>,
-        destinationFile: File
+        destinationFile: File,
+        preferPortrait: Boolean = true
     ): Boolean
 
     suspend fun generateAudioForSlab(text: String): ResponseBody
@@ -93,6 +94,15 @@ class VideoRepositoryImpl @Inject constructor(
         val useJsonMode: Boolean,
         val maxTokens: Int
     )
+
+    private data class PhotoCandidate(
+        val url: String,
+        val width: Int,
+        val height: Int
+    ) {
+        val isPortraitOrSquare: Boolean
+            get() = width > 0 && height > 0 && height.toFloat() >= width.toFloat() * 0.92f
+    }
 
     override suspend fun generateScript(
         topic: String,
@@ -248,26 +258,33 @@ class VideoRepositoryImpl @Inject constructor(
     override suspend fun downloadRealPhoto(
         query: String,
         usedUrls: MutableSet<String>,
-        destinationFile: File
+        destinationFile: File,
+        preferPortrait: Boolean
     ): Boolean = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) return@withContext false
 
-        val candidateUrls = linkedSetOf<String>()
+        val candidates = linkedMapOf<String, PhotoCandidate>()
 
-        runCatching { collectImdbPhotoCandidates(cleanQuery, candidateUrls) }
-        runCatching { collectWikipediaSummaryCandidates(cleanQuery, candidateUrls) }
-        runCatching { collectWikipediaSearchCandidates(cleanQuery, candidateUrls) }
-        runCatching { collectWikimediaCommonsCandidates(cleanQuery, candidateUrls) }
+        runCatching { collectImdbPhotoCandidates(cleanQuery, candidates) }
+        runCatching { collectWikipediaSummaryCandidates(cleanQuery, candidates) }
+        runCatching { collectWikipediaSearchCandidates(cleanQuery, candidates) }
+        runCatching { collectWikimediaCommonsCandidates(cleanQuery, candidates) }
 
-        for (url in candidateUrls) {
-            if (url in usedUrls) continue
+        val ordered = if (preferPortrait) {
+            candidates.values.sortedByDescending { if (it.isPortraitOrSquare) 1 else 0 }
+        } else {
+            candidates.values.toList()
+        }
+
+        for (candidate in ordered) {
+            if (candidate.url in usedUrls) continue
             val downloaded = runCatching {
-                downloadAndValidateImageUrl(url, destinationFile)
+                downloadAndValidateImageUrl(candidate.url, destinationFile)
             }.getOrDefault(false)
 
             if (downloaded) {
-                usedUrls.add(url)
+                usedUrls.add(candidate.url)
                 return@withContext true
             }
         }
@@ -277,7 +294,7 @@ class VideoRepositoryImpl @Inject constructor(
 
     private fun collectImdbPhotoCandidates(
         cleanQuery: String,
-        outUrls: MutableSet<String>
+        outMap: MutableMap<String, PhotoCandidate>
     ) {
         val normalized = cleanQuery.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_')
         if (normalized.isBlank()) return
@@ -304,14 +321,14 @@ class VideoRepositoryImpl @Inject constructor(
             val h = imgObj["height"]?.jsonPrimitive?.intOrNull ?: 0
 
             if (imageUrl.startsWith("http") && (w == 0 || w >= 300) && (h == 0 || h >= 300)) {
-                outUrls.add(imageUrl)
+                outMap.putIfAbsent(imageUrl, PhotoCandidate(imageUrl, w, h))
             }
         }
     }
 
     private fun collectWikipediaSummaryCandidates(
         cleanQuery: String,
-        outUrls: MutableSet<String>
+        outMap: MutableMap<String, PhotoCandidate>
     ) {
         val title = cleanQuery.replace(' ', '_')
         val encodedTitle = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
@@ -319,21 +336,20 @@ class VideoRepositoryImpl @Inject constructor(
         val bodyText = fetchJsonString(url) ?: return
         val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
 
-        val original = (root["originalimage"] as? JsonObject)
-            ?.get("source")?.jsonPrimitive?.contentOrNull
-        val thumbnail = (root["thumbnail"] as? JsonObject)
-            ?.get("source")?.jsonPrimitive?.contentOrNull
-
-        listOfNotNull(original, thumbnail).forEach { imgUrl ->
+        listOf("originalimage", "thumbnail").forEach { key ->
+            val imgObj = root[key] as? JsonObject ?: return@forEach
+            val imgUrl = imgObj["source"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+            val w = imgObj["width"]?.jsonPrimitive?.intOrNull ?: 0
+            val h = imgObj["height"]?.jsonPrimitive?.intOrNull ?: 0
             if (isCleanPhotoUrl(imgUrl)) {
-                outUrls.add(imgUrl)
+                outMap.putIfAbsent(imgUrl, PhotoCandidate(imgUrl, w, h))
             }
         }
     }
 
     private fun collectWikipediaSearchCandidates(
         cleanQuery: String,
-        outUrls: MutableSet<String>
+        outMap: MutableMap<String, PhotoCandidate>
     ) {
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
         val url =
@@ -348,14 +364,13 @@ class VideoRepositoryImpl @Inject constructor(
 
         for (pageElem in pages.values) {
             val pageObj = pageElem as? JsonObject ?: continue
-            val orig = (pageObj["original"] as? JsonObject)
-                ?.get("source")?.jsonPrimitive?.contentOrNull
-            val thumb = (pageObj["thumbnail"] as? JsonObject)
-                ?.get("source")?.jsonPrimitive?.contentOrNull
-
-            listOfNotNull(orig, thumb).forEach { imgUrl ->
+            listOf("original", "thumbnail").forEach { key ->
+                val imgObj = pageObj[key] as? JsonObject ?: return@forEach
+                val imgUrl = imgObj["source"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+                val w = imgObj["width"]?.jsonPrimitive?.intOrNull ?: 0
+                val h = imgObj["height"]?.jsonPrimitive?.intOrNull ?: 0
                 if (isCleanPhotoUrl(imgUrl)) {
-                    outUrls.add(imgUrl)
+                    outMap.putIfAbsent(imgUrl, PhotoCandidate(imgUrl, w, h))
                 }
             }
         }
@@ -363,7 +378,7 @@ class VideoRepositoryImpl @Inject constructor(
 
     private fun collectWikimediaCommonsCandidates(
         cleanQuery: String,
-        outUrls: MutableSet<String>
+        outMap: MutableMap<String, PhotoCandidate>
     ) {
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
         val url =
@@ -393,7 +408,7 @@ class VideoRepositoryImpl @Inject constructor(
 
             val chosen = thumbUrl ?: fullUrl ?: continue
             if (isCleanPhotoUrl(title) && isCleanPhotoUrl(chosen)) {
-                outUrls.add(chosen)
+                outMap.putIfAbsent(chosen, PhotoCandidate(chosen, width, height))
             }
         }
     }
@@ -680,28 +695,31 @@ class VideoRepositoryImpl @Inject constructor(
         const val LANDSCAPE_IMAGE_HEIGHT = 768
 
         const val IMAGE_SUFFIX_SHORTS =
-            ", single continuous full-bleed frame, cinematic IMAX movie still, Unreal Engine 5, 8k resolution, photorealistic, vertical 9:16 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
+            ", single continuous full-bleed frame, live-action 35mm cinema still, ARRI Alexa photography, real-world film set, photorealistic, vertical 9:16 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
         const val IMAGE_SUFFIX_LANDSCAPE =
-            ", single continuous full-bleed frame, cinematic IMAX movie still, Unreal Engine 5, 8k resolution, photorealistic, horizontal 16:9 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
+            ", single continuous full-bleed frame, live-action 35mm cinema still, ARRI Alexa photography, real-world film set, photorealistic, horizontal 16:9 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
 
         const val DEFAULT_NEGATIVE_PROMPT =
-            "filmstrip, multi-panel, stacked frames, comic panels, grid, storyboard, collage, split screen, text, watermark, signature, logo, letters, words, ui, interface, comment box, subscribe button, social media, website, poster, title card, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers"
+            "filmstrip, multi-panel, stacked frames, comic panels, grid, storyboard, collage, split screen, cartoon, anime, 3d render, cgi, illustration, bird, wild animal, abstract, geometric shapes, cubes, blocks, colorful squares, disembodied eye, close-up single eye, text, watermark, signature, logo, letters, words, ui, interface, comment box, subscribe button, social media, website, poster, title card, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers"
 
         const val IMAGE_PROMPT_RULES =
             "REAL PHOTO vs AI IMAGE RULES (VERY IMPORTANT):\n" +
                 "- Whenever a scene directly introduces or highlights a REAL-WORLD actor, actress, or director by name (such as Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Yash, Shah Rukh Khan, Salman Khan, etc.):\n" +
                 "  Set visual_source='real_photo' and real_photo_query to ONLY that single celebrity's clean English name (e.g. 'Prabhas' or 'Sandeep Reddy Vanga' — NEVER mix movie names into real_photo_query).\n" +
-                "- For ALL OTHER SCENES (action sequences, dark violence, blood/box-office hype, cinema theater crowds, fierce cop silhouette/avatar, record-breaking shots, symbolic comparisons, and final comment CTA):\n" +
-                "  Set visual_source='ai_generated' and real_photo_query='' so those visuals are 100% AI-generated cinematic scenes.\n" +
-                "- ALWAYS fill a high-quality English image_prompt even for real_photo scenes as an automatic fallback.\n\n" +
-                "IMAGE PROMPT RULES (STRICT):\n" +
-                "- Describe ONLY physical characters, environments, lighting, and cinematic action.\n" +
-                "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text' in image_prompt, even if voiceover mentions commenting or box office numbers.\n" +
-                "- NEVER write real celebrity/actor names inside image_prompt or character_bible — describe the iconic visual figure/silhouette directly (e.g. rugged intense Indian police officer in khaki uniform in pouring rain) so the AI generator never hallucinates random faces.\n" +
-                "- For metaphors like 'पूरी दुनिया देखेगी' or 'वर्ल्ड रिकॉर्ड', NEVER ask for Earth globes or world maps — describe roaring packed cinema crowds, shattering glass/action, or triumphant hero shots.\n" +
-                "- For the final call-to-action scene, set visual_source='ai_generated' and generate an epic triumphant/intense cinematic shot.\n" +
-                "- Set has_character=false when showing crowds, audiences, theaters, battlefields, or environments; set has_character=true only when the main cinematic character is directly in frame.\n" +
-                "- Vary camera angles constantly across consecutive scenes.\n\n"
+                "- For ALL OTHER SCENES (action sequences, cinema theater crowds, fierce cop silhouette/avatar, record-breaking hype, symbolic comparisons, and final CTA):\n" +
+                "  Set visual_source='ai_generated' and real_photo_query='' so those visuals are 100% AI-generated live-action cinema scenes.\n\n" +
+                "IMAGE PROMPT RULES (STRICT ANTI-GLITCH):\n" +
+                "- EVERY image_prompt MUST describe a grounded, live-action Indian movie frame with real people, environments, props, and lighting.\n" +
+                "- NEVER write movie title words with literal meanings in image_prompt or visual_style — specifically NEVER write the words 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' (otherwise the image model draws cartoon animals or birds!). Instead describe the movie vibe physically, e.g. 'intense bearded Indian man in sharp black suit walking through smoky corridor'.\n" +
+                "- NEVER write abstract phrases like 'dark violence', 'blood rivers', 'box office', 'records', 'explosion of red and blue blocks', or 'close-up eyes' (they cause floating cubes or random disembodied female eyes!). Instead write concrete live-action film shots:\n" +
+                "  * For cop action / dark intensity: 'rugged bearded Indian police officer in khaki uniform standing in heavy night rain with glowing police siren lights, dramatic cinematic shadows'\n" +
+                "  * For theater / box office hype: 'massive roaring Indian cinema audience cheering inside a grand packed movie hall facing a bright silver screen'\n" +
+                "  * For blockbuster action mayhem: 'dramatic Bollywood action hero in slow-motion amidst sparks, shattered glass, and smoky night warehouse lighting'\n" +
+                "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text'.\n" +
+                "- NEVER write real celebrity names inside image_prompt or character_bible.\n" +
+                "- For the final call-to-action scene, set visual_source='ai_generated' and describe an epic wide hero shot of a rugged Indian action protagonist under dramatic cinema spotlights.\n" +
+                "- Set has_character=false for crowds, theaters, exteriors, or action wide shots; set has_character=true only when the single male hero from character_bible is directly in frame.\n" +
+                "- Vary framing across scenes (wide street, inside packed cinema hall, rain-soaked hero silhouette, warehouse standoff, over-the-shoulder action shot — NEVER extreme close-up eye).\n\n"
 
         const val VOICE_AND_BGM_RULES =
             "VOICE EMOTION & BGM RULES:\n" +
@@ -712,8 +730,8 @@ class VideoRepositoryImpl @Inject constructor(
         const val JSON_SCHEMA_SPEC =
             "Return ONLY valid JSON matching this schema:\n" +
                 "{\n" +
-                "  \"character_bible\": \"Unchanging visual look of main character in English without real actor names\",\n" +
-                "  \"visual_style\": \"Unified cinematic visual style, color palette, lighting\",\n" +
+                "  \"character_bible\": \"Concrete physical look of main action hero in English without real actor names\",\n" +
+                "  \"visual_style\": \"Live-action gritty Indian cinema look, warm amber and deep shadow lighting (NO Unreal Engine, NO abstract colors)\",\n" +
                 "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
                 "  \"voice_name\": \"Edge TTS voice shortName matching language and gender\",\n" +
                 "  \"slabs\": [\n" +
@@ -723,7 +741,7 @@ class VideoRepositoryImpl @Inject constructor(
                 "      \"visual_source\": \"real_photo | ai_generated\",\n" +
                 "      \"real_photo_query\": \"Clean English celebrity name (e.g. 'Prabhas') if visual_source='real_photo', else ''\",\n" +
                 "      \"has_character\": false,\n" +
-                "      \"image_prompt\": \"English physical visual description only (NO text/UI/posters/comment box/actor names/world map)\",\n" +
+                "      \"image_prompt\": \"Concrete live-action English movie scene (NO 'Animal'/'Spirit'/cubes/eyes/UI/posters/actor names)\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
                 "    }\n" +
                 "  ]\n" +
