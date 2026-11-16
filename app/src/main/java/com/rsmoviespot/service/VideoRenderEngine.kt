@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -1334,28 +1335,34 @@ class VideoRenderEngine @Inject constructor(
         }
 
     private fun publishToMediaStore(sourceFile: File, topic: String): Uri {
+        require(sourceFile.exists() && sourceFile.length() > 1024L) {
+            "Rendered video file is missing or empty (${sourceFile.length()} bytes)."
+        }
+
         val resolver = context.contentResolver
-        val displayName = "${safeFileName(topic)}_${System.currentTimeMillis()}.mp4"
+        val nowMs = System.currentTimeMillis()
+        val nowSec = nowMs / 1000L
+        val displayName = "${safeFileName(topic)}_$nowMs.mp4"
 
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Video.Media.TITLE, displayName.removeSuffix(".mp4"))
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.DATE_ADDED, nowSec)
+            put(MediaStore.Video.Media.DATE_MODIFIED, nowSec)
+            put(MediaStore.Video.Media.SIZE, sourceFile.length())
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.DATE_TAKEN, nowMs)
                 put(
                     MediaStore.Video.Media.RELATIVE_PATH,
-                    "${Environment.DIRECTORY_MOVIES}/RSMovieSpot"
+                    "${Environment.DIRECTORY_DCIM}/RSMovieSpot"
                 )
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
         }
 
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        }
-
+        val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         val uri = resolver.insert(collection, values)
             ?: throw IOException("Could not create a MediaStore video entry.")
 
@@ -1374,6 +1381,28 @@ class VideoRenderEngine @Inject constructor(
                 resolver.update(uri, completedValues, null, null)
             }
 
+            runCatching {
+                resolver.query(
+                    uri,
+                    arrayOf(MediaStore.Video.Media.DATA),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val path = cursor.getString(0)
+                        if (!path.isNullOrBlank()) {
+                            MediaScannerConnection.scanFile(
+                                context,
+                                arrayOf(path),
+                                arrayOf("video/mp4"),
+                                null
+                            )
+                        }
+                    }
+                }
+            }
+
             return uri
         } catch (error: Exception) {
             resolver.delete(uri, null, null)
@@ -1386,7 +1415,7 @@ class VideoRenderEngine @Inject constructor(
             .replace(Regex("[^A-Za-z0-9._-]+"), "_")
             .trim('_')
             .take(60)
-            .ifBlank { "video" }
+            .ifBlank { "RSMovieSpot" }
 
     private fun escapeConcatPath(path: String): String =
         path.replace("\\", "\\\\").replace("'", "'\\''")
