@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaRecorder
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,6 +25,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -35,20 +37,29 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VoiceGender
+import kotlinx.coroutines.delay
+import java.io.File
 
 private val NeonGreen = Color(0xFF39FF14)
 private val DarkBg = Color(0xFF0A0E0B)
@@ -56,6 +67,7 @@ private val CardBg = Color(0xFF141A15)
 private val SelectedChipBg = Color(0xFF1B3A18)
 private val BorderGreen = Color(0xFF285C22)
 private val TextMuted = Color(0xFFA0ACA2)
+private val WarnAmber = Color(0xFFFFB74D)
 
 @Composable
 fun MainScreen(
@@ -63,6 +75,8 @@ fun MainScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
+
+    var showVoiceSetupDialog by remember { mutableStateOf(false) }
 
     val bgmPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -75,6 +89,14 @@ fun MainScreen(
                 )
             }
             viewModel.onBgmSelected(uri)
+        }
+    }
+
+    val voiceSamplePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.onVoiceSamplePicked(uri)
         }
     }
 
@@ -193,16 +215,82 @@ fun MainScreen(
             }
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
             VoiceGender.entries.forEach { gender ->
+                val labelText = if (gender == VoiceGender.MY_VOICE) {
+                    "My Voice (Clone)"
+                } else {
+                    "${gender.label} Voice"
+                }
                 FilterChip(
                     selected = uiState.selectedGender == gender,
                     onClick = { viewModel.onGenderSelected(gender) },
                     enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
-                    label = { Text("${gender.label} Voice") },
+                    label = { Text(labelText) },
                     colors = chipColors,
                     border = chipBorder
                 )
+            }
+        }
+
+        if (uiState.selectedGender == VoiceGender.MY_VOICE) {
+            val cloneConfig = uiState.voiceCloneConfig
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = CardBg),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(
+                    1.dp,
+                    if (cloneConfig.isReady) BorderGreen else WarnAmber
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (cloneConfig.isReady) {
+                                "Voice Clone Ready"
+                            } else {
+                                "Setup Required (Edge Fallback Active)"
+                            },
+                            color = if (cloneConfig.isReady) NeonGreen else WarnAmber,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (cloneConfig.hasSample) {
+                                "Sample: ${cloneConfig.sampleName}"
+                            } else {
+                                "Tap Setup to record 15s voice & add Modal URL"
+                            },
+                            color = TextMuted,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.clearVoiceTestMessage()
+                            showVoiceSetupDialog = true
+                        },
+                        enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                        shape = RoundedCornerShape(20.dp),
+                        border = BorderStroke(1.dp, NeonGreen),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+                    ) {
+                        Text("Setup", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
             }
         }
 
@@ -461,4 +549,309 @@ fun MainScreen(
             }
         }
     }
+
+    if (showVoiceSetupDialog) {
+        VoiceCloneSetupDialog(
+            initialConfig = uiState.voiceCloneConfig,
+            isTesting = uiState.isTestingVoiceServer,
+            testMessage = uiState.voiceTestMessage,
+            onPickSample = { voiceSamplePickerLauncher.launch(arrayOf("audio/*")) },
+            createTempRecordingFile = viewModel::createRecordingTempFile,
+            onRecordedSample = viewModel::onVoiceSampleRecorded,
+            onTestConnection = viewModel::testVoiceServer,
+            onSave = { url, pin, baseIsFemale ->
+                viewModel.saveVoiceCloneSettings(url, pin, baseIsFemale)
+                showVoiceSetupDialog = false
+            },
+            onDismiss = { showVoiceSetupDialog = false }
+        )
+    }
+}
+
+@Composable
+private fun VoiceCloneSetupDialog(
+    initialConfig: com.rsmoviespot.data.local.VoiceCloneConfig,
+    isTesting: Boolean,
+    testMessage: String?,
+    onPickSample: () -> Unit,
+    createTempRecordingFile: () -> File,
+    onRecordedSample: (File) -> Unit,
+    onTestConnection: (String, String) -> Unit,
+    onSave: (String, String, Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    var serverUrl by remember(initialConfig) { mutableStateOf(initialConfig.serverUrl) }
+    var secretPin by remember(initialConfig) { mutableStateOf(initialConfig.secretPin) }
+    var baseIsFemale by remember(initialConfig) { mutableStateOf(initialConfig.baseIsFemale) }
+
+    var isRecording by remember { mutableStateOf(false) }
+    var recordSeconds by remember { mutableStateOf(0) }
+    var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
+    var activeRecordFile by remember { mutableStateOf<File?>(null) }
+
+    fun stopAndSaveRecording() {
+        val currentRecorder = recorder
+        val file = activeRecordFile
+        recorder = null
+        activeRecordFile = null
+        isRecording = false
+        runCatching {
+            currentRecorder?.stop()
+        }
+        runCatching {
+            currentRecorder?.release()
+        }
+        if (file != null) {
+            onRecordedSample(file)
+        }
+    }
+
+    fun startMicRecording() {
+        val targetFile = createTempRecordingFile()
+        runCatching {
+            val mr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(context)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            mr.apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(128000)
+                setOutputFile(targetFile.absolutePath)
+                prepare()
+                start()
+            }
+            recorder = mr
+            activeRecordFile = targetFile
+            recordSeconds = 0
+            isRecording = true
+        }.onFailure { err ->
+            Toast.makeText(
+                context,
+                "Mic error: ${err.message ?: "Could not start recording"}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            startMicRecording()
+        } else {
+            Toast.makeText(context, "Mic permission required to record voice.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(isRecording) {
+        while (isRecording) {
+            delay(1000L)
+            recordSeconds += 1
+            if (recordSeconds >= 25) {
+                stopAndSaveRecording()
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { recorder?.stop() }
+            runCatching { recorder?.release() }
+            recorder = null
+        }
+    }
+
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = NeonGreen,
+        unfocusedBorderColor = BorderGreen,
+        focusedLabelColor = NeonGreen,
+        unfocusedLabelColor = TextMuted,
+        focusedTextColor = Color.White,
+        unfocusedTextColor = Color.White,
+        cursorColor = NeonGreen
+    )
+
+    val chipColors = FilterChipDefaults.filterChipColors(
+        selectedContainerColor = SelectedChipBg,
+        selectedLabelColor = NeonGreen,
+        containerColor = DarkBg,
+        labelColor = Color.White
+    )
+    val chipBorder = FilterChipDefaults.filterChipBorder(
+        borderColor = BorderGreen,
+        selectedBorderColor = NeonGreen
+    )
+
+    AlertDialog(
+        onDismissRequest = {
+            if (isRecording) stopAndSaveRecording()
+            onDismiss()
+        },
+        containerColor = CardBg,
+        title = {
+            Text(
+                text = "My Voice (Modal Clone)",
+                color = NeonGreen,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = serverUrl,
+                    onValueChange = { serverUrl = it },
+                    label = { Text("Modal Server URL (.modal.run)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = fieldColors
+                )
+
+                OutlinedTextField(
+                    value = secretPin,
+                    onValueChange = { secretPin = it },
+                    label = { Text("Secret PIN (VOICE_API_SECRET)") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = fieldColors
+                )
+
+                Text(
+                    text = "Base Pitch Tone",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !baseIsFemale,
+                        onClick = { baseIsFemale = false },
+                        label = { Text("Male Tone") },
+                        colors = chipColors,
+                        border = chipBorder
+                    )
+                    FilterChip(
+                        selected = baseIsFemale,
+                        onClick = { baseIsFemale = true },
+                        label = { Text("Female Tone") },
+                        colors = chipColors,
+                        border = chipBorder
+                    )
+                }
+
+                Text(
+                    text = "Your 15–20s Voice Sample",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (initialConfig.hasSample) {
+                        "Saved: ${initialConfig.sampleName}"
+                    } else {
+                        "No voice sample saved yet. Record in a quiet room."
+                    },
+                    color = if (initialConfig.hasSample) NeonGreen else TextMuted,
+                    fontSize = 12.sp
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            if (isRecording) {
+                                stopAndSaveRecording()
+                            } else if (ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                startMicRecording()
+                            } else {
+                                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isRecording) Color(0xFFE53935) else NeonGreen,
+                            contentColor = if (isRecording) Color.White else Color.Black
+                        )
+                    ) {
+                        Text(
+                            text = if (isRecording) "Stop (${recordSeconds}s)" else "Record Mic",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = onPickSample,
+                        enabled = !isRecording,
+                        modifier = Modifier.weight(1f),
+                        border = BorderStroke(1.dp, BorderGreen),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+                    ) {
+                        Text("Pick Audio", fontSize = 12.sp)
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = { onTestConnection(serverUrl, secretPin) },
+                    enabled = !isTesting && !isRecording,
+                    modifier = Modifier.fillMaxWidth(),
+                    border = BorderStroke(1.dp, BorderGreen),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                ) {
+                    Text(if (isTesting) "Testing Server…" else "Test Server & PIN")
+                }
+
+                if (!testMessage.isNullOrBlank()) {
+                    val isErr = testMessage.contains("failed", ignoreCase = true) ||
+                        testMessage.contains("Invalid", ignoreCase = true)
+                    Text(
+                        text = testMessage,
+                        color = if (isErr) Color(0xFFFF6B6B) else NeonGreen,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (isRecording) stopAndSaveRecording()
+                    onSave(serverUrl, secretPin, baseIsFemale)
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NeonGreen,
+                    contentColor = Color.Black
+                )
+            ) {
+                Text("Save", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    if (isRecording) stopAndSaveRecording()
+                    onDismiss()
+                }
+            ) {
+                Text("Cancel", color = TextMuted)
+            }
+        }
+    )
 }
