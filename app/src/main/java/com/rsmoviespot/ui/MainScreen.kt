@@ -1,9 +1,11 @@
 package com.rsmoviespot.ui
 
 import android.Manifest
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -350,9 +352,26 @@ fun MainScreen(
                     onClick = {
                         val playIntent = Intent(Intent.ACTION_VIEW).apply {
                             setDataAndType(videoUri, "video/mp4")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    Intent.FLAG_ACTIVITY_NEW_TASK
+                            )
                         }
-                        runCatching { context.startActivity(playIntent) }
+                        val chooser = Intent.createChooser(playIntent, "Play Video").apply {
+                            addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    Intent.FLAG_ACTIVITY_NEW_TASK
+                            )
+                        }
+                        runCatching {
+                            context.startActivity(chooser)
+                        }.onFailure { err ->
+                            Toast.makeText(
+                                context,
+                                "Cannot open player: ${err.message ?: "No video player found"}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(24.dp),
@@ -368,10 +387,23 @@ fun MainScreen(
                         val shareIntent = Intent(Intent.ACTION_SEND).apply {
                             type = "video/mp4"
                             putExtra(Intent.EXTRA_STREAM, videoUri)
+                            clipData = ClipData.newRawUri("RS Movie Spot Video", videoUri)
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
+                        val chooser = Intent.createChooser(shareIntent, "Share Video").apply {
+                            addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    Intent.FLAG_ACTIVITY_NEW_TASK
+                            )
+                        }
                         runCatching {
-                            context.startActivity(Intent.createChooser(shareIntent, "Share Video"))
+                            context.startActivity(chooser)
+                        }.onFailure { err ->
+                            Toast.makeText(
+                                context,
+                                "Cannot share video: ${err.message ?: "Share failed"}",
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
                     },
                     modifier = Modifier.weight(1f),
