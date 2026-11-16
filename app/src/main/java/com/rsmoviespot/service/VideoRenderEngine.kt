@@ -294,6 +294,7 @@ class VideoRenderEngine @Inject constructor(
 
             val mixedAudioFile = File(renderDirectory, "final_audio.m4a")
             val finalAudioReady = mixAudioTrackSafely(
+                renderDirectory = renderDirectory,
                 fullVoiceFile = fullVoiceFile,
                 bgmBedFile = bgmBedFile,
                 sfxTrackFile = sfxTrackFile,
@@ -349,7 +350,6 @@ class VideoRenderEngine @Inject constructor(
             outBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(outBitmap)
 
-            // Full-bleed upper-biased portrait/square fill (ZERO borders!)
             if (srcAspect <= 1.08f && targetHeight > targetWidth) {
                 val cropRect = if (srcAspect > dstAspect) {
                     val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
@@ -367,7 +367,6 @@ class VideoRenderEngine @Inject constructor(
                     Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
                 )
             } else if (targetWidth >= targetHeight && srcAspect >= 1.25f) {
-                // Full-bleed landscape YouTube 16:9
                 val cropRect = if (srcAspect > dstAspect) {
                     val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
                     val left = (srcW - cropW) / 2
@@ -384,8 +383,6 @@ class VideoRenderEngine @Inject constructor(
                     Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
                 )
             } else {
-                // Wide landscape photo in 9:16 Shorts:
-                // 1) Rich glowing blurred backdrop (no heavy black bars!)
                 val bgCropRect = if (srcAspect > dstAspect) {
                     val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
                     val left = (srcW - cropW) / 2
@@ -412,10 +409,8 @@ class VideoRenderEngine @Inject constructor(
                     Rect(0, 0, targetWidth, targetHeight),
                     Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
                 )
-                // Gentle dim so backdrop stays colorful and matches the photo instead of black bars
                 canvas.drawColor(0x3D000000)
 
-                // 2) Edge-to-edge full-width photo with gentle 20% side trim so it fills height cleanly
                 val trimmedW = (srcW * 0.80f).roundToInt().coerceIn(1, srcW)
                 val trimLeft = (srcW - trimmedW) / 2
                 val fgCrop = Rect(trimLeft, 0, trimLeft + trimmedW, srcH)
@@ -1196,7 +1191,41 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
+    private fun readMono16BitWavSamples(wavFile: File): ShortArray {
+        if (!wavFile.exists() || wavFile.length() <= 44L) return ShortArray(0)
+        val bytes = wavFile.readBytes()
+        if (bytes.size <= 44) return ShortArray(0)
+
+        var dataStart = 44
+        var dataLen = bytes.size - 44
+
+        var offset = 12
+        while (offset + 8 <= bytes.size) {
+            val chunkId = String(bytes, offset, 4, Charsets.US_ASCII)
+            val chunkSize = ((bytes[offset + 4].toInt() and 0xFF)) or
+                ((bytes[offset + 5].toInt() and 0xFF) shl 8) or
+                ((bytes[offset + 6].toInt() and 0xFF) shl 16) or
+                ((bytes[offset + 7].toInt() and 0xFF) shl 24)
+            if (chunkId == "data") {
+                dataStart = offset + 8
+                dataLen = chunkSize.coerceIn(0, bytes.size - dataStart)
+                break
+            }
+            if (chunkSize < 0) break
+            offset += 8 + chunkSize + (chunkSize and 1)
+        }
+
+        val sampleCount = dataLen / 2
+        val samples = ShortArray(sampleCount)
+        val buffer = ByteBuffer.wrap(bytes, dataStart, sampleCount * 2).order(ByteOrder.LITTLE_ENDIAN)
+        for (i in 0 until sampleCount) {
+            samples[i] = buffer.short
+        }
+        return samples
+    }
+
     private suspend fun mixAudioTrackSafely(
+        renderDirectory: File,
         fullVoiceFile: File,
         bgmBedFile: File?,
         sfxTrackFile: File?,
@@ -1204,82 +1233,97 @@ class VideoRenderEngine @Inject constructor(
         outputFile: File
     ): File? {
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
-        val voiceFilter =
-            "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS," +
-                "highpass=f=85," +
-                "equalizer=f=180:t=o:w=1.2:g=3.5," +
-                "equalizer=f=3200:t=o:w=1.5:g=3.0," +
-                "acompressor=threshold=-16dB:ratio=3:attack=5:release=60," +
-                "volume=1.15[v]"
 
-        val args = when {
-            bgmBedFile != null && sfxTrackFile != null -> arrayOf(
-                "-y",
-                "-i", fullVoiceFile.absolutePath,
-                "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
-                "-i", sfxTrackFile.absolutePath,
-                "-filter_complex",
-                "$voiceFilter;" +
-                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.25[b];" +
-                    "[2:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
-                    "[v][b][s]amix=inputs=3:duration=first:normalize=0[aout]",
-                "-map", "[aout]",
-                "-t", formattedDuration,
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-ar", "44100",
-                "-ac", "2",
-                outputFile.absolutePath
+        // 1) Apply Studio Mic EQ on single-input voice (no amix / no apad!)
+        val eqVoiceFile = File(renderDirectory, "voice_eq.wav")
+        val eqOk = runCatching {
+            runFfmpeg(
+                arrayOf(
+                    "-y",
+                    "-i", fullVoiceFile.absolutePath,
+                    "-af",
+                    "highpass=f=85," +
+                        "equalizer=f=180:t=o:w=1.2:g=3.5," +
+                        "equalizer=f=3200:t=o:w=1.5:g=3.0," +
+                        "acompressor=threshold=-16dB:ratio=3:attack=5:release=60," +
+                        "volume=1.15",
+                    "-ar", "44100",
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    eqVoiceFile.absolutePath
+                )
             )
-            bgmBedFile != null -> arrayOf(
-                "-y",
-                "-i", fullVoiceFile.absolutePath,
-                "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
-                "-filter_complex",
-                "$voiceFilter;" +
-                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.25[b];" +
-                    "[v][b]amix=inputs=2:duration=first:normalize=0[aout]",
-                "-map", "[aout]",
-                "-t", formattedDuration,
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-ar", "44100",
-                "-ac", "2",
-                outputFile.absolutePath
-            )
-            sfxTrackFile != null -> arrayOf(
-                "-y",
-                "-i", fullVoiceFile.absolutePath,
-                "-i", sfxTrackFile.absolutePath,
-                "-filter_complex",
-                "$voiceFilter;" +
-                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
-                    "[v][s]amix=inputs=2:duration=first:normalize=0[aout]",
-                "-map", "[aout]",
-                "-t", formattedDuration,
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-ar", "44100",
-                "-ac", "2",
-                outputFile.absolutePath
-            )
-            else -> arrayOf(
-                "-y",
-                "-i", fullVoiceFile.absolutePath,
-                "-filter_complex",
-                "$voiceFilter",
-                "-map", "[v]",
-                "-t", formattedDuration,
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-ar", "44100",
-                "-ac", "2",
-                outputFile.absolutePath
-            )
+        }.isSuccess
+        val voiceSource = if (eqOk && eqVoiceFile.exists() && eqVoiceFile.length() > 44L) {
+            eqVoiceFile
+        } else {
+            fullVoiceFile
         }
 
-        val ok = runCatching { runFfmpeg(args) }.isSuccess
-        return outputFile.takeIf { ok && it.exists() && it.length() > 0L }
+        // 2) Ensure BGM is mono 44.1kHz PCM WAV (single-input conversion only if custom mp3)
+        val bgmWavFile = if (bgmBedFile != null) {
+            if (bgmBedFile.extension.equals("wav", ignoreCase = true)) {
+                bgmBedFile
+            } else {
+                val converted = File(renderDirectory, "bgm_44k.wav")
+                val ok = runCatching {
+                    runFfmpeg(
+                        arrayOf(
+                            "-y",
+                            "-i", bgmBedFile.absolutePath,
+                            "-t", formattedDuration,
+                            "-ar", "44100",
+                            "-ac", "1",
+                            "-c:a", "pcm_s16le",
+                            converted.absolutePath
+                        )
+                    )
+                }.isSuccess
+                if (ok && converted.exists() && converted.length() > 44L) converted else null
+            }
+        } else {
+            null
+        }
+
+        // 3) Mix Voice + looped BGM + SFX in Kotlin PCM (zero FFmpeg amix deadlock!)
+        val mixedWavFile = File(renderDirectory, "mixed_master.wav")
+        val kotlinMixOk = runCatching {
+            val voiceSamples = readMono16BitWavSamples(voiceSource)
+            val bgmSamples = bgmWavFile?.let { readMono16BitWavSamples(it) } ?: ShortArray(0)
+            val sfxSamples = sfxTrackFile?.let { readMono16BitWavSamples(it) } ?: ShortArray(0)
+            val totalSamples = (totalDurationSeconds * 44100.0).roundToInt().coerceAtLeast(44100)
+
+            writeMono16BitWav(mixedWavFile, 44100, totalSamples) { idx ->
+                val v = if (idx < voiceSamples.size) voiceSamples[idx] / 32768.0 else 0.0
+                val b = if (bgmSamples.isNotEmpty()) {
+                    (bgmSamples[idx % bgmSamples.size] / 32768.0) * 0.25
+                } else {
+                    0.0
+                }
+                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.35 else 0.0
+                (v + b + s).coerceIn(-0.96, 0.96)
+            }
+            mixedWavFile.exists() && mixedWavFile.length() > 44L
+        }.getOrDefault(false)
+
+        if (!kotlinMixOk) return null
+
+        // 4) Single-input AAC encode
+        val aacOk = runCatching {
+            runFfmpeg(
+                arrayOf(
+                    "-y",
+                    "-i", mixedWavFile.absolutePath,
+                    "-t", formattedDuration,
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    outputFile.absolutePath
+                )
+            )
+        }.isSuccess
+        return outputFile.takeIf { aacOk && it.exists() && it.length() > 0L }
     }
 
     private suspend fun muxFinalVideo(
