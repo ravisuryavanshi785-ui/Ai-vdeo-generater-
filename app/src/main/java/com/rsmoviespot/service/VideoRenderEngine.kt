@@ -191,12 +191,21 @@ class VideoRenderEngine @Inject constructor(
                 totalDurationSeconds = exactVideoDuration
             )
 
-            val finalFile = File(renderDirectory, "final_video.mp4")
-            mixFinalVideoAudio(
-                silentVideoFile = silentVideoFile,
+            val mixedAudioFile = File(renderDirectory, "final_audio.m4a")
+            val finalAudioReady = mixAudioTrackSafely(
                 fullVoiceFile = fullVoiceFile,
                 bgmBedFile = bgmBedFile,
                 sfxTrackFile = sfxTrackFile,
+                totalDurationSeconds = exactVideoDuration,
+                outputFile = mixedAudioFile
+            )
+
+            progress(93, "Finalizing video file…")
+            val finalFile = File(renderDirectory, "final_video.mp4")
+            muxFinalVideo(
+                silentVideoFile = silentVideoFile,
+                mixedAudioFile = finalAudioReady,
+                fallbackVoiceFile = fullVoiceFile,
                 totalDurationSeconds = exactVideoDuration,
                 outputFile = finalFile
             )
@@ -415,7 +424,6 @@ class VideoRenderEngine @Inject constructor(
         val rawResourceFile = copyOptionalRawAudio(renderDirectory, mood)
         if (rawResourceFile != null) return rawResourceFile
 
-        // Built-in pure Kotlin 16-bit WAV music bed (phone-speaker audible mid-range chords + beat)
         val synthFile = File(renderDirectory, "bgm_bed.wav")
         return runCatching {
             writeCinematicBgmWav(synthFile, mood)
@@ -616,87 +624,107 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private suspend fun mixFinalVideoAudio(
-        silentVideoFile: File,
+    private suspend fun mixAudioTrackSafely(
         fullVoiceFile: File,
         bgmBedFile: File?,
         sfxTrackFile: File?,
         totalDurationSeconds: Double,
         outputFile: File
-    ) {
+    ): File? {
+        if (bgmBedFile == null && sfxTrackFile == null) return null
+
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
 
+        // Strictly bound every audio stream with atrim / -t before -i so amix never waits on infinite inputs.
         val args = when {
             bgmBedFile != null && sfxTrackFile != null -> arrayOf(
                 "-y",
-                "-i", silentVideoFile.absolutePath,
                 "-i", fullVoiceFile.absolutePath,
-                "-stream_loop", "-1", "-i", bgmBedFile.absolutePath,
+                "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
                 "-i", sfxTrackFile.absolutePath,
                 "-filter_complex",
-                "[1:a]apad,volume=1.0[v];" +
-                    "[2:a]volume=0.26[b];" +
-                    "[3:a]volume=0.35[s];" +
+                "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
+                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.26[b];" +
+                    "[2:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
                     "[v][b][s]amix=inputs=3:duration=first:normalize=0[aout]",
-                "-map", "0:v:0",
                 "-map", "[aout]",
-                "-c:v", "copy",
+                "-t", formattedDuration,
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-ar", "44100",
                 "-ac", "2",
-                "-t", formattedDuration,
-                "-movflags", "+faststart",
                 outputFile.absolutePath
             )
             bgmBedFile != null -> arrayOf(
                 "-y",
-                "-i", silentVideoFile.absolutePath,
                 "-i", fullVoiceFile.absolutePath,
-                "-stream_loop", "-1", "-i", bgmBedFile.absolutePath,
+                "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
                 "-filter_complex",
-                "[1:a]apad,volume=1.0[v];" +
-                    "[2:a]volume=0.26[b];" +
+                "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
+                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.26[b];" +
                     "[v][b]amix=inputs=2:duration=first:normalize=0[aout]",
-                "-map", "0:v:0",
                 "-map", "[aout]",
-                "-c:v", "copy",
+                "-t", formattedDuration,
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-ar", "44100",
                 "-ac", "2",
-                "-t", formattedDuration,
-                "-movflags", "+faststart",
                 outputFile.absolutePath
             )
             else -> arrayOf(
                 "-y",
-                "-i", silentVideoFile.absolutePath,
                 "-i", fullVoiceFile.absolutePath,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-af", "apad",
-                "-c:v", "copy",
+                "-i", sfxTrackFile!!.absolutePath,
+                "-filter_complex",
+                "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
+                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
+                    "[v][s]amix=inputs=2:duration=first:normalize=0[aout]",
+                "-map", "[aout]",
+                "-t", formattedDuration,
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-ar", "44100",
                 "-ac", "2",
-                "-t", formattedDuration,
-                "-movflags", "+faststart",
                 outputFile.absolutePath
             )
         }
 
-        val mixedOk = runCatching { runFfmpeg(args) }.isSuccess
-        if (!mixedOk || !outputFile.exists() || outputFile.length() == 0L) {
+        val ok = runCatching { runFfmpeg(args) }.isSuccess
+        return outputFile.takeIf { ok && it.exists() && it.length() > 0L }
+    }
+
+    private suspend fun muxFinalVideo(
+        silentVideoFile: File,
+        mixedAudioFile: File?,
+        fallbackVoiceFile: File,
+        totalDurationSeconds: Double,
+        outputFile: File
+    ) {
+        val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
+
+        if (mixedAudioFile != null) {
             runFfmpeg(
                 arrayOf(
                     "-y",
                     "-i", silentVideoFile.absolutePath,
-                    "-i", fullVoiceFile.absolutePath,
+                    "-i", mixedAudioFile.absolutePath,
                     "-map", "0:v:0",
                     "-map", "1:a:0",
-                    "-af", "apad",
+                    "-c:v", "copy",
+                    "-c:a", "copy",
+                    "-t", formattedDuration,
+                    "-movflags", "+faststart",
+                    outputFile.absolutePath
+                )
+            )
+        } else {
+            runFfmpeg(
+                arrayOf(
+                    "-y",
+                    "-i", silentVideoFile.absolutePath,
+                    "-i", fallbackVoiceFile.absolutePath,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-b:a", "192k",
