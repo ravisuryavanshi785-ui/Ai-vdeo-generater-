@@ -5,6 +5,9 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.rsmoviespot.data.api.PersonalVoiceApi
+import com.rsmoviespot.data.local.VoiceCloneConfig
+import com.rsmoviespot.data.local.VoiceCloneStore
 import com.rsmoviespot.data.repository.VideoRepository
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
@@ -18,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import javax.inject.Inject
 
 data class VideoUiState(
@@ -33,16 +37,23 @@ data class VideoUiState(
     val progressText: String = "",
     val progressPercentage: Int = 0,
     val statusMessage: String = "",
-    val generatedVideoUri: Uri? = null
+    val generatedVideoUri: Uri? = null,
+    val voiceCloneConfig: VoiceCloneConfig = VoiceCloneConfig(),
+    val isTestingVoiceServer: Boolean = false,
+    val voiceTestMessage: String? = null
 )
 
 @HiltViewModel
 class VideoViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val videoRepository: VideoRepository
+    private val videoRepository: VideoRepository,
+    private val voiceCloneStore: VoiceCloneStore,
+    private val personalVoiceApi: PersonalVoiceApi
 ) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(VideoUiState())
+    private val _uiState = MutableStateFlow(
+        VideoUiState(voiceCloneConfig = voiceCloneStore.getConfig())
+    )
     val uiState: StateFlow<VideoUiState> = _uiState.asStateFlow()
 
     init {
@@ -77,6 +88,70 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(selectedGender = gender, draftScript = null) }
     }
 
+    fun saveVoiceCloneSettings(serverUrl: String, secretPin: String, baseIsFemale: Boolean) {
+        voiceCloneStore.saveSettings(serverUrl, secretPin, baseIsFemale)
+        _uiState.update {
+            it.copy(
+                voiceCloneConfig = voiceCloneStore.getConfig(),
+                draftScript = null
+            )
+        }
+    }
+
+    fun onVoiceSamplePicked(uri: Uri?) {
+        if (uri == null) return
+        val saved = voiceCloneStore.saveSampleFromUri(uri)
+        _uiState.update {
+            it.copy(
+                voiceCloneConfig = voiceCloneStore.getConfig(),
+                voiceTestMessage = if (saved) {
+                    "Voice sample saved!"
+                } else {
+                    "Could not read selected audio file."
+                }
+            )
+        }
+    }
+
+    fun createRecordingTempFile(): File = voiceCloneStore.createRecordingTempFile()
+
+    fun onVoiceSampleRecorded(tempFile: File) {
+        val saved = voiceCloneStore.commitRecordedSample(tempFile)
+        _uiState.update {
+            it.copy(
+                voiceCloneConfig = voiceCloneStore.getConfig(),
+                voiceTestMessage = if (saved) {
+                    "Mic voice sample saved!"
+                } else {
+                    "Recording was empty or too short."
+                }
+            )
+        }
+    }
+
+    fun testVoiceServer(serverUrl: String, secretPin: String) {
+        if (_uiState.value.isTestingVoiceServer) return
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(isTestingVoiceServer = true, voiceTestMessage = "Checking Modal server…")
+            }
+            val result = personalVoiceApi.testConnection(serverUrl, secretPin)
+            _uiState.update {
+                it.copy(
+                    isTestingVoiceServer = false,
+                    voiceTestMessage = result.fold(
+                        onSuccess = { msg -> msg },
+                        onFailure = { err -> "Test failed: ${err.message ?: "Connection error"}" }
+                    )
+                )
+            }
+        }
+    }
+
+    fun clearVoiceTestMessage() {
+        _uiState.update { it.copy(voiceTestMessage = null) }
+    }
+
     fun onBgmSelected(uri: Uri?) {
         if (uri == null) return
         val fileName = resolveDisplayName(uri) ?: "Custom Audio"
@@ -109,6 +184,12 @@ class VideoViewModel @Inject constructor(
             return
         }
 
+        val effectiveScriptGender = if (currentState.selectedGender == VoiceGender.MY_VOICE) {
+            if (currentState.voiceCloneConfig.baseIsFemale) VoiceGender.FEMALE else VoiceGender.MALE
+        } else {
+            currentState.selectedGender
+        }
+
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -122,7 +203,7 @@ class VideoViewModel @Inject constructor(
                     topic = topic,
                     isShorts = currentState.isShorts,
                     language = currentState.selectedLanguage,
-                    voiceGender = currentState.selectedGender
+                    voiceGender = effectiveScriptGender
                 )
                 _uiState.update {
                     it.copy(
