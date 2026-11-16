@@ -47,6 +47,17 @@ private data class VttCue(
     val cleanLength: Int
 )
 
+private enum class BgmStyle {
+    COMEDY_ROAST,
+    EPIC_ACTION,
+    SUSPENSE_THRILLER,
+    EMOTIONAL_SAD,
+    DEVOTIONAL,
+    SCI_FI_TECH,
+    MOTIVATIONAL,
+    HORROR_DARK
+}
+
 class VideoRenderEngine @Inject constructor(
     private val videoRepository: VideoRepository,
     @ApplicationContext private val context: Context
@@ -115,7 +126,8 @@ class VideoRenderEngine @Inject constructor(
             val bgmBedFile = prepareBgmBed(
                 renderDirectory = renderDirectory,
                 mood = script.bgm_mood,
-                customBgmUri = customBgmUri
+                customBgmUri = customBgmUri,
+                bgmSeed = baseSeed
             )
 
             val videoSegmentFiles = mutableListOf<File>()
@@ -408,7 +420,8 @@ class VideoRenderEngine @Inject constructor(
     private fun prepareBgmBed(
         renderDirectory: File,
         mood: String,
-        customBgmUri: Uri?
+        customBgmUri: Uri?,
+        bgmSeed: Int
     ): File? {
         if (customBgmUri != null) {
             val copiedCustom = runCatching {
@@ -426,13 +439,15 @@ class VideoRenderEngine @Inject constructor(
 
         val synthFile = File(renderDirectory, "bgm_bed.wav")
         return runCatching {
-            writeCinematicBgmWav(synthFile, mood)
+            writeCinematicBgmWav(synthFile, mood, bgmSeed)
             synthFile.takeIf { it.exists() && it.length() > 1024L }
         }.getOrNull()
     }
 
     private fun copyOptionalRawAudio(renderDirectory: File, mood: String): File? {
-        val candidates = listOf("bgm_${mood.lowercase()}", "bgm_epic")
+        val cleanMood = mood.lowercase().trim()
+        val shortMood = cleanMood.substringBefore('_')
+        val candidates = listOf("bgm_$cleanMood", "bgm_$shortMood", "bgm_epic").distinct()
         for (name in candidates) {
             val resId = context.resources.getIdentifier(name, "raw", context.packageName)
             if (resId != 0) {
@@ -446,58 +461,299 @@ class VideoRenderEngine @Inject constructor(
         return null
     }
 
-    private fun writeCinematicBgmWav(outputFile: File, mood: String) {
-        val sampleRate = 44100
-        val durationSeconds = 16
-        val totalSamples = sampleRate * durationSeconds
+    private fun resolveBgmStyle(mood: String): BgmStyle {
+        val normalized = mood.lowercase().trim()
+        return when {
+            normalized.contains("roast") || normalized.contains("comedy") ||
+                normalized.contains("funny") || normalized.contains("satire") -> BgmStyle.COMEDY_ROAST
+            normalized.contains("horror") || normalized.contains("scary") -> BgmStyle.HORROR_DARK
+            normalized.contains("suspense") || normalized.contains("thriller") ||
+                normalized.contains("mystery") || normalized.contains("crime") -> BgmStyle.SUSPENSE_THRILLER
+            normalized.contains("emotional") || normalized.contains("sad") ||
+                normalized.contains("drama") -> BgmStyle.EMOTIONAL_SAD
+            normalized.contains("devotional") || normalized.contains("spiritual") ||
+                normalized.contains("myth") -> BgmStyle.DEVOTIONAL
+            normalized.contains("sci") || normalized.contains("tech") ||
+                normalized.contains("cyber") || normalized.contains("future") -> BgmStyle.SCI_FI_TECH
+            normalized.contains("motiv") || normalized.contains("inspir") ||
+                normalized.contains("success") -> BgmStyle.MOTIVATIONAL
+            else -> BgmStyle.EPIC_ACTION
+        }
+    }
 
-        val chords: Array<DoubleArray> = when (mood.lowercase()) {
-            "devotional" -> arrayOf(
-                doubleArrayOf(130.81, 196.00, 261.63, 329.63),
-                doubleArrayOf(174.61, 220.00, 261.63, 349.23),
-                doubleArrayOf(196.00, 246.94, 293.66, 392.00),
-                doubleArrayOf(130.81, 196.00, 261.63, 329.63)
-            )
-            "emotional" -> arrayOf(
-                doubleArrayOf(174.61, 220.00, 261.63, 349.23),
-                doubleArrayOf(130.81, 196.00, 261.63, 329.63),
-                doubleArrayOf(146.83, 220.00, 293.66, 349.23),
-                doubleArrayOf(196.00, 246.94, 293.66, 392.00)
-            )
-            else -> arrayOf(
-                doubleArrayOf(146.83, 220.00, 293.66, 349.23),
-                doubleArrayOf(116.54, 174.61, 233.08, 293.66),
-                doubleArrayOf(130.81, 196.00, 261.63, 329.63),
-                doubleArrayOf(110.00, 164.81, 220.00, 277.18)
-            )
+    private fun writeCinematicBgmWav(outputFile: File, mood: String, bgmSeed: Int) {
+        val sampleRate = 44100
+        val style = resolveBgmStyle(mood)
+
+        // Shift key and arpeggio pattern per topic so no two videos sound identical.
+        val semitoneShifts = intArrayOf(-3, -2, 0, 2, 3)
+        val semitoneShift = semitoneShifts[(bgmSeed and 0x7FFFFFFF) % semitoneShifts.size]
+        val pitchScale = 2.0.pow(semitoneShift / 12.0)
+        val arpVariant = ((bgmSeed ushr 4) and 0x7FFFFFFF) % 3
+
+        val beatDuration: Double
+        val beatsPerLoop: Int
+        val baseChords: Array<DoubleArray>
+
+        when (style) {
+            BgmStyle.COMEDY_ROAST -> {
+                beatDuration = 0.50 // 120 BPM bouncy
+                beatsPerLoop = 32   // 16.0s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(261.63, 329.63, 392.00, 523.25), // C
+                    doubleArrayOf(196.00, 246.94, 293.66, 392.00), // G
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00), // Am
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23)  // F
+                )
+            }
+            BgmStyle.SUSPENSE_THRILLER -> {
+                beatDuration = 0.75 // 80 BPM tense clock
+                beatsPerLoop = 16   // 12.0s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(164.81, 196.00, 246.94, 329.63), // Em
+                    doubleArrayOf(164.81, 174.61, 220.00, 349.23), // F/E tension
+                    doubleArrayOf(164.81, 196.00, 246.94, 329.63), // Em
+                    doubleArrayOf(155.56, 185.00, 220.00, 311.13)  // D#dim
+                )
+            }
+            BgmStyle.EMOTIONAL_SAD -> {
+                beatDuration = 0.80 // 75 BPM gentle piano
+                beatsPerLoop = 16   // 12.8s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00), // Am
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23), // F
+                    doubleArrayOf(130.81, 196.00, 261.63, 329.63), // C
+                    doubleArrayOf(196.00, 246.94, 293.66, 392.00)  // G
+                )
+            }
+            BgmStyle.DEVOTIONAL -> {
+                beatDuration = 0.75 // 80 BPM serene
+                beatsPerLoop = 16   // 12.0s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(130.81, 196.00, 261.63, 293.66), // Csus2
+                    doubleArrayOf(174.61, 220.00, 261.63, 392.00), // Fadd9
+                    doubleArrayOf(196.00, 261.63, 293.66, 392.00), // Gsus4
+                    doubleArrayOf(130.81, 196.00, 261.63, 329.63)  // C
+                )
+            }
+            BgmStyle.SCI_FI_TECH -> {
+                beatDuration = 0.50 // 120 BPM synthwave
+                beatsPerLoop = 32   // 16.0s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00), // Am
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23), // F
+                    doubleArrayOf(146.83, 220.00, 293.66, 349.23), // Dm
+                    doubleArrayOf(164.81, 207.65, 246.94, 329.63)  // E
+                )
+            }
+            BgmStyle.MOTIVATIONAL -> {
+                beatDuration = 0.60 // 100 BPM inspiring
+                beatsPerLoop = 32   // 19.2s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(174.61, 220.00, 261.63, 349.23), // F
+                    doubleArrayOf(196.00, 246.94, 293.66, 392.00), // G
+                    doubleArrayOf(164.81, 196.00, 246.94, 329.63), // Em
+                    doubleArrayOf(220.00, 261.63, 329.63, 440.00)  // Am
+                )
+            }
+            BgmStyle.HORROR_DARK -> {
+                beatDuration = 0.80 // 75 BPM eerie
+                beatsPerLoop = 16   // 12.8s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(138.59, 164.81, 207.65, 277.18), // C#m
+                    doubleArrayOf(138.59, 196.00, 246.94, 293.66), // tritone tension
+                    doubleArrayOf(146.83, 174.61, 220.00, 293.66), // Dm
+                    doubleArrayOf(138.59, 196.00, 233.08, 277.18)  // dim
+                )
+            }
+            BgmStyle.EPIC_ACTION -> {
+                beatDuration = 0.46875 // 128 BPM driving war rhythm
+                beatsPerLoop = 32      // 15.0s seamless loop
+                baseChords = arrayOf(
+                    doubleArrayOf(146.83, 220.00, 293.66, 349.23), // Dm
+                    doubleArrayOf(116.54, 174.61, 233.08, 293.66), // Bb
+                    doubleArrayOf(130.81, 196.00, 261.63, 329.63), // C
+                    doubleArrayOf(110.00, 164.81, 220.00, 277.18)  // A
+                )
+            }
         }
 
-        val beatDuration = 0.5
-        val chordDuration = 4.0
+        val chords = Array(baseChords.size) { c ->
+            DoubleArray(baseChords[c].size) { n -> baseChords[c][n] * pitchScale }
+        }
+        val loopDuration = beatsPerLoop * beatDuration
+        val chordDuration = loopDuration / chords.size
+        val totalSamples = (loopDuration * sampleRate).roundToInt()
 
+        val arpOrder = when (arpVariant) {
+            0 -> intArrayOf(0, 1, 2, 3, 2, 1, 3, 2)
+            1 -> intArrayOf(0, 2, 1, 3, 0, 3, 2, 1)
+            else -> intArrayOf(3, 2, 1, 0, 1, 2, 3, 2)
+        }
+
+        val rand = Random(bgmSeed)
         writeMono16BitWav(outputFile, sampleRate, totalSamples) { i ->
             val t = i.toDouble() / sampleRate
             val chordIndex = ((t / chordDuration).toInt()).coerceIn(0, chords.size - 1)
             val chordLocalT = t - chordIndex * chordDuration
             val chord = chords[chordIndex]
-
-            val chordEnv = (chordLocalT / 0.15).coerceAtMost(1.0) *
-                ((chordDuration - chordLocalT) / 0.15).coerceAtMost(1.0)
-            val lfo = 0.85 + 0.15 * sin(2.0 * PI * 0.5 * t)
-
-            var pad = 0.0
-            for (freq in chord) {
-                pad += sin(2.0 * PI * freq * t) * 0.18 +
-                    sin(2.0 * PI * freq * 2.0 * t) * 0.06
-            }
-            pad *= chordEnv * lfo
-
             val beatT = t % beatDuration
-            val drumEnv = exp(-14.0 * beatT)
-            val drumFreq = 65.0 + 95.0 * exp(-25.0 * beatT)
-            val drum = sin(2.0 * PI * drumFreq * beatT) * drumEnv * 0.42
+            val beatNumber = (t / beatDuration).toInt()
+            val halfBeatT = t % (beatDuration * 0.5)
+            val quarterBeatT = t % (beatDuration * 0.25)
 
-            (pad + drum).coerceIn(-0.95, 0.95)
+            // Smooth cross-envelope so loop boundary at 0 / loopDuration never clicks.
+            val loopEnv = (t / 0.04).coerceAtMost(1.0) *
+                ((loopDuration - t) / 0.04).coerceAtMost(1.0)
+            val chordEnv = (chordLocalT / 0.12).coerceAtMost(1.0) *
+                ((chordDuration - chordLocalT) / 0.12).coerceAtMost(1.0)
+
+            val sample = when (style) {
+                BgmStyle.COMEDY_ROAST -> {
+                    // Bouncy staccato pluck chords on every half-beat + cheerful bass + off-beat snap
+                    val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
+                    val pluckFreq = chord[arpOrder[stepIdx]] * 1.5
+                    val pluckEnv = exp(-12.0 * halfBeatT)
+                    val pluck = (sin(2.0 * PI * pluckFreq * halfBeatT) +
+                        0.35 * sin(2.0 * PI * pluckFreq * 2.0 * halfBeatT)) * pluckEnv * 0.36
+
+                    val bassFreq = chord[0] * 0.5
+                    val bass = sin(2.0 * PI * bassFreq * beatT) * exp(-7.5 * beatT) * 0.34
+
+                    // Crisp snappy clap on odd beats (2 and 4)
+                    val isSnareBeat = (beatNumber % 2 == 1)
+                    val snap = if (isSnareBeat) {
+                        rand.nextDouble(-1.0, 1.0) * exp(-28.0 * beatT) * 0.26
+                    } else 0.0
+
+                    pluck + bass + snap
+                }
+                BgmStyle.SUSPENSE_THRILLER -> {
+                    // Ticking clock every half beat + slow heartbeat + eerie glassy chime on bar start
+                    val tick = (sin(2.0 * PI * 1950.0 * halfBeatT) * 0.5 +
+                        rand.nextDouble(-1.0, 1.0) * 0.5) * exp(-55.0 * halfBeatT) * 0.22
+
+                    val heartbeat = if (beatNumber % 2 == 0) {
+                        sin(2.0 * PI * 72.0 * beatT) * exp(-12.0 * beatT) * 0.40
+                    } else 0.0
+
+                    val bellFreq = chord[3] * 2.0
+                    val bell = sin(2.0 * PI * bellFreq * chordLocalT) * exp(-1.8 * chordLocalT) * 0.20
+
+                    val lowDrone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.20 +
+                        sin(2.0 * PI * chord[1] * t) * 0.10) * chordEnv
+
+                    tick + heartbeat + bell + lowDrone
+                }
+                BgmStyle.EMOTIONAL_SAD -> {
+                    // Warm felt piano chords + delicate top melody notes (NO drums)
+                    val pianoAttack = (chordLocalT / 0.025).coerceAtMost(1.0)
+                    val pianoDecay = exp(-1.4 * chordLocalT)
+                    var piano = 0.0
+                    for (freq in chord) {
+                        piano += sin(2.0 * PI * freq * t) * 0.18 +
+                            sin(2.0 * PI * freq * 2.0 * t) * 0.05
+                    }
+                    piano *= pianoAttack * pianoDecay
+
+                    val stepIdx = ((t / beatDuration).toInt()) % arpOrder.size
+                    val melodyFreq = chord[arpOrder[stepIdx]] * 2.0
+                    val melody = sin(2.0 * PI * melodyFreq * beatT) *
+                        (beatT / 0.015).coerceAtMost(1.0) * exp(-2.8 * beatT) * 0.24
+
+                    val warmPad = sin(2.0 * PI * chord[0] * 0.5 * t) * chordEnv * 0.22
+                    piano + melody + warmPad
+                }
+                BgmStyle.DEVOTIONAL -> {
+                    // Serene tanpura drone + bansuri vibrato melody + soft temple chime
+                    val drone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.22 +
+                        sin(2.0 * PI * chord[1] * t) * 0.12 +
+                        sin(2.0 * PI * chord[2] * t) * 0.08) * chordEnv
+
+                    val stepIdx = ((t / beatDuration).toInt()) % arpOrder.size
+                    val fluteFreq = chord[arpOrder[stepIdx]] * 2.0
+                    val vibrato = 1.0 + 0.008 * sin(2.0 * PI * 5.2 * t)
+                    val fluteEnv = sin(PI * (beatT / beatDuration).coerceIn(0.0, 1.0)).pow(0.8)
+                    val flute = sin(2.0 * PI * fluteFreq * vibrato * t) * fluteEnv * 0.24
+
+                    val bell = (sin(2.0 * PI * chord[3] * 2.0 * chordLocalT) +
+                        0.4 * sin(2.0 * PI * chord[3] * 4.0 * chordLocalT)) *
+                        exp(-2.6 * chordLocalT) * 0.16
+
+                    drone + flute + bell
+                }
+                BgmStyle.SCI_FI_TECH -> {
+                    // Fast 16th-note cyber synth arpeggio + punchy electronic kick + octave pad
+                    val stepIdx = ((t / (beatDuration * 0.25)).toInt()) % arpOrder.size
+                    val arpFreq = chord[arpOrder[stepIdx]] * 2.0
+                    val arp = (sin(2.0 * PI * arpFreq * quarterBeatT) +
+                        0.4 * sin(2.0 * PI * arpFreq * 2.0 * quarterBeatT)) *
+                        exp(-14.0 * quarterBeatT) * 0.28
+
+                    val pad = (sin(2.0 * PI * chord[0] * t) * 0.16 +
+                        sin(2.0 * PI * chord[2] * t) * 0.12) * chordEnv
+
+                    val kickFreq = 58.0 + 130.0 * exp(-30.0 * beatT)
+                    val kick = sin(2.0 * PI * kickFreq * beatT) * exp(-11.0 * beatT) * 0.36
+                    val hat = if (stepIdx % 2 == 1) {
+                        rand.nextDouble(-1.0, 1.0) * exp(-45.0 * quarterBeatT) * 0.12
+                    } else 0.0
+
+                    arp + pad + kick + hat
+                }
+                BgmStyle.MOTIVATIONAL -> {
+                    // Bright uplifting plucks + warm anthem pad + steady kick
+                    val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
+                    val arpFreq = chord[arpOrder[stepIdx]] * 1.5
+                    val arp = sin(2.0 * PI * arpFreq * halfBeatT) * exp(-7.5 * halfBeatT) * 0.28
+
+                    var pad = 0.0
+                    for (freq in chord) {
+                        pad += sin(2.0 * PI * freq * t) * 0.12
+                    }
+                    pad *= chordEnv
+
+                    val kickFreq = 62.0 + 95.0 * exp(-22.0 * beatT)
+                    val kick = sin(2.0 * PI * kickFreq * beatT) * exp(-10.0 * beatT) * 0.34
+                    arp + pad + kick
+                }
+                BgmStyle.HORROR_DARK -> {
+                    // Unsettling low drone + eerie shimmer + sparse metallic echo
+                    val lfo = 0.70 + 0.30 * sin(2.0 * PI * 0.35 * t)
+                    val drone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.28 +
+                        sin(2.0 * PI * chord[1] * t) * 0.16 +
+                        sin(2.0 * PI * chord[3] * 1.5 * t) * 0.08) * chordEnv * lfo
+
+                    val metalHit = if (beatNumber % 4 == 0) {
+                        (sin(2.0 * PI * 740.0 * beatT) * 0.6 + sin(2.0 * PI * 1185.0 * beatT) * 0.4) *
+                            exp(-2.4 * beatT) * 0.22
+                    } else 0.0
+
+                    drone + metalHit
+                }
+                BgmStyle.EPIC_ACTION -> {
+                    // Double-hit war drums + rich brassy fifths + heroic rising arpeggio
+                    var brass = 0.0
+                    for (freq in chord) {
+                        brass += sin(2.0 * PI * freq * t) * 0.14 +
+                            sin(2.0 * PI * freq * 2.0 * t) * 0.06 +
+                            sin(2.0 * PI * freq * 3.0 * t) * 0.03
+                    }
+                    brass *= chordEnv * (0.85 + 0.15 * sin(2.0 * PI * 0.6 * t))
+
+                    val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
+                    val motifFreq = chord[arpOrder[stepIdx]] * 1.5
+                    val motif = sin(2.0 * PI * motifFreq * halfBeatT) * exp(-9.0 * halfBeatT) * 0.20
+
+                    val drumFreq = 65.0 + 105.0 * exp(-26.0 * beatT)
+                    val mainDrum = sin(2.0 * PI * drumFreq * beatT) * exp(-13.0 * beatT) * 0.40
+                    val doubleHit = sin(2.0 * PI * 88.0 * halfBeatT) * exp(-18.0 * halfBeatT) * 0.18
+
+                    brass + motif + mainDrum + doubleHit
+                }
+            }
+
+            (sample * loopEnv).coerceIn(-0.92, 0.92)
         }
     }
 
@@ -635,7 +891,6 @@ class VideoRenderEngine @Inject constructor(
 
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
 
-        // Strictly bound every audio stream with atrim / -t before -i so amix never waits on infinite inputs.
         val args = when {
             bgmBedFile != null && sfxTrackFile != null -> arrayOf(
                 "-y",
@@ -644,7 +899,7 @@ class VideoRenderEngine @Inject constructor(
                 "-i", sfxTrackFile.absolutePath,
                 "-filter_complex",
                 "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
-                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.26[b];" +
+                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.25[b];" +
                     "[2:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.35[s];" +
                     "[v][b][s]amix=inputs=3:duration=first:normalize=0[aout]",
                 "-map", "[aout]",
@@ -661,7 +916,7 @@ class VideoRenderEngine @Inject constructor(
                 "-stream_loop", "-1", "-t", formattedDuration, "-i", bgmBedFile.absolutePath,
                 "-filter_complex",
                 "[0:a]apad,atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=1.0[v];" +
-                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.26[b];" +
+                    "[1:a]atrim=0:$formattedDuration,asetpts=PTS-STARTPTS,volume=0.25[b];" +
                     "[v][b]amix=inputs=2:duration=first:normalize=0[aout]",
                 "-map", "[aout]",
                 "-t", formattedDuration,
