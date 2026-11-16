@@ -1,5 +1,6 @@
 package com.rsmoviespot.data.repository
 
+import android.graphics.BitmapFactory
 import com.rsmoviespot.BuildConfig
 import com.rsmoviespot.data.api.CloudflareApi
 import com.rsmoviespot.data.api.CloudflareImageRequest
@@ -20,7 +21,9 @@ import dagger.Module
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -29,10 +32,15 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.ResponseBody
 import retrofit2.HttpException
+import java.io.File
 import java.io.IOException
+import java.net.URLEncoder
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -50,6 +58,12 @@ interface VideoRepository {
         seed: Int = 42
     ): ResponseBody
 
+    suspend fun downloadRealPhoto(
+        query: String,
+        usedUrls: MutableSet<String>,
+        destinationFile: File
+    ): Boolean
+
     suspend fun generateAudioForSlab(text: String): ResponseBody
 
     suspend fun generateContinuousAudioWithVtt(text: String): EdgeTtsSynthesisResult
@@ -65,7 +79,8 @@ interface VideoRepository {
 class VideoRepositoryImpl @Inject constructor(
     private val groqApi: GroqApi,
     private val cloudflareApi: CloudflareApi,
-    private val edgeTtsApi: EdgeTtsApi
+    private val edgeTtsApi: EdgeTtsApi,
+    private val okHttpClient: OkHttpClient
 ) : VideoRepository {
 
     private val json = Json {
@@ -230,6 +245,217 @@ class VideoRepositoryImpl @Inject constructor(
         }
     }
 
+    override suspend fun downloadRealPhoto(
+        query: String,
+        usedUrls: MutableSet<String>,
+        destinationFile: File
+    ): Boolean = withContext(Dispatchers.IO) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return@withContext false
+
+        val candidateUrls = linkedSetOf<String>()
+
+        runCatching { collectImdbPhotoCandidates(cleanQuery, candidateUrls) }
+        runCatching { collectWikipediaSummaryCandidates(cleanQuery, candidateUrls) }
+        runCatching { collectWikipediaSearchCandidates(cleanQuery, candidateUrls) }
+        runCatching { collectWikimediaCommonsCandidates(cleanQuery, candidateUrls) }
+
+        for (url in candidateUrls) {
+            if (url in usedUrls) continue
+            val downloaded = runCatching {
+                downloadAndValidateImageUrl(url, destinationFile)
+            }.getOrDefault(false)
+
+            if (downloaded) {
+                usedUrls.add(url)
+                return@withContext true
+            }
+        }
+
+        false
+    }
+
+    private fun collectImdbPhotoCandidates(
+        cleanQuery: String,
+        outUrls: MutableSet<String>
+    ) {
+        val normalized = cleanQuery.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        if (normalized.isBlank()) return
+        val firstChar = normalized.firstOrNull { it in 'a'..'z' || it in '0'..'9' } ?: 'x'
+        val encoded = URLEncoder.encode(normalized, "UTF-8")
+        val url = "https://v3.sg.media-imdb.com/suggestion/$firstChar/$encoded.json"
+
+        val bodyText = fetchJsonString(url) ?: return
+        val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
+        val results = root["d"] as? JsonArray ?: return
+
+        val queryWords = cleanQuery.lowercase().split(Regex("\\s+")).filter { it.length >= 2 }
+
+        for (item in results) {
+            val obj = item as? JsonObject ?: continue
+            val label = obj["l"]?.jsonPrimitive?.contentOrNull.orEmpty().lowercase()
+            val id = obj["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val matchesName = queryWords.isEmpty() || queryWords.any { label.contains(it) }
+            if (!matchesName && !id.startsWith("nm")) continue
+
+            val imgObj = obj["i"] as? JsonObject ?: continue
+            val imageUrl = imgObj["imageUrl"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+            val w = imgObj["width"]?.jsonPrimitive?.intOrNull ?: 0
+            val h = imgObj["height"]?.jsonPrimitive?.intOrNull ?: 0
+
+            if (imageUrl.startsWith("http") && (w == 0 || w >= 300) && (h == 0 || h >= 300)) {
+                outUrls.add(imageUrl)
+            }
+        }
+    }
+
+    private fun collectWikipediaSummaryCandidates(
+        cleanQuery: String,
+        outUrls: MutableSet<String>
+    ) {
+        val title = cleanQuery.replace(' ', '_')
+        val encodedTitle = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+        val url = "https://en.wikipedia.org/api/rest_v1/page/summary/$encodedTitle"
+        val bodyText = fetchJsonString(url) ?: return
+        val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
+
+        val original = (root["originalimage"] as? JsonObject)
+            ?.get("source")?.jsonPrimitive?.contentOrNull
+        val thumbnail = (root["thumbnail"] as? JsonObject)
+            ?.get("source")?.jsonPrimitive?.contentOrNull
+
+        listOfNotNull(original, thumbnail).forEach { imgUrl ->
+            if (isCleanPhotoUrl(imgUrl)) {
+                outUrls.add(imgUrl)
+            }
+        }
+    }
+
+    private fun collectWikipediaSearchCandidates(
+        cleanQuery: String,
+        outUrls: MutableSet<String>
+    ) {
+        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        val url =
+            "https://en.wikipedia.org/w/api.php?action=query&generator=search" +
+                "&gsrsearch=$encoded&gsrlimit=4&prop=pageimages" +
+                "&piprop=original|thumbnail&pithumbsize=1200&format=json"
+
+        val bodyText = fetchJsonString(url) ?: return
+        val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
+        val queryObj = root["query"] as? JsonObject ?: return
+        val pages = queryObj["pages"] as? JsonObject ?: return
+
+        for (pageElem in pages.values) {
+            val pageObj = pageElem as? JsonObject ?: continue
+            val orig = (pageObj["original"] as? JsonObject)
+                ?.get("source")?.jsonPrimitive?.contentOrNull
+            val thumb = (pageObj["thumbnail"] as? JsonObject)
+                ?.get("source")?.jsonPrimitive?.contentOrNull
+
+            listOfNotNull(orig, thumb).forEach { imgUrl ->
+                if (isCleanPhotoUrl(imgUrl)) {
+                    outUrls.add(imgUrl)
+                }
+            }
+        }
+    }
+
+    private fun collectWikimediaCommonsCandidates(
+        cleanQuery: String,
+        outUrls: MutableSet<String>
+    ) {
+        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        val url =
+            "https://commons.wikimedia.org/w/api.php?action=query&generator=search" +
+                "&gsrnamespace=6&gsrsearch=$encoded&gsrlimit=12&prop=imageinfo" +
+                "&iiprop=url|size|mime&iiurlwidth=1200&format=json"
+
+        val bodyText = fetchJsonString(url) ?: return
+        val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
+        val queryObj = root["query"] as? JsonObject ?: return
+        val pages = queryObj["pages"] as? JsonObject ?: return
+
+        for (pageElem in pages.values) {
+            val pageObj = pageElem as? JsonObject ?: continue
+            val title = pageObj["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val imageInfo = (pageObj["imageinfo"] as? JsonArray)
+                ?.firstOrNull() as? JsonObject ?: continue
+
+            val mime = imageInfo["mime"]?.jsonPrimitive?.contentOrNull.orEmpty().lowercase()
+            val width = imageInfo["width"]?.jsonPrimitive?.intOrNull ?: 0
+            val height = imageInfo["height"]?.jsonPrimitive?.intOrNull ?: 0
+            val thumbUrl = imageInfo["thumburl"]?.jsonPrimitive?.contentOrNull
+            val fullUrl = imageInfo["url"]?.jsonPrimitive?.contentOrNull
+
+            if (mime != "image/jpeg" && mime != "image/png") continue
+            if (width < 400 || height < 400) continue
+
+            val chosen = thumbUrl ?: fullUrl ?: continue
+            if (isCleanPhotoUrl(title) && isCleanPhotoUrl(chosen)) {
+                outUrls.add(chosen)
+            }
+        }
+    }
+
+    private fun isCleanPhotoUrl(urlOrTitle: String): Boolean {
+        val lower = urlOrTitle.lowercase()
+        if (lower.endsWith(".svg") || lower.endsWith(".gif") || lower.endsWith(".pdf")) return false
+        val bannedTokens = listOf(
+            "signature", "autograph", "logo", "icon", "flag", "map",
+            "diagram", "chart", "coat_of_arms", "emblem", "stamp", "locator"
+        )
+        return bannedTokens.none { lower.contains(it) }
+    }
+
+    private fun fetchJsonString(url: String): String? {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", WIKIMEDIA_USER_AGENT)
+            .header("Accept", "application/json")
+            .build()
+
+        okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return null
+            return response.body?.string()?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun downloadAndValidateImageUrl(url: String, destinationFile: File): Boolean {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", WIKIMEDIA_USER_AGENT)
+            .build()
+
+        okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return false
+            val contentType = response.header("Content-Type").orEmpty().lowercase()
+            if (contentType.isNotBlank() &&
+                (!contentType.startsWith("image/") || contentType.contains("svg"))
+            ) {
+                return false
+            }
+
+            val body = response.body ?: return false
+            destinationFile.outputStream().use { out ->
+                body.byteStream().use { input -> input.copyTo(out) }
+            }
+        }
+
+        if (!destinationFile.exists() || destinationFile.length() < 8192L) {
+            destinationFile.delete()
+            return false
+        }
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(destinationFile.absolutePath, bounds)
+        if (bounds.outWidth < 300 || bounds.outHeight < 300) {
+            destinationFile.delete()
+            return false
+        }
+        return true
+    }
+
     override suspend fun generateAudioForSlab(text: String): ResponseBody {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
         return edgeTtsApi.synthesize(
@@ -310,6 +536,16 @@ class VideoRepositoryImpl @Inject constructor(
             val prompt = dto.imagePrompt.trim()
             val sfxCue = dto.sfxCue?.trim()?.lowercase()?.ifBlank { "whoosh" } ?: "whoosh"
             val emotion = dto.voiceEmotion?.trim()?.lowercase()?.ifBlank { "normal" } ?: "normal"
+            val realQuery = dto.realPhotoQuery?.trim().orEmpty()
+            val visualSource = if (
+                dto.visualSource?.trim()?.equals("real_photo", ignoreCase = true) == true &&
+                realQuery.isNotBlank()
+            ) {
+                "real_photo"
+            } else {
+                "ai_generated"
+            }
+
             if (voiceover.isBlank() || prompt.isBlank()) {
                 null
             } else {
@@ -319,7 +555,9 @@ class VideoRepositoryImpl @Inject constructor(
                     image_prompt = prompt,
                     sfx_cue = sfxCue,
                     has_character = dto.hasCharacter ?: false,
-                    voice_emotion = emotion
+                    voice_emotion = emotion,
+                    visual_source = visualSource,
+                    real_photo_query = if (visualSource == "real_photo") realQuery else ""
                 )
             }
         }
@@ -395,14 +633,14 @@ class VideoRepositoryImpl @Inject constructor(
                 )
                 lastError = wrapped
                 if ((code == 429 || code in 500..599) && attempt < MAX_API_ATTEMPTS - 1) {
-                    delay(1500L * (attempt + 1))
+                    delay(2000L * (attempt + 1))
                 } else {
                     throw wrapped
                 }
             } catch (error: IOException) {
                 lastError = error
                 if (attempt < MAX_API_ATTEMPTS - 1) {
-                    delay(1500L * (attempt + 1))
+                    delay(2000L * (attempt + 1))
                 } else {
                     throw error
                 }
@@ -424,12 +662,17 @@ class VideoRepositoryImpl @Inject constructor(
         @SerialName("has_character")
         val hasCharacter: Boolean? = null,
         @SerialName("voice_emotion")
-        val voiceEmotion: String? = null
+        val voiceEmotion: String? = null,
+        @SerialName("visual_source")
+        val visualSource: String? = null,
+        @SerialName("real_photo_query")
+        val realPhotoQuery: String? = null
     )
 
     private companion object {
-        const val MAX_API_ATTEMPTS = 3
+        const val MAX_API_ATTEMPTS = 5
         const val FULL_SCRIPT_WORD_THRESHOLD = 25
+        const val WIKIMEDIA_USER_AGENT = "RSMovieSpot/1.0 (https://rsmoviespot.app)"
 
         const val SHORTS_IMAGE_WIDTH = 768
         const val SHORTS_IMAGE_HEIGHT = 1344
@@ -445,14 +688,20 @@ class VideoRepositoryImpl @Inject constructor(
             "filmstrip, multi-panel, stacked frames, comic panels, grid, storyboard, collage, split screen, text, watermark, signature, logo, letters, words, ui, interface, comment box, subscribe button, social media, website, poster, title card, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers"
 
         const val IMAGE_PROMPT_RULES =
-            "IMAGE PROMPT RULES (STRICT):\n" +
+            "REAL PHOTO vs AI IMAGE RULES (VERY IMPORTANT):\n" +
+                "- Whenever a scene directly introduces or highlights a REAL-WORLD actor, actress, or director by name (such as Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Yash, Shah Rukh Khan, Salman Khan, etc.):\n" +
+                "  Set visual_source='real_photo' and real_photo_query to ONLY that single celebrity's clean English name (e.g. 'Prabhas' or 'Sandeep Reddy Vanga' — NEVER mix movie names into real_photo_query).\n" +
+                "- For ALL OTHER SCENES (action sequences, dark violence, blood/box-office hype, cinema theater crowds, fierce cop silhouette/avatar, record-breaking shots, symbolic comparisons, and final comment CTA):\n" +
+                "  Set visual_source='ai_generated' and real_photo_query='' so those visuals are 100% AI-generated cinematic scenes.\n" +
+                "- ALWAYS fill a high-quality English image_prompt even for real_photo scenes as an automatic fallback.\n\n" +
+                "IMAGE PROMPT RULES (STRICT):\n" +
                 "- Describe ONLY physical characters, environments, lighting, and cinematic action.\n" +
                 "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text' in image_prompt, even if voiceover mentions commenting or box office numbers.\n" +
-                "- NEVER write real celebrity/actor names (like Sunny Deol or Prabhas) inside image_prompt or character_bible — describe the iconic visual character directly (e.g. muscular divine Vanara warrior with golden mace gada, saffron dhoti, glowing aura) so the image generator renders the exact mythic/cinematic figure.\n" +
-                "- For metaphors like 'पूरी दुनिया देखेगी' or 'वर्ल्ड रिकॉर्ड', NEVER ask for Earth globes or world maps — describe roaring packed cinema crowds, grand glowing Indian temples, or triumphant hero action.\n" +
-                "- For the final call-to-action scene, always generate an epic triumphant hero shot of the main character (or a grand cinematic climax shot if no hero).\n" +
-                "- Set has_character=false when showing crowds, audiences, forts, battlefields, cinema halls, or environments; set has_character=true only when the main character from character_bible is directly in frame.\n" +
-                "- Vary camera angles constantly across consecutive scenes (wide aerial, close-up eyes, over-the-shoulder, silhouette, battlefield, palace interior).\n\n"
+                "- NEVER write real celebrity/actor names inside image_prompt or character_bible — describe the iconic visual figure/silhouette directly (e.g. rugged intense Indian police officer in khaki uniform in pouring rain) so the AI generator never hallucinates random faces.\n" +
+                "- For metaphors like 'पूरी दुनिया देखेगी' or 'वर्ल्ड रिकॉर्ड', NEVER ask for Earth globes or world maps — describe roaring packed cinema crowds, shattering glass/action, or triumphant hero shots.\n" +
+                "- For the final call-to-action scene, set visual_source='ai_generated' and generate an epic triumphant/intense cinematic shot.\n" +
+                "- Set has_character=false when showing crowds, audiences, theaters, battlefields, or environments; set has_character=true only when the main cinematic character is directly in frame.\n" +
+                "- Vary camera angles constantly across consecutive scenes.\n\n"
 
         const val VOICE_AND_BGM_RULES =
             "VOICE EMOTION & BGM RULES:\n" +
@@ -471,6 +720,8 @@ class VideoRepositoryImpl @Inject constructor(
                 "    {\n" +
                 "      \"voiceover_text\": \"Narration segment in target language\",\n" +
                 "      \"voice_emotion\": \"hook | suspense | climax | question | normal\",\n" +
+                "      \"visual_source\": \"real_photo | ai_generated\",\n" +
+                "      \"real_photo_query\": \"Clean English celebrity name (e.g. 'Prabhas') if visual_source='real_photo', else ''\",\n" +
                 "      \"has_character\": false,\n" +
                 "      \"image_prompt\": \"English physical visual description only (NO text/UI/posters/comment box/actor names/world map)\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
