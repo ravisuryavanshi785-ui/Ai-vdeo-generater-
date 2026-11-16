@@ -1,10 +1,14 @@
 package com.rsmoviespot.ui
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,314 +17,406 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.rsmoviespot.domain.models.VideoLanguage
+import com.rsmoviespot.domain.models.VoiceGender
+
+private val NeonGreen = Color(0xFF39FF14)
+private val DarkBg = Color(0xFF0A0E0B)
+private val CardBg = Color(0xFF141A15)
+private val SelectedChipBg = Color(0xFF1B3A18)
+private val BorderGreen = Color(0xFF285C22)
+private val TextMuted = Color(0xFFA0ACA2)
 
 @Composable
 fun MainScreen(
     viewModel: VideoViewModel = hiltViewModel()
 ) {
-    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        viewModel.startGeneratingVideo()
-    }
 
     val bgmPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        viewModel.onBgmSelected(uri)
-    }
-
-    val onGenerateClick: () -> Unit = {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val hasPermission = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-
-            if (hasPermission) {
-                viewModel.startGeneratingVideo()
-            } else {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
             }
-        } else {
-            viewModel.startGeneratingVideo()
+            viewModel.onBgmSelected(uri)
         }
     }
 
-    val isBusy = state.isGenerating || state.isPreviewingScript
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        viewModel.startGeneratingVideo()
+    }
 
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background
-    ) { contentPadding ->
-        Column(
+    val chipColors = FilterChipDefaults.filterChipColors(
+        selectedContainerColor = SelectedChipBg,
+        selectedLabelColor = NeonGreen,
+        containerColor = CardBg,
+        labelColor = Color.White
+    )
+    val chipBorder = FilterChipDefaults.filterChipBorder(
+        enabled = true,
+        selected = false,
+        borderColor = BorderGreen,
+        selectedBorderColor = NeonGreen
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(DarkBg)
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Text(
+            text = "RS MOVIE SPOT",
+            color = NeonGreen,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.2.sp
+        )
+        Text(
+            text = "AI Video Generator",
+            color = Color.White,
+            fontSize = 28.sp,
+            fontWeight = FontWeight.ExtraBold
+        )
+        Text(
+            text = "Enter a short topic or paste your full script.",
+            color = TextMuted,
+            fontSize = 14.sp
+        )
+
+        OutlinedTextField(
+            value = uiState.topic,
+            onValueChange = viewModel::onTopicChanged,
+            label = { Text("Topic or full script (>25 words = exact script)") },
             modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(contentPadding)
-                .padding(horizontal = 24.dp, vertical = 32.dp),
-            verticalArrangement = Arrangement.spacedBy(20.dp)
+                .fillMaxWidth()
+                .height(130.dp),
+            enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = NeonGreen,
+                unfocusedBorderColor = BorderGreen,
+                focusedLabelColor = NeonGreen,
+                unfocusedLabelColor = TextMuted,
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                cursorColor = NeonGreen
+            )
+        )
+
+        Text(
+            text = "Choose video format",
+            color = Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            FilterChip(
+                selected = uiState.isShorts,
+                onClick = { viewModel.onShortsChanged(true) },
+                enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                label = { Text("Shorts · 9:16") },
+                colors = chipColors,
+                border = chipBorder
+            )
+            FilterChip(
+                selected = !uiState.isShorts,
+                onClick = { viewModel.onShortsChanged(false) },
+                enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                label = { Text("YouTube · 16:9") },
+                colors = chipColors,
+                border = chipBorder
+            )
+        }
+
+        Text(
+            text = "Language & Voice",
+            color = Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    text = "RS MOVIE SPOT",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "AI Video Generator",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "Turn a topic into a ready-to-share video.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+            VideoLanguage.entries.forEach { language ->
+                FilterChip(
+                    selected = uiState.selectedLanguage == language,
+                    onClick = { viewModel.onLanguageSelected(language) },
+                    enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                    label = { Text(language.label) },
+                    colors = chipColors,
+                    border = chipBorder
                 )
             }
+        }
 
-            OutlinedTextField(
-                value = state.topic,
-                onValueChange = viewModel::onTopicChanged,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Topic & instructions") },
-                placeholder = { Text("e.g. Shivaji Maharaj 1 minute epic story, 10 scenes") },
-                minLines = 2,
-                maxLines = 5,
-                enabled = !isBusy,
-                keyboardOptions = KeyboardOptions(
-                    capitalization = KeyboardCapitalization.Sentences
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            VoiceGender.entries.forEach { gender ->
+                FilterChip(
+                    selected = uiState.selectedGender == gender,
+                    onClick = { viewModel.onGenderSelected(gender) },
+                    enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                    label = { Text("${gender.label} Voice") },
+                    colors = chipColors,
+                    border = chipBorder
                 )
-            )
+            }
+        }
 
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    text = "Choose video format",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+        Text(
+            text = "Background music (optional)",
+            color = Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = { bgmPickerLauncher.launch(arrayOf("audio/*")) },
+                enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(24.dp),
+                border = BorderStroke(1.dp, BorderGreen),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+            ) {
+                Text(uiState.selectedBgmName, maxLines = 1)
+            }
+            if (uiState.selectedBgmUri != null) {
+                OutlinedButton(
+                    onClick = viewModel::clearBgm,
+                    enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, BorderGreen),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
                 ) {
-                    FilterChip(
-                        selected = state.isShorts,
-                        onClick = { viewModel.onShortsChanged(true) },
-                        enabled = !isBusy,
-                        label = { Text("Shorts · 9:16") }
-                    )
-                    FilterChip(
-                        selected = !state.isShorts,
-                        onClick = { viewModel.onShortsChanged(false) },
-                        enabled = !isBusy,
-                        label = { Text("YouTube · 16:9") }
-                    )
+                    Text("Reset")
                 }
             }
+        }
 
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            OutlinedButton(
+                onClick = viewModel::previewScript,
+                enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(50.dp),
+                shape = RoundedCornerShape(25.dp),
+                border = BorderStroke(1.dp, BorderGreen),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+            ) {
                 Text(
-                    text = "Background music (optional)",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onBackground
+                    text = when {
+                        uiState.isPreviewingScript -> "Writing…"
+                        uiState.draftScript != null -> "Regenerate"
+                        else -> "Preview Script"
+                    },
+                    fontWeight = FontWeight.SemiBold
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedButton(
-                        onClick = { bgmPickerLauncher.launch(arrayOf("audio/*")) },
-                        enabled = !isBusy,
-                        modifier = Modifier.weight(1f)
+            }
+
+            Button(
+                onClick = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.POST_NOTIFICATIONS
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        viewModel.startGeneratingVideo()
+                    }
+                },
+                enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(50.dp),
+                shape = RoundedCornerShape(25.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NeonGreen,
+                    contentColor = Color.Black,
+                    disabledContainerColor = Color(0xFF233024),
+                    disabledContentColor = TextMuted
+                )
+            ) {
+                Text(
+                    text = if (uiState.isGenerating) "Rendering…" else "Generate Video",
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        if (uiState.isGenerating) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = CardBg),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = state.selectedBgmName,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            text = uiState.progressText.ifBlank { "Working…" },
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "${uiState.progressPercentage}%",
+                            color = NeonGreen,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
                         )
                     }
-                    if (state.selectedBgmUri != null) {
-                        TextButton(
-                            onClick = viewModel::clearBgm,
-                            enabled = !isBusy
-                        ) {
-                            Text("Reset")
-                        }
-                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    LinearProgressIndicator(
+                        progress = { (uiState.progressPercentage / 100f).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = NeonGreen,
+                        trackColor = Color(0xFF263327)
+                    )
                 }
             }
+        }
 
+        if (uiState.statusMessage.isNotBlank()) {
+            val isError = uiState.statusMessage.contains("failed", ignoreCase = true) ||
+                uiState.statusMessage.contains("error", ignoreCase = true)
+            Text(
+                text = uiState.statusMessage,
+                color = if (isError) Color(0xFFFF6B6B) else NeonGreen,
+                fontSize = 14.sp
+            )
+        }
+
+        uiState.generatedVideoUri?.let { videoUri ->
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                OutlinedButton(
-                    onClick = viewModel::previewScript,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(56.dp),
-                    enabled = !isBusy && state.topic.isNotBlank()
-                ) {
-                    if (state.isPreviewingScript) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.height(18.dp),
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Text(
-                            text = if (state.draftScript != null) "Regenerate" else "Preview Script",
-                            maxLines = 1
-                        )
-                    }
-                }
-
                 Button(
-                    onClick = onGenerateClick,
-                    modifier = Modifier
-                        .weight(1.3f)
-                        .height(56.dp),
-                    enabled = !isBusy && state.topic.isNotBlank(),
+                    onClick = {
+                        val playIntent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(videoUri, "video/mp4")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        runCatching { context.startActivity(playIntent) }
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(24.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary
+                        containerColor = NeonGreen,
+                        contentColor = Color.Black
                     )
                 ) {
-                    if (state.isGenerating) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.height(20.dp),
-                            color = MaterialTheme.colorScheme.onPrimary,
-                            strokeWidth = 2.dp
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text("Rendering…")
-                    } else {
-                        Text("Generate Video", fontWeight = FontWeight.Bold)
-                    }
+                    Text("Play Video", fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(
+                    onClick = {
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "video/mp4"
+                            putExtra(Intent.EXTRA_STREAM, videoUri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        runCatching {
+                            context.startActivity(Intent.createChooser(shareIntent, "Share Video"))
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, NeonGreen),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+                ) {
+                    Text("Share Video", fontWeight = FontWeight.SemiBold)
                 }
             }
+        }
 
-            val draftScript = state.draftScript
-            if (draftScript != null && !state.isGenerating) {
+        uiState.draftScript?.let { script ->
+            Text(
+                text = "Script Preview (${script.slabs.size} scenes · ${script.voice_name})",
+                color = NeonGreen,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold
+            )
+            script.slabs.forEachIndexed { index, slab ->
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
+                    colors = CardDefaults.cardColors(containerColor = CardBg),
+                    shape = RoundedCornerShape(12.dp)
                 ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
                         Text(
-                            text = "Script Preview (${draftScript.slabs.size} scenes · Editable)",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.Bold
+                            text = "Scene ${index + 1} · ${slab.voice_emotion} · ${slab.sfx_cue}",
+                            color = TextMuted,
+                            fontSize = 12.sp
                         )
-                        draftScript.slabs.forEachIndexed { index, slab ->
-                            OutlinedTextField(
-                                value = slab.voiceover_text,
-                                onValueChange = { viewModel.onSlabVoiceoverChanged(index, it) },
-                                modifier = Modifier.fillMaxWidth(),
-                                label = { Text("Scene ${index + 1} (${slab.sfx_cue})") },
-                                minLines = 2,
-                                maxLines = 4
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (state.isGenerating || state.progressText.isNotBlank()) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Row(
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = slab.voiceover_text,
+                            onValueChange = { viewModel.onSlabVoiceoverChanged(index, it) },
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = state.progressText.ifBlank { "Preparing…" },
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurface
+                            enabled = !uiState.isGenerating,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = NeonGreen,
+                                unfocusedBorderColor = BorderGreen,
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
                             )
-                            Text(
-                                text = "${state.progressPercentage}%",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-
-                        LinearProgressIndicator(
-                            progress = state.progressPercentage / 100f,
-                            modifier = Modifier.fillMaxWidth(),
-                            color = MaterialTheme.colorScheme.primary,
-                            trackColor = MaterialTheme.colorScheme.surface
-                        )
-                    }
-                }
-            }
-
-            if (state.statusMessage.isNotBlank()) {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(
-                        text = state.statusMessage,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (state.generatedVideoUri != null) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.error
-                        }
-                    )
-
-                    val videoUri = state.generatedVideoUri
-                    if (videoUri != null) {
-                        Text(
-                            text = "Gallery URI: $videoUri",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
