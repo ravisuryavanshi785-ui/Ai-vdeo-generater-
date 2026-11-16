@@ -85,6 +85,7 @@ class VideoRepositoryImpl @Inject constructor(
             appendLine("Format guideline: $defaultFormatGuide")
             appendLine("CRITICAL: Write ONE continuous, connected spoken Hindi script split smoothly across the 'slabs' array — reading every slab's voiceover_text back-to-back must sound like ONE single unbroken storyteller, NEVER isolated bullet facts.")
             appendLine("CRITICAL FOR PHOTOS: Every slab's image_prompt must depict the exact thing/action happening in THAT slab's line (with varied settings/angles and has_character=false when no main character is needed).")
+            appendLine("CRITICAL FOR BGM: Choose the exact best 'bgm_mood' from [comedy_roast, epic_action, suspense_thriller, emotional_sad, devotional, sci_fi_tech, motivational, horror_dark] matching this specific topic's vibe.")
             appendLine("Note: Avoid unescaped double quotes inside JSON string values; use single quotes if quoting dialogue.")
         }
 
@@ -208,7 +209,7 @@ class VideoRepositoryImpl @Inject constructor(
 
         var characterBible = ""
         var visualStyle = ""
-        var bgmMood = "epic_dark"
+        var bgmMood = "epic_action"
 
         val slabElements: List<JsonElement> = when (root) {
             is JsonArray -> root
@@ -216,7 +217,7 @@ class VideoRepositoryImpl @Inject constructor(
                 characterBible = root["character_bible"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 visualStyle = root["visual_style"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 bgmMood = root["bgm_mood"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-                    .ifBlank { "epic_dark" }
+                    .ifBlank { "epic_action" }
 
                 val array = root["slabs"]
                     ?: root["scenes"]
@@ -366,11 +367,13 @@ class VideoRepositoryImpl @Inject constructor(
                 "- Each slab's image_prompt MUST visually show what is happening in THAT SPECIFIC line — NEVER repeat generic standing portraits!\n" +
                 "- Set has_character=false whenever the scene is about crowds, audiences, money/budget, green-screen VFX, locations, forts, battlefields, cinema halls, or objects. Only set has_character=true when the main character from character_bible is directly in that shot.\n" +
                 "- Vary shot types constantly: extreme close-up emotion, wide aerial view, over-the-shoulder, cinema theater audience reaction, messy green-screen studio, dramatic silhouette, burning torches, war map table.\n\n" +
+                "RULE 3 — MATCH BGM MOOD TO THE VIDEO:\n" +
+                "- Pick the exact fitting bgm_mood: 'comedy_roast' (roasts/funny/satire), 'epic_action' (history/war/action), 'suspense_thriller' (mystery/crime/thriller), 'emotional_sad' (drama/tribute/sad), 'devotional' (mythology/spiritual), 'sci_fi_tech' (space/AI/tech), 'motivational' (hustle/success), or 'horror_dark' (scary/ghost).\n\n" +
                 "Return ONLY valid JSON matching this schema:\n" +
                 "{\n" +
                 "  \"character_bible\": \"Unchanging look of main character in English (if topic has one main character, else empty string)\",\n" +
                 "  \"visual_style\": \"Unified cinematic visual style, color palette, lighting\",\n" +
-                "  \"bgm_mood\": \"epic_dark | devotional | suspense | sci_fi | emotional\",\n" +
+                "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
                 "  \"slabs\": [\n" +
                 "    {\n" +
                 "      \"voiceover_text\": \"Next continuous spoken Hindi segment in Devanagari\",\n" +
