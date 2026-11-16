@@ -5,9 +5,11 @@ import com.rsmoviespot.data.api.CloudflareApi
 import com.rsmoviespot.data.api.CloudflareImageRequest
 import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.EdgeTtsRequest
+import com.rsmoviespot.data.api.EdgeTtsSynthesisResult
 import com.rsmoviespot.data.api.GroqApi
 import com.rsmoviespot.data.api.GroqChatRequest
 import com.rsmoviespot.data.api.GroqMessage
+import com.rsmoviespot.data.api.GroqPlainChatRequest
 import com.rsmoviespot.data.api.GroqResponseFormat
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
@@ -40,6 +42,7 @@ interface VideoRepository {
         seed: Int = 42
     ): ResponseBody
     suspend fun generateAudioForSlab(text: String): ResponseBody
+    suspend fun generateContinuousAudioWithVtt(text: String): EdgeTtsSynthesisResult
 }
 
 @Singleton
@@ -54,6 +57,12 @@ class VideoRepositoryImpl @Inject constructor(
         isLenient = true
     }
 
+    private data class ScriptAttempt(
+        val modelId: String,
+        val useJsonMode: Boolean,
+        val maxTokens: Int
+    )
+
     override suspend fun generateScript(
         topic: String,
         isShorts: Boolean
@@ -64,48 +73,58 @@ class VideoRepositoryImpl @Inject constructor(
         }
 
         val defaultFormatGuide = if (isShorts) {
-            "Vertical 9:16 YouTube Shorts. Unless the user specifies another length or scene count, create 7 to 8 tightly connected scenes (~40-50 seconds total)."
+            "Vertical 9:16 YouTube Shorts. Unless the user specifies another length, create 8 to 10 tightly connected scenes (~40-50 seconds total)."
         } else {
-            "Horizontal 16:9 YouTube video. Unless the user specifies another length or scene count, create 9 to 12 tightly connected scenes (~65-85 seconds total)."
+            "Horizontal 16:9 YouTube video. Unless the user specifies another length, create 10 to 14 tightly connected scenes (~65-85 seconds total)."
         }
 
         val userPrompt = buildString {
-            appendLine("USER REQUEST (FOLLOW EVERY INSTRUCTION HERE STRICTLY):")
+            appendLine("USER TOPIC & INSTRUCTIONS (OBEY STRICTLY):")
             appendLine(topic.trim())
             appendLine()
             appendLine("Format guideline: $defaultFormatGuide")
-            appendLine("Narrative mandate: Write ONE seamless, gripping Hindi story from start to finish where every scene flows naturally out of the previous scene. NEVER write disconnected encyclopedia facts or standalone summaries.")
-            appendLine("If the user mentioned a specific duration (e.g. '1 minute', '30 sec'), exact scene count, specific style, or specific plot points, OBEY the user request above everything else.")
+            appendLine("CRITICAL: Write ONE continuous, connected spoken Hindi script split smoothly across the 'slabs' array — reading every slab's voiceover_text back-to-back must sound like ONE single unbroken storyteller, NEVER isolated bullet facts.")
+            appendLine("CRITICAL FOR PHOTOS: Every slab's image_prompt must depict the exact thing/action happening in THAT slab's line (with varied settings/angles and has_character=false when no main character is needed).")
+            appendLine("Note: Avoid unescaped double quotes inside JSON string values; use single quotes if quoting dialogue.")
         }
 
-        val modelsToTry = listOf(
-            "llama-3.3-70b-versatile",
-            "openai/gpt-oss-120b"
+        val messages = listOf(
+            GroqMessage(role = "system", content = SYSTEM_PROMPT),
+            GroqMessage(role = "user", content = userPrompt)
+        )
+
+        val attempts = listOf(
+            ScriptAttempt("llama-3.3-70b-versatile", useJsonMode = true, maxTokens = 6000),
+            ScriptAttempt("llama-3.3-70b-versatile", useJsonMode = false, maxTokens = 6000),
+            ScriptAttempt("openai/gpt-oss-120b", useJsonMode = false, maxTokens = 8192)
         )
 
         var lastError: Throwable? = null
-        for ((index, modelId) in modelsToTry.withIndex()) {
+        for ((index, attempt) in attempts.withIndex()) {
             try {
                 val response = callWithHttpUrl {
-                    groqApi.generateContent(
-                        authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
-                        request = GroqChatRequest(
-                            model = modelId,
-                            messages = listOf(
-                                GroqMessage(
-                                    role = "system",
-                                    content = SYSTEM_PROMPT
-                                ),
-                                GroqMessage(
-                                    role = "user",
-                                    content = userPrompt
-                                )
-                            ),
-                            temperature = 0.75,
-                            maxTokens = 4096,
-                            responseFormat = GroqResponseFormat(type = "json_object")
+                    if (attempt.useJsonMode) {
+                        groqApi.generateContent(
+                            authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
+                            request = GroqChatRequest(
+                                model = attempt.modelId,
+                                messages = messages,
+                                temperature = 0.75,
+                                maxTokens = attempt.maxTokens,
+                                responseFormat = GroqResponseFormat(type = "json_object")
+                            )
                         )
-                    )
+                    } else {
+                        groqApi.generateContentPlain(
+                            authHeader = "Bearer ${BuildConfig.GROQ_API_KEY}",
+                            request = GroqPlainChatRequest(
+                                model = attempt.modelId,
+                                messages = messages,
+                                temperature = 0.75,
+                                maxTokens = attempt.maxTokens
+                            )
+                        )
+                    }
                 }
 
                 val generatedText = response.choices
@@ -120,7 +139,7 @@ class VideoRepositoryImpl @Inject constructor(
                 throw cancelled
             } catch (error: Throwable) {
                 lastError = error
-                if (index == modelsToTry.lastIndex) {
+                if (index == attempts.lastIndex) {
                     throw error
                 }
             }
@@ -174,8 +193,17 @@ class VideoRepositoryImpl @Inject constructor(
         )
     }
 
+    override suspend fun generateContinuousAudioWithVtt(text: String): EdgeTtsSynthesisResult {
+        require(text.isNotBlank()) { "Voiceover text must not be blank." }
+        return edgeTtsApi.synthesizeWithSubtitles(
+            text = text,
+            voice = HINDI_VOICE
+        )
+    }
+
     private fun parseScriptResponse(rawText: String): VideoScriptResponse {
         val extractedJson = extractJsonPayload(rawText)
+            .replace(Regex(",\\s*([}\\]])"), "$1")
         val root = json.parseToJsonElement(extractedJson)
 
         var characterBible = ""
@@ -215,7 +243,7 @@ class VideoRepositoryImpl @Inject constructor(
                     voiceover_text = voiceover,
                     image_prompt = prompt,
                     sfx_cue = sfxCue,
-                    has_character = dto.hasCharacter ?: true
+                    has_character = dto.hasCharacter ?: false
                 )
             }
         }
@@ -325,27 +353,29 @@ class VideoRepositoryImpl @Inject constructor(
             "text, watermark, signature, logo, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers, collage, split screen"
 
         const val SYSTEM_PROMPT =
-            "You are an elite Hindi cinematic storyteller (like Nitish Rajput / Dhruv Rathee / top Indian documentary narrators) for RS Movie Spot.\n" +
-                "Your #1 problem to AVOID: NEVER write disconnected Wikipedia facts or bullet-point trivia across scenes! Every scene must feel like the very next breath of ONE gripping story.\n\n" +
-                "STRICT STORYTELLING RULES:\n" +
-                "1. FIRST write the ENTIRE story in the \"continuous_script\" JSON field as ONE unbroken spoken Hindi monologue with a clear arc: Hook -> Rising Tension -> Turning Point -> Climax -> Goosebumps Ending.\n" +
-                "2. THEN split that exact \"continuous_script\" sequentially into \"slabs\" (14-20 spoken Hindi words per slab for ~5 sec each, or as requested by user duration). Do NOT summarize or rewrite it into isolated facts inside slabs — reading all slabs back-to-back must sound like one smooth voiceover!\n" +
-                "3. SCENE-TO-SCENE CONTINUATION: Every slab (except the last) MUST leave curiosity or connect directly to the next slab using natural spoken Hindi bridges like: \"लेकिन असली खेल तो तब शुरू हुआ जब...\", \"मगर सामने जो खड़ा था...\", \"और तभी उन्होंने एक ऐसी चाल चली...\", \"यहीं से पूरी कहानी पलट गई...\", \"पर सवाल ये था कि...\".\n" +
-                "4. NO TEXTBOOK TONE: Use natural, emotional spoken Hindi in accurate Devanagari (e.g., करोड़, बॉक्स ऑफिस, छत्रपति शिवाजी महाराज). Avoid dry phrases like \"उनका जन्म ... में हुआ था\", \"उल्लेखनीय है कि\".\n" +
-                "5. BAD (Disconnected Facts) vs GOOD (Connected Story):\n" +
-                "   BAD: Scene 1: \"शिवाजी महाराज का जन्म 1630 में हुआ।\" | Scene 2: \"उन्होंने 16 साल की उम्र में तोरणा किला जीता।\" | Scene 3: \"उनकी सेना बहुत बहादुर थी।\"\n" +
-                "   GOOD: Scene 1: \"सोचिए, सिर्फ सोलह साल की उम्र में एक लड़का मुगलों की सबसे बड़ी सल्तनत से टकराने निकल पड़ा...\" | Scene 2: \"लेकिन किसी ने नहीं सोचा था कि सह्याद्रि की पहाड़ियों से उठा ये तूफान...\" | Scene 3: \"एक रात चुपचाप तोरणा किले के दरवाज़े तोड़कर इतिहास की सबसे बड़ी जंग शुरू कर देगा!\"\n\n" +
-                "Return ONLY valid JSON matching this exact schema (keep \"continuous_script\" BEFORE \"slabs\"):\n" +
+            "You are an elite Hindi YouTube storyteller, movie critic, and film director for RS Movie Spot.\n" +
+                "Think like ONE continuous spoken voiceover (like Dhruv Rathee / Nitish Rajput / top Hindi movie roast creators) where every scene's voiceover_text is literally the NEXT flowing phrase of the same unbroken story!\n\n" +
+                "RULE 1 — CONTINUOUS NARRATION (NEVER DISCONNECTED FACTS):\n" +
+                "- Write ONE seamless story arc: Hook -> Buildup -> Twist/Contrast -> Climax -> Punchy Ending.\n" +
+                "- Each slab's voiceover_text (12-18 spoken Hindi words, ~4.5-5.5s each, or adjust count to match user's requested duration like 1 min = ~12 scenes, 1.5 min = ~16-18 scenes) MUST connect smoothly to the previous and next slab using natural spoken connectors ('लेकिन...', 'मगर असली मज़ा तो तब आया जब...', 'और यहीं पर...', 'सोचिए...', 'पर दिक्कत ये थी कि...').\n" +
+                "- NEVER write isolated encyclopedia lines! When all voiceover_text values are joined with spaces and read aloud by ONE voice, it must sound 100% continuous.\n" +
+                "- BAD (Disconnected Facts): 'आदिपुरुष का बजट 500 करोड़ था।' -> 'इसके डायलॉग खराब थे।' -> 'पब्लिक को गुस्सा आया।'\n" +
+                "- GOOD (Continuous Flow): 'सोचिए, पाँच सौ करोड़ रुपये लगाकर कोई फिल्म बनाए...' -> 'और दर्शक थिएटर में बैठकर सिर्फ ये सोचें कि ये कौन सा कार्टून चल रहा है!' -> 'क्योंकि मेकर्स ने रामायण की भावना के बजाय सस्ते वीएफएक्स पर पैसा उड़ा दिया...' -> 'और ऊपर से ऐसे डायलॉग लिख दिए जिन्हें सुनकर खुद पब्लिक का पारा चढ़ गया!'\n" +
+                "- Use accurate spoken Hindi in Devanagari (करोड़, बॉक्स ऑफिस, थिएटर, दर्शक). Never put unescaped double quotes inside JSON strings (use single quotes if needed).\n\n" +
+                "RULE 2 — SCENE-MATCHED PHOTOS (EVERY SCENE LOOKS DIFFERENT & RELEVANT):\n" +
+                "- Each slab's image_prompt MUST visually show what is happening in THAT SPECIFIC line — NEVER repeat generic standing portraits!\n" +
+                "- Set has_character=false whenever the scene is about crowds, audiences, money/budget, green-screen VFX, locations, forts, battlefields, cinema halls, or objects. Only set has_character=true when the main character from character_bible is directly in that shot.\n" +
+                "- Vary shot types constantly: extreme close-up emotion, wide aerial view, over-the-shoulder, cinema theater audience reaction, messy green-screen studio, dramatic silhouette, burning torches, war map table.\n\n" +
+                "Return ONLY valid JSON matching this schema:\n" +
                 "{\n" +
-                "  \"character_bible\": \"Exact unchanging visual look of main character in English (age, face, beard, exact outfit/armor colors, weapon)\",\n" +
-                "  \"visual_style\": \"One unified cinematic art style, color palette, and dramatic lighting\",\n" +
+                "  \"character_bible\": \"Unchanging look of main character in English (if topic has one main character, else empty string)\",\n" +
+                "  \"visual_style\": \"Unified cinematic visual style, color palette, lighting\",\n" +
                 "  \"bgm_mood\": \"epic_dark | devotional | suspense | sci_fi | emotional\",\n" +
-                "  \"continuous_script\": \"Full unbroken connected Hindi narration from hook to ending\",\n" +
                 "  \"slabs\": [\n" +
                 "    {\n" +
-                "      \"voiceover_text\": \"Exact next sequential chunk of continuous_script in Devanagari\",\n" +
-                "      \"has_character\": true,\n" +
-                "      \"image_prompt\": \"Specific English visual scene matching this exact moment in the story (vary camera angles: wide battle, fort silhouette, close-up eyes, war map, crowd). Set has_character=false when character is not in frame.\",\n" +
+                "      \"voiceover_text\": \"Next continuous spoken Hindi segment in Devanagari\",\n" +
+                "      \"has_character\": false,\n" +
+                "      \"image_prompt\": \"Detailed English visual prompt strictly illustrating this specific line with camera angle, action, and setting\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
                 "    }\n" +
                 "  ]\n" +
