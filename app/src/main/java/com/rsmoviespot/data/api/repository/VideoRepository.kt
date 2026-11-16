@@ -11,8 +11,10 @@ import com.rsmoviespot.data.api.GroqChatRequest
 import com.rsmoviespot.data.api.GroqMessage
 import com.rsmoviespot.data.api.GroqPlainChatRequest
 import com.rsmoviespot.data.api.GroqResponseFormat
+import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
+import com.rsmoviespot.domain.models.VoiceGender
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -35,14 +37,28 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 interface VideoRepository {
-    suspend fun generateScript(topic: String, isShorts: Boolean = true): VideoScriptResponse
+    suspend fun generateScript(
+        topic: String,
+        isShorts: Boolean = true,
+        language: VideoLanguage = VideoLanguage.AUTO,
+        voiceGender: VoiceGender = VoiceGender.MALE
+    ): VideoScriptResponse
+
     suspend fun generateImageForSlab(
         prompt: String,
         isShorts: Boolean = true,
         seed: Int = 42
     ): ResponseBody
+
     suspend fun generateAudioForSlab(text: String): ResponseBody
+
     suspend fun generateContinuousAudioWithVtt(text: String): EdgeTtsSynthesisResult
+
+    suspend fun generateDynamicVoiceClip(
+        text: String,
+        voiceName: String,
+        emotion: String
+    ): ByteArray
 }
 
 @Singleton
@@ -65,7 +81,9 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateScript(
         topic: String,
-        isShorts: Boolean
+        isShorts: Boolean,
+        language: VideoLanguage,
+        voiceGender: VoiceGender
     ): VideoScriptResponse {
         val cleanInput = topic.trim()
         require(cleanInput.isNotBlank()) { "Topic must not be blank." }
@@ -82,27 +100,36 @@ class VideoRepositoryImpl @Inject constructor(
             TOPIC_SYSTEM_PROMPT
         }
 
+        val targetGenderLabel = voiceGender.label
+        val languageDirective = if (language == VideoLanguage.AUTO) {
+            "Language: Auto-detect from user request. Default to spoken Hindi (Devanagari) with voice_name '${VideoLanguage.HINDI.resolveVoice(voiceGender)}', UNLESS the user explicitly requested another language (e.g. English, Marathi, Gujarati, Bengali, Tamil, Telugu, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, Japanese, Arabic), in which case write in THAT language and pick the matching $targetGenderLabel Edge TTS voice_name."
+        } else {
+            "Language MANDATORY: Write ALL voiceover_text strictly in ${language.languageInstruction} and set voice_name to '${language.resolveVoice(voiceGender)}'."
+        }
+
         val userPrompt = if (isFullScriptMode) {
             buildString {
                 appendLine("MODE: FULL USER SCRIPT ($inputWordCount words).")
-                appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user sentences intact and split ONLY into 10 to 12 short scenes (about 1 sentence or phrase per scene).")
+                appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user text intact and split sequentially into 12 to 15 short punchy visual scenes (splitting longer sentences cleanly at commas/clauses so each cut stays ~3.5-4.5s).")
+                appendLine("Set voice_name matching the script's language and $targetGenderLabel gender (e.g., Hindi: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
                 appendLine()
                 appendLine("USER SCRIPT:")
                 appendLine(cleanInput)
             }
         } else {
             val formatGuide = if (isShorts) {
-                "Vertical 9:16 YouTube Shorts. Unless the user specifies another length, split into 10 to 12 fast-paced scenes (~3.5 to 4.5 seconds per scene, ~42-50 seconds total)."
+                "Vertical 9:16 YouTube Shorts. Unless the user specifies another length, create 11 to 13 fast-paced scenes (~3.5-4s each, ~45s total)."
             } else {
-                "Horizontal 16:9 YouTube video. Unless the user specifies another length, split into 12 to 15 tightly connected scenes (~60-75 seconds total)."
+                "Horizontal 16:9 YouTube video. Unless the user specifies another length, create 13 to 16 tightly connected scenes (~65-80s total)."
             }
 
             buildString {
-                appendLine("MODE: TOPIC MODE ($inputWordCount words). FOLLOW EVERY USER INSTRUCTION STRICTLY:")
+                appendLine("MODE: TOPIC MODE ($inputWordCount words). FOLLOW EVERY INSTRUCTION STRICTLY:")
                 appendLine(cleanInput)
                 appendLine()
+                appendLine(languageDirective)
                 appendLine("Format guideline: $formatGuide")
-                appendLine("Write ONE continuous, high-retention Hindi script using respectful pronouns (वे, उनकी, महाबली) for deities and heroes — NEVER 'वह' or 'उसकी'.")
+                appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
                 appendLine("Avoid unescaped double quotes inside JSON string values; use single quotes if quoting dialogue.")
             }
         }
@@ -128,7 +155,7 @@ class VideoRepositoryImpl @Inject constructor(
                             request = GroqChatRequest(
                                 model = attempt.modelId,
                                 messages = messages,
-                                temperature = if (isFullScriptMode) 0.25 else 0.75,
+                                temperature = if (isFullScriptMode) 0.25 else 0.78,
                                 maxTokens = attempt.maxTokens,
                                 responseFormat = GroqResponseFormat(type = "json_object")
                             )
@@ -139,7 +166,7 @@ class VideoRepositoryImpl @Inject constructor(
                             request = GroqPlainChatRequest(
                                 model = attempt.modelId,
                                 messages = messages,
-                                temperature = if (isFullScriptMode) 0.25 else 0.75,
+                                temperature = if (isFullScriptMode) 0.25 else 0.78,
                                 maxTokens = attempt.maxTokens
                             )
                         )
@@ -153,7 +180,7 @@ class VideoRepositoryImpl @Inject constructor(
                     ?.takeIf { it.isNotBlank() }
                     ?: throw IllegalStateException("Groq returned empty result.")
 
-                return parseScriptResponse(generatedText)
+                return parseScriptResponse(generatedText, language, voiceGender)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -205,11 +232,10 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateAudioForSlab(text: String): ResponseBody {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
-
         return edgeTtsApi.synthesize(
             EdgeTtsRequest(
                 text = text,
-                voice = HINDI_VOICE
+                voice = VideoLanguage.HINDI.maleVoice
             )
         )
     }
@@ -218,11 +244,36 @@ class VideoRepositoryImpl @Inject constructor(
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
         return edgeTtsApi.synthesizeWithSubtitles(
             text = text,
-            voice = HINDI_VOICE
+            voice = VideoLanguage.HINDI.maleVoice
         )
     }
 
-    private fun parseScriptResponse(rawText: String): VideoScriptResponse {
+    override suspend fun generateDynamicVoiceClip(
+        text: String,
+        voiceName: String,
+        emotion: String
+    ): ByteArray {
+        require(text.isNotBlank()) { "Voiceover text must not be blank." }
+        val (rate, pitch) = when (emotion.lowercase().trim()) {
+            "hook" -> "+18%" to "+2Hz"
+            "suspense" -> "+6%" to "-6Hz"
+            "climax" -> "+21%" to "-1Hz"
+            "question" -> "+11%" to "+2Hz"
+            else -> "+14%" to "-2Hz"
+        }
+        return edgeTtsApi.synthesizeSpeechClip(
+            text = text,
+            voice = voiceName.ifBlank { VideoLanguage.HINDI.maleVoice },
+            rate = rate,
+            pitch = pitch
+        )
+    }
+
+    private fun parseScriptResponse(
+        rawText: String,
+        requestedLanguage: VideoLanguage,
+        requestedGender: VoiceGender
+    ): VideoScriptResponse {
         val extractedJson = extractJsonPayload(rawText)
             .replace(Regex(",\\s*([}\\]])"), "$1")
         val root = json.parseToJsonElement(extractedJson)
@@ -230,6 +281,7 @@ class VideoRepositoryImpl @Inject constructor(
         var characterBible = ""
         var visualStyle = ""
         var bgmMood = "epic_action"
+        var parsedVoiceName = ""
 
         val slabElements: List<JsonElement> = when (root) {
             is JsonArray -> root
@@ -238,6 +290,7 @@ class VideoRepositoryImpl @Inject constructor(
                 visualStyle = root["visual_style"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 bgmMood = root["bgm_mood"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                     .ifBlank { "epic_action" }
+                parsedVoiceName = root["voice_name"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
 
                 val array = root["slabs"]
                     ?: root["scenes"]
@@ -256,6 +309,7 @@ class VideoRepositoryImpl @Inject constructor(
             val voiceover = dto.voiceoverText.trim()
             val prompt = dto.imagePrompt.trim()
             val sfxCue = dto.sfxCue?.trim()?.lowercase()?.ifBlank { "whoosh" } ?: "whoosh"
+            val emotion = dto.voiceEmotion?.trim()?.lowercase()?.ifBlank { "normal" } ?: "normal"
             if (voiceover.isBlank() || prompt.isBlank()) {
                 null
             } else {
@@ -264,16 +318,25 @@ class VideoRepositoryImpl @Inject constructor(
                     voiceover_text = voiceover,
                     image_prompt = prompt,
                     sfx_cue = sfxCue,
-                    has_character = dto.hasCharacter ?: false
+                    has_character = dto.hasCharacter ?: false,
+                    voice_emotion = emotion
                 )
             }
         }
 
         require(slabs.isNotEmpty()) { "Groq returned an empty script." }
+
+        val finalVoiceName = if (requestedLanguage != VideoLanguage.AUTO) {
+            requestedLanguage.resolveVoice(requestedGender)
+        } else {
+            parsedVoiceName.ifBlank { VideoLanguage.HINDI.resolveVoice(requestedGender) }
+        }
+
         return VideoScriptResponse(
             character_bible = characterBible,
             visual_style = visualStyle,
             bgm_mood = bgmMood,
+            voice_name = finalVoiceName,
             slabs = slabs
         )
     }
@@ -359,13 +422,14 @@ class VideoRepositoryImpl @Inject constructor(
         @SerialName("sfx_cue")
         val sfxCue: String? = null,
         @SerialName("has_character")
-        val hasCharacter: Boolean? = null
+        val hasCharacter: Boolean? = null,
+        @SerialName("voice_emotion")
+        val voiceEmotion: String? = null
     )
 
     private companion object {
         const val MAX_API_ATTEMPTS = 3
         const val FULL_SCRIPT_WORD_THRESHOLD = 25
-        const val HINDI_VOICE = "hi-IN-MadhurNeural"
 
         const val SHORTS_IMAGE_WIDTH = 768
         const val SHORTS_IMAGE_HEIGHT = 1344
@@ -373,61 +437,68 @@ class VideoRepositoryImpl @Inject constructor(
         const val LANDSCAPE_IMAGE_HEIGHT = 768
 
         const val IMAGE_SUFFIX_SHORTS =
-            ", cinematic IMAX movie still, Unreal Engine 5, 8k resolution, photorealistic, vertical 9:16 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
+            ", single continuous full-bleed frame, cinematic IMAX movie still, Unreal Engine 5, 8k resolution, photorealistic, vertical 9:16 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
         const val IMAGE_SUFFIX_LANDSCAPE =
-            ", cinematic IMAX movie still, Unreal Engine 5, 8k resolution, photorealistic, horizontal 16:9 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
+            ", single continuous full-bleed frame, cinematic IMAX movie still, Unreal Engine 5, 8k resolution, photorealistic, horizontal 16:9 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
 
         const val DEFAULT_NEGATIVE_PROMPT =
-            "text, watermark, signature, logo, letters, words, ui, interface, comment box, subscribe button, social media, website, poster, title card, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers, collage, split screen"
+            "filmstrip, multi-panel, stacked frames, comic panels, grid, storyboard, collage, split screen, text, watermark, signature, logo, letters, words, ui, interface, comment box, subscribe button, social media, website, poster, title card, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers"
 
         const val IMAGE_PROMPT_RULES =
             "IMAGE PROMPT RULES (STRICT):\n" +
                 "- Describe ONLY physical characters, environments, lighting, and cinematic action.\n" +
-                "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text' in the image_prompt, even if the voiceover mentions commenting, subscribing, or box office numbers.\n" +
-                "- For the final call-to-action scene, always generate an epic triumphant hero shot of the main character (or a grand dramatic climax scene if there is no single hero).\n" +
-                "- Set has_character=false when showing crowds, audiences, forts, battlefields, objects, or environments; set has_character=true only when the main character from character_bible is directly in frame.\n" +
+                "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text' in image_prompt, even if voiceover mentions commenting or box office numbers.\n" +
+                "- NEVER write real celebrity/actor names (like Sunny Deol or Prabhas) inside image_prompt or character_bible — describe the iconic visual character directly (e.g. muscular divine Vanara warrior with golden mace gada, saffron dhoti, glowing aura) so the image generator renders the exact mythic/cinematic figure.\n" +
+                "- For metaphors like 'पूरी दुनिया देखेगी' or 'वर्ल्ड रिकॉर्ड', NEVER ask for Earth globes or world maps — describe roaring packed cinema crowds, grand glowing Indian temples, or triumphant hero action.\n" +
+                "- For the final call-to-action scene, always generate an epic triumphant hero shot of the main character (or a grand cinematic climax shot if no hero).\n" +
+                "- Set has_character=false when showing crowds, audiences, forts, battlefields, cinema halls, or environments; set has_character=true only when the main character from character_bible is directly in frame.\n" +
                 "- Vary camera angles constantly across consecutive scenes (wide aerial, close-up eyes, over-the-shoulder, silhouette, battlefield, palace interior).\n\n"
 
-        const val BGM_MOOD_RULES =
-            "BGM MOOD RULE:\n" +
-                "- Pick the exact fitting bgm_mood: 'comedy_roast', 'epic_action', 'suspense_thriller', 'emotional_sad', 'devotional', 'sci_fi_tech', 'motivational', or 'horror_dark'.\n\n"
+        const val VOICE_AND_BGM_RULES =
+            "VOICE EMOTION & BGM RULES:\n" +
+                "- Pick bgm_mood: 'comedy_roast', 'epic_action', 'suspense_thriller', 'emotional_sad', 'devotional', 'sci_fi_tech', 'motivational', or 'horror_dark'.\n" +
+                "- For each scene, set voice_emotion to shift delivery dynamically: 'hook' (opening punch), 'suspense' (mystery/tension), 'climax' (intense/goosebumps), 'question' (engaging question/CTA), or 'normal'.\n" +
+                "- Pick valid Edge TTS voice_name (e.g. hi-IN-MadhurNeural, hi-IN-SwaraNeural, en-IN-PrabhatNeural, en-IN-NeerjaNeural, en-US-AndrewNeural, en-US-AvaNeural, mr-IN-ManoharNeural, mr-IN-AarohiNeural, ta-IN-ValluvarNeural, ta-IN-PallaviNeural, etc.).\n\n"
 
         const val JSON_SCHEMA_SPEC =
             "Return ONLY valid JSON matching this schema:\n" +
                 "{\n" +
-                "  \"character_bible\": \"Unchanging visual look of main character in English (if topic has one main character, else empty string)\",\n" +
+                "  \"character_bible\": \"Unchanging visual look of main character in English without real actor names\",\n" +
                 "  \"visual_style\": \"Unified cinematic visual style, color palette, lighting\",\n" +
                 "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
+                "  \"voice_name\": \"Edge TTS voice shortName matching language and gender\",\n" +
                 "  \"slabs\": [\n" +
                 "    {\n" +
-                "      \"voiceover_text\": \"Hindi narration segment\",\n" +
+                "      \"voiceover_text\": \"Narration segment in target language\",\n" +
+                "      \"voice_emotion\": \"hook | suspense | climax | question | normal\",\n" +
                 "      \"has_character\": false,\n" +
-                "      \"image_prompt\": \"English physical visual description only (NO text/UI/posters/comment box)\",\n" +
+                "      \"image_prompt\": \"English physical visual description only (NO text/UI/posters/comment box/actor names/world map)\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
                 "    }\n" +
                 "  ]\n" +
                 "}"
 
         const val FULL_SCRIPT_SYSTEM_PROMPT =
-            "You are a film director splitting an existing user-written Hindi script into visual scenes for RS Movie Spot.\n" +
+            "You are a film director splitting an existing user-written script into fast visual scenes for RS Movie Spot.\n" +
                 "CRITICAL FULL SCRIPT RULE:\n" +
-                "- DO NOT rewrite, paraphrase, translate, summarize, add, drop, or change EVEN A SINGLE HINDI WORD of the user's input.\n" +
-                "- Keep the exact user sentences intact and ONLY split the provided text sequentially into 10 to 12 short scenes (roughly 1 sentence or natural phrase per scene).\n" +
-                "- Concatenating all slabs' voiceover_text values with spaces MUST reconstruct the user's exact input text word-for-word.\n\n" +
+                "- DO NOT rewrite, paraphrase, translate, summarize, add, drop, or change EVEN A SINGLE WORD of the user's input.\n" +
+                "- Keep exact user words intact and split sequentially into 12 to 15 short punchy scenes (splitting long sentences cleanly at commas/clauses so each visual stays ~3.5-4.5s).\n" +
+                "- Concatenating all slabs' voiceover_text values with spaces MUST match the user's input word-for-word.\n\n" +
                 IMAGE_PROMPT_RULES +
-                BGM_MOOD_RULES +
+                VOICE_AND_BGM_RULES +
                 JSON_SCHEMA_SPEC
 
         const val TOPIC_SYSTEM_PROMPT =
-            "You are an elite Hindi YouTube storyteller, movie critic, and film director for RS Movie Spot.\n" +
-                "Think like ONE continuous spoken voiceover where every scene's voiceover_text is the NEXT flowing phrase of the same unbroken story!\n\n" +
-                "RULE 1 — CONTINUOUS HIGH-RETENTION HINDI SCRIPT (10 TO 12 SCENES):\n" +
-                "- Split into 10 to 12 crisp scenes (~9-14 words / ~3.5-4.5s each for Shorts; 12-15 scenes for 16:9 YouTube) with seamless spoken transitions ('लेकिन...', 'मगर तभी...', 'और यहीं पर...', 'सोचिए...').\n" +
-                "- NEVER write isolated Wikipedia facts! Every scene must flow naturally out of the previous scene.\n" +
-                "- RESPECTFUL PRONOUNS MANDATORY: For deities, saints, historical kings, and revered heroes (e.g., भगवान, हनुमान जी, श्री राम, छत्रपति शिवाजी महाराज), ALWAYS use respectful plural pronouns like 'वे', 'उनकी', 'उनका', 'उन्हें', 'महाबली', 'प्रभु' — NEVER use singular 'वह', 'उसकी', 'उसका', or 'उसने'.\n" +
-                "- Use accurate spoken Hindi in Devanagari (करोड़, बॉक्स ऑफिस, थिएटर, दर्शक). Never put unescaped double quotes inside JSON strings (use single quotes if needed).\n\n" +
+            "You are an elite YouTube storyteller, movie critic, and film director for RS Movie Spot.\n" +
+                "Think like ONE continuous spoken storyteller where every scene's voiceover_text is the NEXT flowing phrase of the same unbroken story!\n\n" +
+                "RULE 1 — CONTINUOUS HIGH-RETENTION SCRIPT (11 TO 15 SCENES):\n" +
+                "- Create 11 to 13 crisp scenes (~8-13 words / ~3.5-4s each for Shorts; 13-16 scenes for 16:9 YouTube) with seamless spoken transitions.\n" +
+                "- Use natural spoken punctuation ('!', '?', '...') and short energetic clauses so TTS pitch rises and falls dramatically instead of sounding flat.\n" +
+                "- NEVER write isolated Wikipedia facts! Every scene must flow naturally from the previous scene.\n" +
+                "- When writing in Hindi: use accurate Devanagari spelling (करोड़, बॉक्स ऑफिस, थिएटर) and MANDATORY respectful plural pronouns (वे, उनकी, उनका, उन्हें, महाबली, प्रभु) for deities and heroes — NEVER singular वह/उसकी/उसका.\n" +
+                "- Never put unescaped double quotes inside JSON strings (use single quotes if needed).\n\n" +
                 IMAGE_PROMPT_RULES +
-                BGM_MOOD_RULES +
+                VOICE_AND_BGM_RULES +
                 JSON_SCHEMA_SPEC
     }
 }
