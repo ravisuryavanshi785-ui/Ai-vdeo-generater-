@@ -22,32 +22,51 @@ import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
+data class EdgeTtsSynthesisResult(
+    val audioBytes: ByteArray,
+    val vttContent: String?
+)
+
 @Singleton
 class EdgeTtsApi @Inject constructor(
     private val okHttpClient: OkHttpClient,
     @ApplicationContext private val context: Context
 ) {
-    suspend fun synthesize(request: EdgeTtsRequest): ResponseBody = withContext(Dispatchers.IO) {
-        val cleanText = request.text.trim()
+    suspend fun synthesize(request: EdgeTtsRequest): ResponseBody {
+        val result = synthesizeWithSubtitles(request.text, request.voice)
+        return result.audioBytes.toResponseBody("audio/mpeg".toMediaType())
+    }
+
+    suspend fun synthesizeWithSubtitles(
+        text: String,
+        voice: String
+    ): EdgeTtsSynthesisResult = withContext(Dispatchers.IO) {
+        val cleanText = text.trim()
         require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
 
-        val edgeBytes = runCatching {
-            synthesizeWithEdgeNeural(cleanText, request.voice)
+        val edgeResult = runCatching {
+            synthesizeWithEdgeNeural(cleanText, voice)
         }.getOrNull()
 
-        if (edgeBytes != null && edgeBytes.isNotEmpty()) {
-            return@withContext edgeBytes.toResponseBody("audio/mpeg".toMediaType())
+        if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
+            return@withContext edgeResult
         }
 
-        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, request.voice)
+        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, voice)
         if (fallbackBytes.isEmpty()) {
             throw IOException("TTS produced empty audio output.")
         }
 
-        return@withContext fallbackBytes.toResponseBody("audio/mpeg".toMediaType())
+        EdgeTtsSynthesisResult(
+            audioBytes = fallbackBytes,
+            vttContent = null
+        )
     }
 
-    private fun synthesizeWithEdgeNeural(text: String, voiceName: String): ByteArray {
+    private fun synthesizeWithEdgeNeural(
+        text: String,
+        voiceName: String
+    ): EdgeTtsSynthesisResult {
         val voice = findEdgeVoice(voiceName)
             ?: throw IOException("Edge Neural voice not found: $voiceName")
 
@@ -64,6 +83,7 @@ class EdgeTtsApi @Inject constructor(
                 .fileName(fileBaseName)
                 .overwrite(true)
                 .voiceRate("+10%")
+                .enableVttFile()
                 .formatMp3()
                 .trans()
 
@@ -79,14 +99,29 @@ class EdgeTtsApi @Inject constructor(
 
             val outputFile = directFile
                 ?: File(tempDir, "$fileBaseName.mp3").takeIf { it.exists() }
-                ?: tempDir.listFiles()?.firstOrNull { it.isFile && it.length() > 0L }
+                ?: tempDir.listFiles()?.firstOrNull {
+                    it.isFile && it.length() > 0L && !it.extension.equals("vtt", ignoreCase = true)
+                }
                 ?: throw IOException("Edge TTS output file was not created.")
 
             val bytes = outputFile.readBytes()
             if (bytes.isEmpty()) {
                 throw IOException("Edge TTS output file is empty.")
             }
-            return bytes
+
+            val vttFile = File(tempDir, "${outputFile.nameWithoutExtension}.vtt").takeIf { it.exists() }
+                ?: File(tempDir, "$fileBaseName.vtt").takeIf { it.exists() }
+                ?: tempDir.listFiles()?.firstOrNull {
+                    it.isFile && it.extension.equals("vtt", ignoreCase = true) && it.length() > 0L
+                }
+
+            val vttText = vttFile?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
+                ?.takeIf { it.isNotBlank() }
+
+            return EdgeTtsSynthesisResult(
+                audioBytes = bytes,
+                vttContent = vttText
+            )
         } finally {
             tempDir.deleteRecursively()
         }
