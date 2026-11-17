@@ -58,8 +58,8 @@ import kotlin.random.Random
 
 data class VideoRenderResult(
     val galleryUri: Uri,
-    val thumbnailUri: Uri? = null,
-    val renderedScript: VideoScriptResponse? = null,
+    val thumbnailUri: Uri?,
+    val completedScript: VideoScriptResponse,
     val segmentCount: Int,
     val width: Int,
     val height: Int
@@ -72,10 +72,9 @@ private data class PopCaptionChunk(
     val endSeconds: Double
 )
 
-private data class FixedOverlay(
+private data class PreparedVisual(
     val file: File,
-    val x: Int,
-    val y: Int
+    val isPoster: Boolean
 )
 
 private enum class BgmStyle {
@@ -179,88 +178,25 @@ class VideoRenderEngine @Inject constructor(
                 bgmSeed = baseSeed
             )
 
-            val watermarkFile = File(renderDirectory, "watermark.png").also {
+            val watermarkFile = File(renderDirectory, "hud_watermark.png").also {
                 renderWatermarkPng(it)
             }
-            val subscribeBadgeFile = File(renderDirectory, "subscribe_badge.png").also {
+            val subscribeBadgeFile = File(renderDirectory, "hud_subscribe.png").also {
                 renderSubscribeBadgePng(it)
             }
 
             val videoSegmentFiles = mutableListOf<File>()
             val slabCount = script.slabs.size
             val usedRealPhotoUrls = mutableSetOf<String>()
-            var lastValidVisualFile: File? = null
-            var heroCoverSourceFile: File? = null
+            val usedVideoClipUrls = mutableSetOf<String>()
+            var previousValidImageFile: File? = null
+            var coverBaseImageFile: File? = null
 
             script.slabs.forEachIndexed { index, slab ->
                 val baseProgress = 14 + (index * 68 / slabCount)
-                val wantsReal1 = slab.visual_source.equals("real_photo", ignoreCase = true) &&
+                val isVideoClipMode = (slab.visual_source == "video_clip" || slab.visual_source == "meme_clip") &&
                     slab.real_photo_query.isNotBlank()
-
-                val statusLabel = if (wantsReal1) {
-                    "Fetching real photo (${slab.real_photo_query})…"
-                } else {
-                    "Creating scene ${index + 1} of $slabCount…"
-                }
-                progress(baseProgress.coerceIn(14, 82), statusLabel)
-
-                val primaryImageFile = File(renderDirectory, "slab_${index + 1}_a.png")
-                prepareSingleVisualFile(
-                    renderDirectory = renderDirectory,
-                    filePrefix = "s${index + 1}_a",
-                    customUriString = slab.custom_image_uri,
-                    visualSource = slab.visual_source,
-                    realPhotoQuery = slab.real_photo_query,
-                    scenePrompt = slab.image_prompt,
-                    characterBible = script.character_bible,
-                    visualStyle = script.visual_style,
-                    hasCharacter = slab.has_character,
-                    sceneSeed = baseSeed + (index * 37),
-                    usedRealPhotoUrls = usedRealPhotoUrls,
-                    lastValidVisualFile = lastValidVisualFile,
-                    targetWidth = width,
-                    targetHeight = height,
-                    isShorts = isShorts,
-                    outputFile = primaryImageFile
-                )
-                lastValidVisualFile = primaryImageFile
-                if (heroCoverSourceFile == null) {
-                    heroCoverSourceFile = primaryImageFile
-                }
-
-                val hasSecondSpec = !slab.custom_image_uri_2.isNullOrBlank() ||
-                    (slab.visual_source_2.equals("real_photo", ignoreCase = true) && slab.real_photo_query_2.isNotBlank()) ||
-                    slab.image_prompt_2.isNotBlank()
-
-                val cleanLayout = slab.layout_mode.lowercase().trim()
-                val useSplit = hasSecondSpec && cleanLayout == "split"
-                val useFlip = hasSecondSpec && cleanLayout == "flip" && sceneFramesList[index] >= 30
-
-                val secondaryImageFile = if (useSplit || useFlip) {
-                    val file2 = File(renderDirectory, "slab_${index + 1}_b.png")
-                    prepareSingleVisualFile(
-                        renderDirectory = renderDirectory,
-                        filePrefix = "s${index + 1}_b",
-                        customUriString = slab.custom_image_uri_2,
-                        visualSource = slab.visual_source_2.ifBlank { "ai_generated" },
-                        realPhotoQuery = slab.real_photo_query_2,
-                        scenePrompt = slab.image_prompt_2.ifBlank { slab.image_prompt },
-                        characterBible = script.character_bible,
-                        visualStyle = script.visual_style,
-                        hasCharacter = slab.has_character,
-                        sceneSeed = baseSeed + (index * 37) + 503,
-                        usedRealPhotoUrls = usedRealPhotoUrls,
-                        lastValidVisualFile = primaryImageFile,
-                        targetWidth = width,
-                        targetHeight = height,
-                        isShorts = isShorts,
-                        outputFile = file2
-                    )
-                    lastValidVisualFile = file2
-                    file2
-                } else {
-                    null
-                }
+                val isMeme = slab.visual_source == "meme_clip"
 
                 val segmentExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
                 val popCaptions = runCatching {
@@ -274,137 +210,219 @@ class VideoRenderEngine @Inject constructor(
                     )
                 }.getOrDefault(emptyList())
 
-                val fixedOverlays = mutableListOf<FixedOverlay>()
-                if (watermarkFile.exists()) {
-                    fixedOverlays += FixedOverlay(
-                        file = watermarkFile,
-                        x = (width - 310).coerceAtLeast(16),
-                        y = if (isShorts) 72 else 32
-                    )
-                }
-                if (slab.stat_badge.isNotBlank()) {
-                    val statFile = File(renderDirectory, "stat_${index + 1}.png")
-                    val statW = renderStatBadgePng(slab.stat_badge, width, isShorts, statFile)
-                    if (statW != null && statFile.exists()) {
-                        fixedOverlays += FixedOverlay(
-                            file = statFile,
-                            x = ((width - statW) / 2).coerceAtLeast(0),
-                            y = if (isShorts) 170 else 44
-                        )
+                val statBadgeFile = slab.stat_badge.trim().takeIf { it.isNotBlank() }?.let { badgeText ->
+                    File(renderDirectory, "stat_${index + 1}.png").takeIf { file ->
+                        renderStatBadgePng(badgeText, file)
                     }
                 }
-                if (index == slabCount - 1 && subscribeBadgeFile.exists()) {
-                    fixedOverlays += FixedOverlay(
-                        file = subscribeBadgeFile,
-                        x = ((width - 540) / 2).coerceAtLeast(0),
-                        y = if (isShorts) 305 else 120
-                    )
-                }
+                val endSubscribeFile = if (index == slabCount - 1) subscribeBadgeFile else null
+                val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
 
-                val renderProgress = 14 + (((index + 0.5) * 68) / slabCount).roundToInt()
-                progress(
-                    renderProgress.coerceIn(14, 82),
-                    "Animating scene ${index + 1} of $slabCount…"
-                )
-
-                val isBoomScene = slab.sfx_cue.equals("boom", ignoreCase = true) ||
-                    slab.sfx_cue.equals("thunder", ignoreCase = true)
-
-                if (useFlip && secondaryImageFile != null) {
-                    val totalSceneFrames = sceneFramesList[index]
-                    val framesA = (totalSceneFrames / 2).coerceAtLeast(12)
-                    val framesB = (totalSceneFrames - framesA).coerceAtLeast(12)
-                    val splitTime = framesA.toDouble() / FRAME_RATE
-                    val durB = framesB.toDouble() / FRAME_RATE
-
-                    val captionsA = popCaptions.mapNotNull { c ->
-                        if (c.startSeconds < splitTime && c.endSeconds > 0.05) {
-                            c.copy(
-                                startSeconds = c.startSeconds.coerceAtLeast(0.0),
-                                endSeconds = c.endSeconds.coerceAtMost(splitTime + 0.04)
-                            )
-                        } else null
-                    }
-                    val captionsB = popCaptions.mapNotNull { c ->
-                        if (c.endSeconds > splitTime) {
-                            c.copy(
-                                startSeconds = (c.startSeconds - splitTime).coerceAtLeast(0.0),
-                                endSeconds = (c.endSeconds - splitTime).coerceAtMost(durB + 0.04)
-                            )
-                        } else null
-                    }
-
-                    val segA = File(renderDirectory, "vseg_${index + 1}_a.mp4")
-                    val segB = File(renderDirectory, "vseg_${index + 1}_b.mp4")
-
-                    runFfmpeg(
-                        createVideoOnlySegmentArguments(
-                            motionStyleIndex = index * 2,
-                            isFirstScene = index == 0,
-                            isLastScene = false,
-                            isPunchZoom = isBoomScene,
-                            gentlePosterZoom = wantsReal1,
-                            imageFile = primaryImageFile,
-                            popCaptions = captionsA,
-                            fixedOverlays = fixedOverlays,
-                            outputFile = segA,
-                            width = width,
-                            height = height,
-                            segmentFrames = framesA
-                        )
-                    )
-                    runFfmpeg(
-                        createVideoOnlySegmentArguments(
-                            motionStyleIndex = index * 2 + 1,
-                            isFirstScene = false,
-                            isLastScene = index == slabCount - 1,
-                            isPunchZoom = false,
-                            gentlePosterZoom = slab.visual_source_2.equals("real_photo", ignoreCase = true),
-                            imageFile = secondaryImageFile,
-                            popCaptions = captionsB,
-                            fixedOverlays = fixedOverlays,
-                            outputFile = segB,
-                            width = width,
-                            height = height,
-                            segmentFrames = framesB
-                        )
-                    )
-                    videoSegmentFiles += segA
-                    videoSegmentFiles += segB
-                } else {
-                    val finalSceneImage = if (useSplit && secondaryImageFile != null) {
-                        val splitImageFile = File(renderDirectory, "slab_${index + 1}_split.png")
-                        composeSplitScreenFrame(
-                            topOrLeftFile = primaryImageFile,
-                            bottomOrRightFile = secondaryImageFile,
-                            outputFile = splitImageFile,
-                            targetWidth = width,
-                            targetHeight = height
-                        )
-                        splitImageFile
+                var clipRenderedSuccessfully = false
+                if (isVideoClipMode) {
+                    val clipLabel = if (isMeme) {
+                        "Fetching meme clip (${slab.real_photo_query})…"
                     } else {
-                        primaryImageFile
+                        "Fetching movie clip (${slab.real_photo_query})…"
                     }
+                    progress(baseProgress.coerceIn(14, 82), clipLabel)
 
-                    val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
-                    runFfmpeg(
-                        createVideoOnlySegmentArguments(
-                            motionStyleIndex = index,
-                            isFirstScene = index == 0,
-                            isLastScene = index == slabCount - 1,
-                            isPunchZoom = isBoomScene,
-                            gentlePosterZoom = wantsReal1 && !useSplit,
-                            imageFile = finalSceneImage,
+                    val rawClipFile = File(renderDirectory, "net_clip_${index + 1}.mp4")
+                    val downloadedClip = runCatching {
+                        videoRepository.downloadInternetVideoClip(
+                            query = slab.real_photo_query,
+                            isMeme = isMeme,
+                            usedUrls = usedVideoClipUrls,
+                            destinationFile = rawClipFile
+                        )
+                    }.getOrDefault(false)
+
+                    if (downloadedClip && rawClipFile.exists() && rawClipFile.length() > 16_384L) {
+                        progress(
+                            (baseProgress + 2).coerceIn(14, 82),
+                            "Editing video clip scene ${index + 1} of $slabCount…"
+                        )
+                        clipRenderedSuccessfully = runCatching {
+                            runFfmpeg(
+                                createVideoClipSegmentArguments(
+                                    sceneIndex = index,
+                                    totalScenes = slabCount,
+                                    clipFile = rawClipFile,
+                                    watermarkFile = watermarkFile,
+                                    statBadgeFile = statBadgeFile,
+                                    subscribeBadgeFile = endSubscribeFile,
+                                    popCaptions = popCaptions,
+                                    outputFile = videoSegmentFile,
+                                    width = width,
+                                    height = height,
+                                    segmentFrames = sceneFramesList[index]
+                                )
+                            )
+                            videoSegmentFile.exists() && videoSegmentFile.length() > 4096L
+                        }.getOrDefault(false)
+
+                        if (!clipRenderedSuccessfully) {
+                            videoSegmentFile.delete()
+                        }
+                    }
+                    rawClipFile.delete()
+                }
+
+                if (!clipRenderedSuccessfully) {
+                    val effectiveSource1 = if (isVideoClipMode) "real_photo" else slab.visual_source
+                    val visual1 = prepareSingleVisualFile(
+                        renderDirectory = renderDirectory,
+                        tag = "${index + 1}_a",
+                        visualSource = effectiveSource1,
+                        realQuery = slab.real_photo_query,
+                        scenePrompt = slab.image_prompt,
+                        hasCharacter = slab.has_character,
+                        characterBible = script.character_bible,
+                        visualStyle = script.visual_style,
+                        usedRealPhotoUrls = usedRealPhotoUrls,
+                        previousValidImageFile = previousValidImageFile,
+                        sceneSeed = baseSeed + (index * 37),
+                        width = width,
+                        height = height,
+                        isShorts = isShorts,
+                        progressUpdate = { msg -> progress(baseProgress.coerceIn(14, 82), msg) }
+                    )
+                    previousValidImageFile = visual1.file
+                    if (coverBaseImageFile == null) coverBaseImageFile = visual1.file
+
+                    val wantsTwoPhotos = (slab.layout_mode == "split" || slab.layout_mode == "flip") &&
+                        (slab.image_prompt_2.isNotBlank() || slab.real_photo_query_2.isNotBlank())
+
+                    if (wantsTwoPhotos) {
+                        val visual2 = prepareSingleVisualFile(
+                            renderDirectory = renderDirectory,
+                            tag = "${index + 1}_b",
+                            visualSource = slab.visual_source_2,
+                            realQuery = slab.real_photo_query_2,
+                            scenePrompt = slab.image_prompt_2.ifBlank { slab.image_prompt },
+                            hasCharacter = slab.has_character,
+                            characterBible = script.character_bible,
+                            visualStyle = script.visual_style,
+                            usedRealPhotoUrls = usedRealPhotoUrls,
+                            previousValidImageFile = visual1.file,
+                            sceneSeed = baseSeed + (index * 37) + 511,
+                            width = width,
+                            height = height,
+                            isShorts = isShorts,
+                            progressUpdate = { msg -> progress(baseProgress.coerceIn(14, 82), msg) }
+                        )
+
+                        if (slab.layout_mode == "split") {
+                            val splitFile = File(renderDirectory, "slab_${index + 1}_split.png")
+                            val splitOk = composeSplitScreenFrame(
+                                fileA = visual1.file,
+                                fileB = visual2.file,
+                                outputFile = splitFile,
+                                targetWidth = width,
+                                targetHeight = height
+                            )
+                            val finalFrame = if (splitOk) splitFile else visual1.file
+                            renderPhotoSegmentWithOverlays(
+                                sceneIndex = index,
+                                totalScenes = slabCount,
+                                imageFile = finalFrame,
+                                isPoster = false,
+                                sfxCue = slab.sfx_cue,
+                                watermarkFile = watermarkFile,
+                                statBadgeFile = statBadgeFile,
+                                subscribeBadgeFile = endSubscribeFile,
+                                popCaptions = popCaptions,
+                                outputFile = videoSegmentFile,
+                                width = width,
+                                height = height,
+                                segmentFrames = sceneFramesList[index]
+                            )
+                        } else {
+                            val totalSceneFrames = sceneFramesList[index]
+                            val framesA = (totalSceneFrames / 2).coerceAtLeast(MIN_SCENE_FRAMES / 2)
+                            val framesB = (totalSceneFrames - framesA).coerceAtLeast(MIN_SCENE_FRAMES / 2)
+                            val cutSeconds = framesA.toDouble() / FRAME_RATE
+
+                            val captionsA = popCaptions.mapNotNull { c ->
+                                if (c.startSeconds >= cutSeconds) null
+                                else c.copy(endSeconds = c.endSeconds.coerceAtMost(cutSeconds + 0.02))
+                            }
+                            val captionsB = popCaptions.mapNotNull { c ->
+                                if (c.endSeconds <= cutSeconds) null
+                                else PopCaptionChunk(
+                                    file = c.file,
+                                    stripHeight = c.stripHeight,
+                                    startSeconds = (c.startSeconds - cutSeconds).coerceAtLeast(0.0),
+                                    endSeconds = (c.endSeconds - cutSeconds).coerceAtLeast(0.10)
+                                )
+                            }
+
+                            val segA = File(renderDirectory, "vseg_${index + 1}_a.mp4")
+                            val segB = File(renderDirectory, "vseg_${index + 1}_b.mp4")
+
+                            renderPhotoSegmentWithOverlays(
+                                sceneIndex = index * 2,
+                                totalScenes = slabCount * 2,
+                                imageFile = visual1.file,
+                                isPoster = visual1.isPoster,
+                                sfxCue = slab.sfx_cue,
+                                watermarkFile = watermarkFile,
+                                statBadgeFile = statBadgeFile,
+                                subscribeBadgeFile = null,
+                                popCaptions = captionsA,
+                                outputFile = segA,
+                                width = width,
+                                height = height,
+                                segmentFrames = framesA
+                            )
+                            renderPhotoSegmentWithOverlays(
+                                sceneIndex = index * 2 + 1,
+                                totalScenes = slabCount * 2,
+                                imageFile = visual2.file,
+                                isPoster = visual2.isPoster,
+                                sfxCue = "whoosh",
+                                watermarkFile = watermarkFile,
+                                statBadgeFile = statBadgeFile,
+                                subscribeBadgeFile = endSubscribeFile,
+                                popCaptions = captionsB,
+                                outputFile = segB,
+                                width = width,
+                                height = height,
+                                segmentFrames = framesB
+                            )
+
+                            val subList = File(renderDirectory, "sub_${index + 1}.txt")
+                            subList.writeText(
+                                "file '${escapeConcatPath(segA.absolutePath)}'\n" +
+                                    "file '${escapeConcatPath(segB.absolutePath)}'\n"
+                            )
+                            runFfmpeg(createConcatArguments(subList, videoSegmentFile))
+                        }
+                    } else {
+                        val renderProgress = 14 + (((index + 0.5) * 68) / slabCount).roundToInt()
+                        progress(
+                            renderProgress.coerceIn(14, 82),
+                            "Animating scene ${index + 1} of $slabCount…"
+                        )
+                        renderPhotoSegmentWithOverlays(
+                            sceneIndex = index,
+                            totalScenes = slabCount,
+                            imageFile = visual1.file,
+                            isPoster = visual1.isPoster,
+                            sfxCue = slab.sfx_cue,
+                            watermarkFile = watermarkFile,
+                            statBadgeFile = statBadgeFile,
+                            subscribeBadgeFile = endSubscribeFile,
                             popCaptions = popCaptions,
-                            fixedOverlays = fixedOverlays,
                             outputFile = videoSegmentFile,
                             width = width,
                             height = height,
                             segmentFrames = sceneFramesList[index]
                         )
-                    )
-                    videoSegmentFiles += videoSegmentFile
+                    }
                 }
+
+                videoSegmentFiles += videoSegmentFile
             }
 
             progress(85, "Syncing scenes with voiceover…")
@@ -418,7 +436,7 @@ class VideoRenderEngine @Inject constructor(
             val silentVideoFile = File(renderDirectory, "silent_video.mp4")
             runFfmpeg(createConcatArguments(concatList, silentVideoFile))
 
-            progress(90, "Mastering studio voice, BGM & SFX…")
+            progress(90, "Mastering voice, auto-ducked BGM & SFX…")
             val sfxTrackFile = synthesizeTimedSfxTrackWav(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
@@ -446,29 +464,45 @@ class VideoRenderEngine @Inject constructor(
                 outputFile = finalFile
             )
 
-            progress(96, "Saving video & cover to gallery…")
+            progress(96, "Exporting video & cover thumbnail…")
             val actionUri = publishToMediaStore(finalFile, topic)
-            val thumbnailUri = runCatching {
-                heroCoverSourceFile?.let { coverSrc ->
-                    val coverJpg = File(renderDirectory, "cover_thumb.jpg")
-                    renderCoverThumbnailJpg(
-                        sourceImageFile = coverSrc,
-                        headlineText = script.youtube_title.ifBlank { topic },
-                        isShorts = isShorts,
-                        outputFile = coverJpg
-                    )
-                    if (coverJpg.exists() && coverJpg.length() > 2048L) {
-                        publishThumbnailToMediaStore(coverJpg, topic)
-                    } else null
-                }
-            }.getOrNull()
 
-            progress(100, "Video ready")
+            var thumbBaseFile = coverBaseImageFile ?: previousValidImageFile
+            if (thumbBaseFile == null || !thumbBaseFile.exists()) {
+                val extractedCover = File(renderDirectory, "extracted_cover.jpg")
+                val extracted = runCatching {
+                    runFfmpeg(
+                        arrayOf(
+                            "-y",
+                            "-ss", "0.5",
+                            "-i", silentVideoFile.absolutePath,
+                            "-vframes", "1",
+                            extractedCover.absolutePath
+                        )
+                    )
+                    extractedCover.exists() && extractedCover.length() > 1024L
+                }.getOrDefault(false)
+                if (extracted) thumbBaseFile = extractedCover
+            }
+
+            val thumbnailUri = thumbBaseFile?.takeIf { it.exists() }?.let { base ->
+                runCatching {
+                    val thumbJpg = File(renderDirectory, "cover_thumb.jpg")
+                    renderCoverThumbnailJpg(
+                        baseImage = base,
+                        headline = script.youtube_title.ifBlank { topic },
+                        outputFile = thumbJpg
+                    )
+                    publishThumbnailToMediaStore(thumbJpg, topic)
+                }.getOrNull()
+            }
+
+            progress(100, "Video & thumbnail ready")
 
             VideoRenderResult(
                 galleryUri = actionUri,
                 thumbnailUri = thumbnailUri,
-                renderedScript = script,
+                completedScript = script,
                 segmentCount = videoSegmentFiles.size,
                 width = width,
                 height = height
@@ -480,246 +514,214 @@ class VideoRenderEngine @Inject constructor(
 
     private suspend fun prepareSingleVisualFile(
         renderDirectory: File,
-        filePrefix: String,
-        customUriString: String?,
+        tag: String,
         visualSource: String,
-        realPhotoQuery: String,
+        realQuery: String,
         scenePrompt: String,
+        hasCharacter: Boolean,
         characterBible: String,
         visualStyle: String,
-        hasCharacter: Boolean,
-        sceneSeed: Int,
         usedRealPhotoUrls: MutableSet<String>,
-        lastValidVisualFile: File?,
-        targetWidth: Int,
-        targetHeight: Int,
+        previousValidImageFile: File?,
+        sceneSeed: Int,
+        width: Int,
+        height: Int,
         isShorts: Boolean,
-        outputFile: File
-    ) {
-        if (!customUriString.isNullOrBlank()) {
-            val rawCustom = File(renderDirectory, "${filePrefix}_custom.img")
-            val copied = runCatching {
-                val uri = Uri.parse(customUriString)
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    rawCustom.outputStream().use { out -> input.copyTo(out) }
-                }
-                rawCustom.exists() && rawCustom.length() > 1024L && !isMostlyBlackOrCorrupt(rawCustom)
-            }.getOrDefault(false)
-
-            if (copied) {
-                val composed = runCatching {
-                    composeStudioFrameFromRealPhoto(
-                        rawFile = rawCustom,
-                        outputFile = outputFile,
-                        targetWidth = targetWidth,
-                        targetHeight = targetHeight
-                    )
-                }.getOrDefault(false)
-                rawCustom.delete()
-                if (composed && !isMostlyBlackOrCorrupt(outputFile)) return
-            }
-            rawCustom.delete()
+        progressUpdate: (String) -> Unit
+    ): PreparedVisual {
+        val imageFile = File(renderDirectory, "slab_${tag}.png")
+        val wantsRealPhoto = visualSource.equals("real_photo", ignoreCase = true) &&
+            realQuery.isNotBlank()
+        val isPosterQuery = realQuery.lowercase().let {
+            it.contains("poster") || it.contains("movie") || it.contains("film")
         }
 
-        val wantsRealPhoto = visualSource.equals("real_photo", ignoreCase = true) &&
-            realPhotoQuery.isNotBlank()
-
         if (wantsRealPhoto) {
-            val rawRealFile = File(renderDirectory, "${filePrefix}_real.img")
+            progressUpdate("Fetching real photo ($realQuery)…")
+            val rawRealFile = File(renderDirectory, "real_raw_${tag}.img")
             val downloaded = runCatching {
                 videoRepository.downloadRealPhoto(
-                    query = realPhotoQuery,
+                    query = realQuery,
                     usedUrls = usedRealPhotoUrls,
                     destinationFile = rawRealFile,
                     preferPortrait = isShorts
                 )
             }.getOrDefault(false)
 
-            if (downloaded && !isMostlyBlackOrCorrupt(rawRealFile)) {
-                val composed = runCatching {
+            val composed = if (downloaded) {
+                runCatching {
                     composeStudioFrameFromRealPhoto(
                         rawFile = rawRealFile,
-                        outputFile = outputFile,
-                        targetWidth = targetWidth,
-                        targetHeight = targetHeight
+                        outputFile = imageFile,
+                        targetWidth = width,
+                        targetHeight = height,
+                        isPoster = isPosterQuery
                     )
                 }.getOrDefault(false)
-                rawRealFile.delete()
-                if (composed && !isMostlyBlackOrCorrupt(outputFile)) return
+            } else {
+                false
             }
             rawRealFile.delete()
+
+            if (composed && !isMostlyBlackOrCorrupt(imageFile)) {
+                return PreparedVisual(imageFile, isPoster = isPosterQuery)
+            }
         }
 
-        val primaryPrompt = buildSceneImagePrompt(
+        progressUpdate("Generating AI scene ($tag)…")
+        val fullPrompt = buildSceneImagePrompt(
             characterBible = characterBible,
             visualStyle = visualStyle,
             scenePrompt = scenePrompt,
             hasCharacter = hasCharacter
-        ).ifBlank { "dramatic live-action cinema scene with glowing spotlights and misty atmosphere" }
+        )
 
-        val firstTryOk = runCatching {
-            videoRepository.generateImageForSlab(
-                prompt = primaryPrompt,
-                isShorts = isShorts,
-                seed = sceneSeed
-            ).use { body ->
-                outputFile.outputStream().use { output ->
-                    body.byteStream().use { input -> input.copyTo(output) }
+        val seedsToTry = listOf(sceneSeed, sceneSeed + 997)
+        for (trySeed in seedsToTry) {
+            val ok = runCatching {
+                videoRepository.generateImageForSlab(
+                    prompt = fullPrompt,
+                    isShorts = isShorts,
+                    seed = trySeed,
+                    visualStyle = visualStyle
+                ).use { body ->
+                    imageFile.outputStream().use { output ->
+                        body.byteStream().use { input -> input.copyTo(output) }
+                    }
                 }
+                isValidImageHeader(imageFile) && !isMostlyBlackOrCorrupt(imageFile)
+            }.getOrDefault(false)
+            if (ok) {
+                return PreparedVisual(imageFile, isPoster = false)
             }
-            validateImageFile(outputFile) && !isMostlyBlackOrCorrupt(outputFile)
-        }.getOrDefault(false)
-        if (firstTryOk) return
-
-        outputFile.delete()
-        val retryPrompt =
-            "live-action cinema wide shot of dramatic movie theater stage with warm spotlights and rising smoke"
-        val retryOk = runCatching {
-            videoRepository.generateImageForSlab(
-                prompt = retryPrompt,
-                isShorts = isShorts,
-                seed = sceneSeed + 997
-            ).use { body ->
-                outputFile.outputStream().use { output ->
-                    body.byteStream().use { input -> input.copyTo(output) }
-                }
-            }
-            validateImageFile(outputFile) && !isMostlyBlackOrCorrupt(outputFile)
-        }.getOrDefault(false)
-        if (retryOk) return
-
-        outputFile.delete()
-        if (lastValidVisualFile != null && lastValidVisualFile.exists() && !isMostlyBlackOrCorrupt(lastValidVisualFile)) {
-            lastValidVisualFile.copyTo(outputFile, overwrite = true)
-            return
         }
 
-        renderGradientFallbackPng(outputFile, targetWidth, targetHeight)
+        if (previousValidImageFile != null && previousValidImageFile.exists()) {
+            previousValidImageFile.copyTo(imageFile, overwrite = true)
+            return PreparedVisual(imageFile, isPoster = false)
+        }
+
+        renderGradientFallbackPng(imageFile, width, height)
+        return PreparedVisual(imageFile, isPoster = false)
+    }
+
+    private fun isValidImageHeader(file: File): Boolean {
+        if (!file.exists() || file.length() < 512L) return false
+        val header = file.inputStream().use { stream ->
+            val buffer = ByteArray(16)
+            val read = stream.read(buffer)
+            if (read > 0) String(buffer, 0, read, Charsets.UTF_8).trimStart() else ""
+        }
+        return !header.startsWith("{") && !header.startsWith("<")
     }
 
     private fun isMostlyBlackOrCorrupt(file: File): Boolean {
         if (!file.exists() || file.length() < 512L) return true
-        val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
-        val bmp = runCatching { BitmapFactory.decodeFile(file.absolutePath, opts) }.getOrNull() ?: return true
-        try {
-            if (bmp.width <= 0 || bmp.height <= 0) return true
+        val opts = BitmapFactory.Options().apply { inSampleSize = 16 }
+        val bmp = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return true
+        return try {
+            val w = bmp.width
+            val h = bmp.height
+            if (w <= 0 || h <= 0) return true
             var lumaSum = 0.0
-            var samples = 0
-            val stepX = (bmp.width / 12).coerceAtLeast(1)
-            val stepY = (bmp.height / 12).coerceAtLeast(1)
-            var y = stepY / 2
-            while (y < bmp.height) {
-                var x = stepX / 2
-                while (x < bmp.width) {
+            var count = 0
+            for (y in 0 until h step 2) {
+                for (x in 0 until w step 2) {
                     val px = bmp.getPixel(x, y)
-                    val r = Color.red(px)
-                    val g = Color.green(px)
-                    val b = Color.blue(px)
-                    lumaSum += (0.299 * r + 0.587 * g + 0.114 * b)
-                    samples++
-                    x += stepX
+                    val luma = 0.299 * Color.red(px) + 0.587 * Color.green(px) + 0.114 * Color.blue(px)
+                    lumaSum += luma
+                    count++
                 }
-                y += stepY
             }
-            if (samples == 0) return true
-            val avgLuma = lumaSum / samples
-            return avgLuma < 8.5
+            val avgLuma = if (count > 0) lumaSum / count else 0.0
+            avgLuma < 8.5
         } finally {
             bmp.recycle()
         }
     }
 
-    private fun renderGradientFallbackPng(outputFile: File, width: Int, height: Int) {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    private fun renderGradientFallbackPng(file: File, width: Int, height: Int) {
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         try {
-            val canvas = Canvas(bitmap)
+            val canvas = Canvas(bmp)
             val paint = Paint().apply {
                 shader = LinearGradient(
                     0f, 0f, width.toFloat(), height.toFloat(),
-                    intArrayOf(0xFF14281D.toInt(), 0xFF0A0F14.toInt(), 0xFF23192D.toInt()),
+                    intArrayOf(0xFF1A0F2E.toInt(), 0xFF0E1D38.toInt(), 0xFF2B1218.toInt()),
                     null,
                     Shader.TileMode.CLAMP
                 )
             }
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-            outputFile.outputStream().use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
+            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 95, it) }
         } finally {
-            bitmap.recycle()
+            bmp.recycle()
         }
     }
 
     private fun composeSplitScreenFrame(
-        topOrLeftFile: File,
-        bottomOrRightFile: File,
+        fileA: File,
+        fileB: File,
         outputFile: File,
         targetWidth: Int,
         targetHeight: Int
-    ) {
-        val bmp1 = BitmapFactory.decodeFile(topOrLeftFile.absolutePath)
-        val bmp2 = BitmapFactory.decodeFile(bottomOrRightFile.absolutePath)
-        if (bmp1 == null || bmp2 == null) {
-            bmp1?.recycle()
-            bmp2?.recycle()
-            topOrLeftFile.copyTo(outputFile, overwrite = true)
-            return
+    ): Boolean {
+        val bmpA = BitmapFactory.decodeFile(fileA.absolutePath) ?: return false
+        val bmpB = BitmapFactory.decodeFile(fileB.absolutePath) ?: run {
+            bmpA.recycle()
+            return false
         }
-
-        val outBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-        try {
-            val canvas = Canvas(outBitmap)
-            canvas.drawColor(Color.BLACK)
+        val outBmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        return try {
+            val canvas = Canvas(outBmp)
             val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-
+            val linePaint = Paint().apply {
+                color = 0xFFFFD700.toInt()
+                strokeWidth = 8f
+            }
             if (targetHeight >= targetWidth) {
                 val halfH = targetHeight / 2
-                val gap = 6
-                drawCenterCrop(canvas, bmp1, RectF(0f, 0f, targetWidth.toFloat(), (halfH - gap).toFloat()), paint)
-                drawCenterCrop(canvas, bmp2, RectF(0f, (halfH + gap).toFloat(), targetWidth.toFloat(), targetHeight.toFloat()), paint)
-
-                val linePaint = Paint().apply { color = 0xFFFFD700.toInt() }
-                canvas.drawRect(0f, (halfH - gap).toFloat(), targetWidth.toFloat(), (halfH + gap).toFloat(), linePaint)
+                drawBitmapCenterCrop(canvas, bmpA, RectF(0f, 0f, targetWidth.toFloat(), halfH.toFloat()), paint)
+                drawBitmapCenterCrop(canvas, bmpB, RectF(0f, halfH.toFloat(), targetWidth.toFloat(), targetHeight.toFloat()), paint)
+                canvas.drawLine(0f, halfH.toFloat(), targetWidth.toFloat(), halfH.toFloat(), linePaint)
             } else {
                 val halfW = targetWidth / 2
-                val gap = 6
-                drawCenterCrop(canvas, bmp1, RectF(0f, 0f, (halfW - gap).toFloat(), targetHeight.toFloat()), paint)
-                drawCenterCrop(canvas, bmp2, RectF((halfW + gap).toFloat(), 0f, targetWidth.toFloat(), targetHeight.toFloat()), paint)
-
-                val linePaint = Paint().apply { color = 0xFFFFD700.toInt() }
-                canvas.drawRect((halfW - gap).toFloat(), 0f, (halfW + gap).toFloat(), targetHeight.toFloat(), linePaint)
+                drawBitmapCenterCrop(canvas, bmpA, RectF(0f, 0f, halfW.toFloat(), targetHeight.toFloat()), paint)
+                drawBitmapCenterCrop(canvas, bmpB, RectF(halfW.toFloat(), 0f, targetWidth.toFloat(), targetHeight.toFloat()), paint)
+                canvas.drawLine(halfW.toFloat(), 0f, halfW.toFloat(), targetHeight.toFloat(), linePaint)
             }
-
-            outputFile.outputStream().use { out ->
-                outBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
+            outputFile.outputStream().use { outBmp.compress(Bitmap.CompressFormat.PNG, 96, it) }
+            outputFile.exists() && outputFile.length() > 1024L
         } finally {
-            outBitmap.recycle()
-            bmp1.recycle()
-            bmp2.recycle()
+            bmpA.recycle()
+            bmpB.recycle()
+            outBmp.recycle()
         }
     }
 
-    private fun drawCenterCrop(canvas: Canvas, src: Bitmap, dst: RectF, paint: Paint) {
-        val dstAspect = dst.width() / dst.height().coerceAtLeast(1f)
-        val srcAspect = src.width.toFloat() / src.height.toFloat().coerceAtLeast(0.01f)
-        val crop = if (srcAspect > dstAspect) {
-            val cropW = (src.height * dstAspect).roundToInt().coerceIn(1, src.width)
+    private fun drawBitmapCenterCrop(canvas: Canvas, src: Bitmap, dst: RectF, paint: Paint) {
+        val srcW = src.width.toFloat()
+        val srcH = src.height.toFloat()
+        val dstAspect = dst.width() / dst.height()
+        val srcAspect = srcW / srcH
+        val srcRect = if (srcAspect > dstAspect) {
+            val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, src.width)
             val left = (src.width - cropW) / 2
             Rect(left, 0, left + cropW, src.height)
         } else {
-            val cropH = (src.width / dstAspect).roundToInt().coerceIn(1, src.height)
+            val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, src.height)
             val top = ((src.height - cropH) * 0.25f).roundToInt().coerceIn(0, src.height - cropH)
             Rect(0, top, src.width, top + cropH)
         }
-        canvas.drawBitmap(src, crop, dst, paint)
+        canvas.drawBitmap(src, srcRect, dst, paint)
     }
 
     private fun composeStudioFrameFromRealPhoto(
         rawFile: File,
         outputFile: File,
         targetWidth: Int,
-        targetHeight: Int
+        targetHeight: Int,
+        isPoster: Boolean = false
     ): Boolean {
         val srcBitmap = BitmapFactory.decodeFile(rawFile.absolutePath) ?: return false
         if (srcBitmap.width <= 0 || srcBitmap.height <= 0) {
@@ -737,86 +739,58 @@ class VideoRenderEngine @Inject constructor(
 
             outBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(outBitmap)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-            val bgCropRect = if (srcAspect > dstAspect) {
-                val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
-                val left = (srcW - cropW) / 2
-                Rect(left, 0, left + cropW, srcH)
-            } else {
-                val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
-                val top = (srcH - cropH) / 2
-                Rect(0, top, srcW, top + cropH)
-            }
-
-            if (srcAspect <= 0.85f && targetHeight > targetWidth) {
-                val blurW = (targetWidth / 24).coerceAtLeast(32)
-                val blurH = (targetHeight / 24).coerceAtLeast(32)
-                tinyBitmap = Bitmap.createBitmap(blurW, blurH, Bitmap.Config.ARGB_8888)
-                Canvas(tinyBitmap).drawBitmap(
-                    srcBitmap,
-                    bgCropRect,
-                    Rect(0, 0, blurW, blurH),
-                    Paint(Paint.FILTER_BITMAP_FLAG)
-                )
-                canvas.drawBitmap(
-                    tinyBitmap,
-                    null,
-                    Rect(0, 0, targetWidth, targetHeight),
-                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-                )
+            if (isPoster && targetHeight > targetWidth) {
+                tinyBitmap = Bitmap.createScaledBitmap(srcBitmap, 48, 84, true)
+                canvas.drawBitmap(tinyBitmap, null, Rect(0, 0, targetWidth, targetHeight), paint)
                 canvas.drawColor(0x55000000)
 
-                val drawW = targetWidth * 0.90f
+                val drawW = targetWidth * 0.92f
                 val drawH = (drawW / srcAspect).coerceAtMost(targetHeight * 0.80f)
-                val finalW = (drawH * srcAspect).coerceAtMost(targetWidth * 0.92f)
+                val finalW = drawH * srcAspect
                 val left = (targetWidth - finalW) / 2f
-                val top = ((targetHeight - drawH) * 0.44f).coerceAtLeast(90f)
-                val dstRect = RectF(left, top, left + finalW, top + drawH)
-
-                canvas.drawBitmap(
-                    srcBitmap,
-                    Rect(0, 0, srcW, srcH),
-                    dstRect,
-                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-                )
+                val top = ((targetHeight - drawH) * 0.42f).coerceAtLeast(110f)
+                canvas.drawBitmap(srcBitmap, null, RectF(left, top, left + finalW, top + drawH), paint)
+            } else if (srcAspect <= 1.08f && targetHeight > targetWidth) {
+                val cropRect = if (srcAspect > dstAspect) {
+                    val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
+                    val left = (srcW - cropW) / 2
+                    Rect(left, 0, left + cropW, srcH)
+                } else {
+                    val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
+                    val top = ((srcH - cropH) * 0.16f).roundToInt().coerceIn(0, srcH - cropH)
+                    Rect(0, top, srcW, top + cropH)
+                }
+                canvas.drawBitmap(srcBitmap, cropRect, Rect(0, 0, targetWidth, targetHeight), paint)
             } else if (targetWidth >= targetHeight && srcAspect >= 1.25f) {
-                drawCenterCrop(canvas, srcBitmap, RectF(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat()), Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                val cropRect = if (srcAspect > dstAspect) {
+                    val cropW = (srcH * dstAspect).roundToInt().coerceIn(1, srcW)
+                    val left = (srcW - cropW) / 2
+                    Rect(left, 0, left + cropW, srcH)
+                } else {
+                    val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
+                    val top = ((srcH - cropH) * 0.22f).roundToInt().coerceIn(0, srcH - cropH)
+                    Rect(0, top, srcW, top + cropH)
+                }
+                canvas.drawBitmap(srcBitmap, cropRect, Rect(0, 0, targetWidth, targetHeight), paint)
             } else {
                 val blurW = (targetWidth / 24).coerceAtLeast(32)
                 val blurH = (targetHeight / 24).coerceAtLeast(32)
-                tinyBitmap = Bitmap.createBitmap(blurW, blurH, Bitmap.Config.ARGB_8888)
-                Canvas(tinyBitmap).drawBitmap(
-                    srcBitmap,
-                    bgCropRect,
-                    Rect(0, 0, blurW, blurH),
-                    Paint(Paint.FILTER_BITMAP_FLAG)
-                )
-
-                canvas.drawBitmap(
-                    tinyBitmap,
-                    null,
-                    Rect(0, 0, targetWidth, targetHeight),
-                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-                )
+                tinyBitmap = Bitmap.createScaledBitmap(srcBitmap, blurW, blurH, true)
+                canvas.drawBitmap(tinyBitmap, null, Rect(0, 0, targetWidth, targetHeight), paint)
                 canvas.drawColor(0x45000000)
 
                 val drawW = targetWidth * 0.94f
                 val drawH = (drawW / srcAspect).coerceAtMost(targetHeight * 0.72f)
-                val finalW = (drawH * srcAspect).coerceAtMost(targetWidth * 0.94f)
+                val finalW = drawH * srcAspect
                 val left = (targetWidth - finalW) / 2f
-                val top = ((targetHeight - drawH) * 0.38f).coerceAtLeast(90f)
-                val dstRect = RectF(left, top, left + finalW, top + drawH)
-
-                canvas.drawBitmap(
-                    srcBitmap,
-                    Rect(0, 0, srcW, srcH),
-                    dstRect,
-                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-                )
+                val top = ((targetHeight - drawH) * 0.40f).coerceAtLeast(90f)
+                canvas.drawBitmap(srcBitmap, null, RectF(left, top, left + finalW, top + drawH), paint)
             }
 
             outputFile.outputStream().use { out ->
-                outBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                outBitmap.compress(Bitmap.CompressFormat.PNG, 98, out)
             }
             return outputFile.exists() && outputFile.length() > 1024L
         } finally {
@@ -827,169 +801,147 @@ class VideoRenderEngine @Inject constructor(
     }
 
     private fun renderWatermarkPng(outputFile: File) {
-        val w = 274
-        val h = 54
+        val w = 360
+        val h = 64
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         try {
             val canvas = Canvas(bmp)
-            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x66000000 }
-            val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0x5539FF14
-                style = Paint.Style.STROKE
-                strokeWidth = 2f
-            }
-            val rect = RectF(2f, 2f, w - 2f, h - 2f)
-            canvas.drawRoundRect(rect, 20f, 20f, bg)
-            canvas.drawRoundRect(rect, 20f, 20f, border)
+            canvas.drawColor(Color.TRANSPARENT)
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x77000000 }
+            canvas.drawRoundRect(RectF(4f, 6f, w - 4f, h - 6f), 26f, 26f, bgPaint)
 
-            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0xCCFFFFFF.toInt()
-                textSize = 25f
+            val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xE6FFFFFF.toInt()
+                textSize = 27f
                 typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
                 textAlign = Paint.Align.CENTER
             }
-            val yPos = (h / 2f) - ((textPaint.descent() + textPaint.ascent()) / 2f)
-            canvas.drawText("@RSMoviesSpot", w / 2f, yPos, textPaint)
+            canvas.drawText("@RSMoviesSpot", w / 2f, h / 2f + 9f, textPaint)
+            outputFile.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    private fun renderStatBadgePng(badgeText: String, outputFile: File): Boolean {
+        val text = badgeText.trim().uppercase(Locale.US)
+        if (text.isBlank()) return false
+        val w = 520
+        val h = 84
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        return try {
+            val canvas = Canvas(bmp)
+            canvas.drawColor(Color.TRANSPARENT)
+
+            val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.BLACK
+                textSize = 34f
+                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+                textAlign = Paint.Align.CENTER
+            }
+            val textW = paint.measureText(text)
+            val pillW = (textW + 64f).coerceIn(200f, w - 16f)
+            val left = (w - pillW) / 2f
+            val rect = RectF(left, 10f, left + pillW, h - 10f)
+
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFD700.toInt() }
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFF111111.toInt()
+                style = Paint.Style.STROKE
+                strokeWidth = 4f
+            }
+            canvas.drawRoundRect(rect, 28f, 28f, bgPaint)
+            canvas.drawRoundRect(rect, 28f, 28f, borderPaint)
+            canvas.drawText(text, w / 2f, h / 2f + 12f, paint)
 
             outputFile.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            outputFile.exists() && outputFile.length() > 512L
         } finally {
             bmp.recycle()
         }
     }
 
     private fun renderSubscribeBadgePng(outputFile: File) {
-        val w = 540
-        val h = 92
+        val w = 480
+        val h = 88
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         try {
             val canvas = Canvas(bmp)
-            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xD9CC0000.toInt() }
+            canvas.drawColor(Color.TRANSPARENT)
+            val rect = RectF(10f, 10f, w - 10f, h - 10f)
+            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFE50914.toInt() }
             val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0xFFFFE135.toInt()
+                color = Color.WHITE
                 style = Paint.Style.STROKE
                 strokeWidth = 4f
             }
-            val rect = RectF(4f, 4f, w - 4f, h - 4f)
-            canvas.drawRoundRect(rect, 44f, 44f, bg)
-            canvas.drawRoundRect(rect, 44f, 44f, border)
+            canvas.drawRoundRect(rect, 34f, 34f, bg)
+            canvas.drawRoundRect(rect, 34f, 34f, border)
 
-            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            val txt = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE
-                textSize = 34f
+                textSize = 33f
                 typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
                 textAlign = Paint.Align.CENTER
             }
-            val yPos = (h / 2f) - ((textPaint.descent() + textPaint.ascent()) / 2f)
-            canvas.drawText("SUBSCRIBE • @RSMoviesSpot", w / 2f, yPos, textPaint)
-
+            canvas.drawText("SUBSCRIBE · RS MOVIE SPOT", w / 2f, h / 2f + 11f, txt)
             outputFile.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
         } finally {
             bmp.recycle()
         }
     }
 
-    private fun renderStatBadgePng(
-        badgeText: String,
-        videoWidth: Int,
-        isShorts: Boolean,
-        outputFile: File
-    ): Int? {
-        val clean = badgeText.trim().uppercase(Locale.US).take(28)
-        if (clean.isBlank()) return null
-
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFFFE135.toInt()
-            textSize = if (isShorts) 42f else 36f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            textAlign = Paint.Align.CENTER
-        }
-        val textWidth = textPaint.measureText(clean)
-        val badgeW = ((textWidth + 76f).roundToInt())
-            .coerceIn(240, videoWidth - 80)
-            .let { if (it % 2 == 0) it else it + 1 }
-        val badgeH = if (isShorts) 94 else 82
-
-        val bmp = Bitmap.createBitmap(badgeW, badgeH, Bitmap.Config.ARGB_8888)
+    private fun renderCoverThumbnailJpg(baseImage: File, headline: String, outputFile: File) {
+        val src = BitmapFactory.decodeFile(baseImage.absolutePath) ?: return
+        val out = Bitmap.createBitmap(1080, 1920, Bitmap.Config.ARGB_8888)
         try {
-            val canvas = Canvas(bmp)
-            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xD4101612.toInt() }
-            val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0xFFFFE135.toInt()
-                style = Paint.Style.STROKE
-                strokeWidth = 4f
-            }
-            val rect = RectF(4f, 4f, badgeW - 4f, badgeH - 4f)
-            canvas.drawRoundRect(rect, 26f, 26f, bg)
-            canvas.drawRoundRect(rect, 26f, 26f, border)
-
-            val yPos = (badgeH / 2f) - ((textPaint.descent() + textPaint.ascent()) / 2f)
-            canvas.drawText(clean, badgeW / 2f, yPos, textPaint)
-
-            outputFile.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            return badgeW
-        } finally {
-            bmp.recycle()
-        }
-    }
-
-    private fun renderCoverThumbnailJpg(
-        sourceImageFile: File,
-        headlineText: String,
-        isShorts: Boolean,
-        outputFile: File
-    ) {
-        val src = BitmapFactory.decodeFile(sourceImageFile.absolutePath) ?: return
-        val w = if (isShorts) 1080 else 1280
-        val h = if (isShorts) 1920 else 720
-        val outBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        try {
-            val canvas = Canvas(outBmp)
-            drawCenterCrop(canvas, src, RectF(0f, 0f, w.toFloat(), h.toFloat()), Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
-
-            val shadePaint = Paint().apply {
+            val canvas = Canvas(out)
+            drawBitmapCenterCrop(
+                canvas,
+                src,
+                RectF(0f, 0f, 1080f, 1920f),
+                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            )
+            val gradPaint = Paint().apply {
                 shader = LinearGradient(
-                    0f, h * 0.45f, 0f, h.toFloat(),
-                    intArrayOf(0x00000000, 0xCC000000.toInt(), 0xEE000000.toInt()),
+                    0f, 960f, 0f, 1920f,
+                    intArrayOf(Color.TRANSPARENT, 0xCC000000.toInt(), 0xEE000000.toInt()),
                     null,
                     Shader.TileMode.CLAMP
                 )
             }
-            canvas.drawRect(0f, h * 0.45f, w.toFloat(), h.toFloat(), shadePaint)
+            canvas.drawRect(0f, 960f, 1080f, 1920f, gradPaint)
 
-            val title = headlineText.trim().take(48).ifBlank { "RS Movie Spot" }
-            val tp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            val cleanHead = headline.trim().take(48).uppercase(Locale.US)
+            val fill = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = 0xFFFFE135.toInt()
-                textSize = if (isShorts) 72f else 62f
+                textSize = 72f
                 typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
             }
-            val sp = TextPaint(tp).apply {
-                color = Color.BLACK
+            val stroke = TextPaint(fill).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = 14f
-                strokeJoin = Paint.Join.ROUND
+                color = Color.BLACK
             }
-            val maxW = (w - 110).coerceAtLeast(320)
-            val fillLayout = StaticLayout.Builder.obtain(title, 0, title.length, tp, maxW)
+            val fillLayout = StaticLayout.Builder.obtain(cleanHead, 0, cleanHead.length, fill, 960)
                 .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                .setMaxLines(2)
+                .setLineSpacing(6f, 1.05f)
                 .build()
-            val strokeLayout = StaticLayout.Builder.obtain(title, 0, title.length, sp, maxW)
+            val strokeLayout = StaticLayout.Builder.obtain(cleanHead, 0, cleanHead.length, stroke, 960)
                 .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                .setMaxLines(2)
+                .setLineSpacing(6f, 1.05f)
                 .build()
 
             canvas.save()
-            canvas.translate((w - maxW) / 2f, h - fillLayout.height - if (isShorts) 220f else 90f)
+            canvas.translate(60f, (1760f - fillLayout.height).coerceAtLeast(1150f))
             strokeLayout.draw(canvas)
             fillLayout.draw(canvas)
             canvas.restore()
 
-            outputFile.outputStream().use { out ->
-                outBmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
-            }
+            outputFile.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 92, it) }
         } finally {
-            outBmp.recycle()
             src.recycle()
+            out.recycle()
         }
     }
 
@@ -1021,7 +973,7 @@ class VideoRenderEngine @Inject constructor(
         rawFiles.forEachIndexed { index, rawMp3 ->
             val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
             val isLast = index == rawFiles.lastIndex
-            val microBreath = if (isLast) 0.02 else 0.05
+            val microBreath = if (isLast) 0.02 else 0.06
 
             val trimmedOk = runCatching {
                 runFfmpeg(
@@ -1147,7 +1099,7 @@ class VideoRenderEngine @Inject constructor(
         val boxPadY = if (isShorts) 18f else 16f
         val maxStripHeight = if (isShorts) 320 else 240
 
-        var fontSize = if (isShorts) 56f else 46f
+        var fontSize = if (isShorts) 54f else 46f
         lateinit var fillPaint: TextPaint
         lateinit var layout: StaticLayout
 
@@ -1253,11 +1205,17 @@ class VideoRenderEngine @Inject constructor(
         raw
             .replace(
                 Regex(
-                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|text overlay)\\b",
+                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay)\\b",
                     RegexOption.IGNORE_CASE
                 ),
                 "dramatic packed cinema theater"
             )
+            .replace(Regex("\\banimals?\\b", RegexOption.IGNORE_CASE), "intense Bollywood action film")
+            .replace(Regex("\\bspirits?\\b", RegexOption.IGNORE_CASE), "fierce police thriller")
+            .replace(Regex("\\bdark violence\\b|\\bbrutal violence\\b|\\bviolence\\b", RegexOption.IGNORE_CASE), "gritty dramatic action confrontation in moody night rain")
+            .replace(Regex("\\bblood rivers?\\b|\\brivers of blood\\b", RegexOption.IGNORE_CASE), "dramatic crimson-lit action showdown with flying sparks")
+            .replace(Regex("\\bbox[- ]?office\\b", RegexOption.IGNORE_CASE), "cheering packed cinema hall")
+            .replace(Regex("\\bclose[- ]?up(?:\\s+of)?(?:\\s+a)?(?:\\s+woman'?s?)?\\s+eyes?\\b", RegexOption.IGNORE_CASE), "dramatic medium shot of intense action hero")
             .replace(Regex("\\bunreal engine(?:\\s*5)?\\b", RegexOption.IGNORE_CASE), "live-action 35mm cinema still")
             .replace(Regex("\\babstract\\b", RegexOption.IGNORE_CASE), "realistic live-action")
             .trim()
@@ -1273,11 +1231,12 @@ class VideoRenderEngine @Inject constructor(
         val cleanStyle = sanitizePromptText(visualStyle)
 
         return buildString {
-            append(cleanScene)
             if (hasCharacter && cleanBible.isNotBlank()) {
-                append(". Character details: ")
+                append("Character appearance: ")
                 append(cleanBible)
+                append(". ")
             }
+            append(cleanScene)
             if (cleanStyle.isNotBlank()) {
                 append(". Style: ")
                 append(cleanStyle)
@@ -1481,31 +1440,22 @@ class VideoRenderEngine @Inject constructor(
                     val pluckEnv = exp(-12.0 * halfBeatT)
                     val pluck = (sin(2.0 * PI * pluckFreq * halfBeatT) +
                         0.35 * sin(2.0 * PI * pluckFreq * 2.0 * halfBeatT)) * pluckEnv * 0.36
-
                     val bassFreq = chord[0] * 0.5
                     val bass = sin(2.0 * PI * bassFreq * beatT) * exp(-7.5 * beatT) * 0.34
-
-                    val isSnareBeat = (beatNumber % 2 == 1)
-                    val snap = if (isSnareBeat) {
+                    val snap = if (beatNumber % 2 == 1) {
                         rand.nextDouble(-1.0, 1.0) * exp(-28.0 * beatT) * 0.26
                     } else 0.0
-
                     pluck + bass + snap
                 }
                 BgmStyle.SUSPENSE_THRILLER -> {
                     val tick = (sin(2.0 * PI * 1950.0 * halfBeatT) * 0.5 +
                         rand.nextDouble(-1.0, 1.0) * 0.5) * exp(-55.0 * halfBeatT) * 0.22
-
                     val heartbeat = if (beatNumber % 2 == 0) {
                         sin(2.0 * PI * 72.0 * beatT) * exp(-12.0 * beatT) * 0.40
                     } else 0.0
-
-                    val bellFreq = chord[3] * 2.0
-                    val bell = sin(2.0 * PI * bellFreq * chordLocalT) * exp(-1.8 * chordLocalT) * 0.20
-
+                    val bell = sin(2.0 * PI * chord[3] * 2.0 * chordLocalT) * exp(-1.8 * chordLocalT) * 0.20
                     val lowDrone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.20 +
                         sin(2.0 * PI * chord[1] * t) * 0.10) * chordEnv
-
                     tick + heartbeat + bell + lowDrone
                 }
                 BgmStyle.EMOTIONAL_SAD -> {
@@ -1513,16 +1463,12 @@ class VideoRenderEngine @Inject constructor(
                     val pianoDecay = exp(-1.4 * chordLocalT)
                     var piano = 0.0
                     for (freq in chord) {
-                        piano += sin(2.0 * PI * freq * t) * 0.18 +
-                            sin(2.0 * PI * freq * 2.0 * t) * 0.05
+                        piano += sin(2.0 * PI * freq * t) * 0.18 + sin(2.0 * PI * freq * 2.0 * t) * 0.05
                     }
                     piano *= pianoAttack * pianoDecay
-
                     val stepIdx = ((t / beatDuration).toInt()) % arpOrder.size
-                    val melodyFreq = chord[arpOrder[stepIdx]] * 2.0
-                    val melody = sin(2.0 * PI * melodyFreq * beatT) *
+                    val melody = sin(2.0 * PI * chord[arpOrder[stepIdx]] * 2.0 * beatT) *
                         (beatT / 0.015).coerceAtMost(1.0) * exp(-2.8 * beatT) * 0.24
-
                     val warmPad = sin(2.0 * PI * chord[0] * 0.5 * t) * chordEnv * 0.22
                     piano + melody + warmPad
                 }
@@ -1530,48 +1476,32 @@ class VideoRenderEngine @Inject constructor(
                     val drone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.22 +
                         sin(2.0 * PI * chord[1] * t) * 0.12 +
                         sin(2.0 * PI * chord[2] * t) * 0.08) * chordEnv
-
                     val stepIdx = ((t / beatDuration).toInt()) % arpOrder.size
                     val fluteFreq = chord[arpOrder[stepIdx]] * 2.0
                     val vibrato = 1.0 + 0.008 * sin(2.0 * PI * 5.2 * t)
                     val fluteEnv = sin(PI * (beatT / beatDuration).coerceIn(0.0, 1.0)).pow(0.8)
                     val flute = sin(2.0 * PI * fluteFreq * vibrato * t) * fluteEnv * 0.24
-
                     val bell = (sin(2.0 * PI * chord[3] * 2.0 * chordLocalT) +
-                        0.4 * sin(2.0 * PI * chord[3] * 4.0 * chordLocalT)) *
-                        exp(-2.6 * chordLocalT) * 0.16
-
+                        0.4 * sin(2.0 * PI * chord[3] * 4.0 * chordLocalT)) * exp(-2.6 * chordLocalT) * 0.16
                     drone + flute + bell
                 }
                 BgmStyle.SCI_FI_TECH -> {
                     val stepIdx = ((t / (beatDuration * 0.25)).toInt()) % arpOrder.size
                     val arpFreq = chord[arpOrder[stepIdx]] * 2.0
                     val arp = (sin(2.0 * PI * arpFreq * quarterBeatT) +
-                        0.4 * sin(2.0 * PI * arpFreq * 2.0 * quarterBeatT)) *
-                        exp(-14.0 * quarterBeatT) * 0.28
-
-                    val pad = (sin(2.0 * PI * chord[0] * t) * 0.16 +
-                        sin(2.0 * PI * chord[2] * t) * 0.12) * chordEnv
-
+                        0.4 * sin(2.0 * PI * arpFreq * 2.0 * quarterBeatT)) * exp(-14.0 * quarterBeatT) * 0.28
+                    val pad = (sin(2.0 * PI * chord[0] * t) * 0.16 + sin(2.0 * PI * chord[2] * t) * 0.12) * chordEnv
                     val kickFreq = 58.0 + 130.0 * exp(-30.0 * beatT)
                     val kick = sin(2.0 * PI * kickFreq * beatT) * exp(-11.0 * beatT) * 0.36
-                    val hat = if (stepIdx % 2 == 1) {
-                        rand.nextDouble(-1.0, 1.0) * exp(-45.0 * quarterBeatT) * 0.12
-                    } else 0.0
-
+                    val hat = if (stepIdx % 2 == 1) rand.nextDouble(-1.0, 1.0) * exp(-45.0 * quarterBeatT) * 0.12 else 0.0
                     arp + pad + kick + hat
                 }
                 BgmStyle.MOTIVATIONAL -> {
                     val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
-                    val arpFreq = chord[arpOrder[stepIdx]] * 1.5
-                    val arp = sin(2.0 * PI * arpFreq * halfBeatT) * exp(-7.5 * halfBeatT) * 0.28
-
+                    val arp = sin(2.0 * PI * chord[arpOrder[stepIdx]] * 1.5 * halfBeatT) * exp(-7.5 * halfBeatT) * 0.28
                     var pad = 0.0
-                    for (freq in chord) {
-                        pad += sin(2.0 * PI * freq * t) * 0.12
-                    }
+                    for (freq in chord) pad += sin(2.0 * PI * freq * t) * 0.12
                     pad *= chordEnv
-
                     val kickFreq = 62.0 + 95.0 * exp(-22.0 * beatT)
                     val kick = sin(2.0 * PI * kickFreq * beatT) * exp(-10.0 * beatT) * 0.34
                     arp + pad + kick
@@ -1581,12 +1511,10 @@ class VideoRenderEngine @Inject constructor(
                     val drone = (sin(2.0 * PI * chord[0] * 0.5 * t) * 0.28 +
                         sin(2.0 * PI * chord[1] * t) * 0.16 +
                         sin(2.0 * PI * chord[3] * 1.5 * t) * 0.08) * chordEnv * lfo
-
                     val metalHit = if (beatNumber % 4 == 0) {
                         (sin(2.0 * PI * 740.0 * beatT) * 0.6 + sin(2.0 * PI * 1185.0 * beatT) * 0.4) *
                             exp(-2.4 * beatT) * 0.22
                     } else 0.0
-
                     drone + metalHit
                 }
                 BgmStyle.EPIC_ACTION -> {
@@ -1597,15 +1525,11 @@ class VideoRenderEngine @Inject constructor(
                             sin(2.0 * PI * freq * 3.0 * t) * 0.03
                     }
                     brass *= chordEnv * (0.85 + 0.15 * sin(2.0 * PI * 0.6 * t))
-
                     val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
-                    val motifFreq = chord[arpOrder[stepIdx]] * 1.5
-                    val motif = sin(2.0 * PI * motifFreq * halfBeatT) * exp(-9.0 * halfBeatT) * 0.20
-
+                    val motif = sin(2.0 * PI * chord[arpOrder[stepIdx]] * 1.5 * halfBeatT) * exp(-9.0 * halfBeatT) * 0.20
                     val drumFreq = 65.0 + 105.0 * exp(-26.0 * beatT)
                     val mainDrum = sin(2.0 * PI * drumFreq * beatT) * exp(-13.0 * beatT) * 0.40
                     val doubleHit = sin(2.0 * PI * 88.0 * halfBeatT) * exp(-18.0 * halfBeatT) * 0.18
-
                     brass + motif + mainDrum + doubleHit
                 }
             }
@@ -1791,7 +1715,7 @@ class VideoRenderEngine @Inject constructor(
                         "equalizer=f=180:t=o:w=1.2:g=3.5," +
                         "equalizer=f=3200:t=o:w=1.5:g=3.0," +
                         "acompressor=threshold=-16dB:ratio=3:attack=5:release=60," +
-                        "volume=1.18",
+                        "volume=1.15",
                     "-ar", "44100",
                     "-ac", "1",
                     "-c:a", "pcm_s16le",
@@ -1829,32 +1753,33 @@ class VideoRenderEngine @Inject constructor(
             null
         }
 
-        // Kotlin PCM Mixer with Automatic Voice-Triggered BGM Ducking
         val mixedWavFile = File(renderDirectory, "mixed_master.wav")
         val kotlinMixOk = runCatching {
             val voiceSamples = readMono16BitWavSamples(voiceSource)
             val bgmSamples = bgmWavFile?.let { readMono16BitWavSamples(it) } ?: ShortArray(0)
             val sfxSamples = sfxTrackFile?.let { readMono16BitWavSamples(it) } ?: ShortArray(0)
             val totalSamples = (totalDurationSeconds * 44100.0).roundToInt().coerceAtLeast(44100)
-            var voiceEnv = 0.0
+
+            var envelope = 0.0
+            var currentDuckGain = 0.28
 
             writeMono16BitWav(mixedWavFile, 44100, totalSamples) { idx ->
                 val v = if (idx < voiceSamples.size) voiceSamples[idx] / 32768.0 else 0.0
                 val absV = abs(v)
-                voiceEnv = if (absV > voiceEnv) {
-                    voiceEnv * 0.98 + absV * 0.02
+                envelope = if (absV > envelope) {
+                    envelope * 0.985 + absV * 0.015
                 } else {
-                    voiceEnv * 0.99985
+                    envelope * 0.9996 + absV * 0.0004
                 }
-                val duckFactor = (1.0 - (voiceEnv * 7.5).coerceIn(0.0, 1.0))
-                val bgmGain = 0.13 + (0.15 * duckFactor)
+                val targetGain = if (envelope > 0.025) 0.13 else 0.28
+                currentDuckGain = currentDuckGain * 0.9995 + targetGain * 0.0005
 
                 val b = if (bgmSamples.isNotEmpty()) {
-                    (bgmSamples[idx % bgmSamples.size] / 32768.0) * bgmGain
+                    (bgmSamples[idx % bgmSamples.size] / 32768.0) * currentDuckGain
                 } else {
                     0.0
                 }
-                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.36 else 0.0
+                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.34 else 0.0
                 (v + b + s).coerceIn(-0.96, 0.96)
             }
             mixedWavFile.exists() && mixedWavFile.length() > 44L
@@ -1924,152 +1849,90 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun validateImageFile(imageFile: File): Boolean {
-        if (!imageFile.exists() || imageFile.length() < 64L) return false
-        val header = imageFile.inputStream().use { stream ->
-            val buffer = ByteArray(16)
-            val read = stream.read(buffer)
-            if (read > 0) String(buffer, 0, read, Charsets.UTF_8).trimStart() else ""
-        }
-        return !header.startsWith("{") && !header.startsWith("<")
-    }
-
-    private fun createVideoOnlySegmentArguments(
-        motionStyleIndex: Int,
-        isFirstScene: Boolean,
-        isLastScene: Boolean,
-        isPunchZoom: Boolean,
-        gentlePosterZoom: Boolean,
-        imageFile: File,
+    private fun createVideoClipSegmentArguments(
+        sceneIndex: Int,
+        totalScenes: Int,
+        clipFile: File,
+        watermarkFile: File,
+        statBadgeFile: File?,
+        subscribeBadgeFile: File?,
         popCaptions: List<PopCaptionChunk>,
-        fixedOverlays: List<FixedOverlay>,
         outputFile: File,
         width: Int,
         height: Int,
         segmentFrames: Int
     ): Array<String> {
         val frames = segmentFrames.coerceAtLeast(1)
-        val denom = (frames - 1).coerceAtLeast(1)
         val durationSeconds = frames.toDouble() / FRAME_RATE
-        val fadeOutStart = String.format(
-            Locale.US,
-            "%.2f",
-            (durationSeconds - 0.30).coerceAtLeast(0.05)
-        )
-
-        val upWidth = (width * 3) / 2
-        val upHeight = (height * 3) / 2
-
-        val motionFilter = when {
-            gentlePosterZoom ->
-                "zoompan=z='min(zoom+0.0012,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
-                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-            isPunchZoom ->
-                "zoompan=z='if(lte(on,1),1.28,max(1.06,zoom-0.0035))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
-                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-            motionStyleIndex % 4 == 0 ->
-                "zoompan=z='min(zoom+0.0025,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
-                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-            motionStyleIndex % 4 == 1 ->
-                "zoompan=z='if(lte(on,1),1.25,max(1.0,zoom-0.0025))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
-                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-            motionStyleIndex % 4 == 2 ->
-                "zoompan=z='1.20':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':" +
-                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-            else ->
-                "zoompan=z='1.20':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
-                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-        }
-
+        val fadeOutStart = String.format(Locale.US, "%.2f", (durationSeconds - 0.30).coerceAtLeast(0.05))
         val edgeFades = buildString {
-            if (isFirstScene) append("fade=t=in:st=0:d=0.18,")
-            if (isLastScene) append("fade=t=out:st=$fadeOutStart:d=0.28,")
+            if (sceneIndex == 0) append("fade=t=in:st=0:d=0.22,")
+            if (sceneIndex == totalScenes - 1) append("fade=t=out:st=$fadeOutStart:d=0.28,")
         }
-
         val baseGrade = "eq=contrast=1.06:saturation=1.10,vignette=PI/6"
-        val hasOverlays = popCaptions.isNotEmpty() || fixedOverlays.isNotEmpty()
 
-        if (hasOverlays) {
-            val args = mutableListOf("-y", "-i", imageFile.absolutePath)
-            fixedOverlays.forEach { ov ->
-                args += "-i"
-                args += ov.file.absolutePath
-            }
-            popCaptions.forEach { chunk ->
-                args += "-i"
-                args += chunk.file.absolutePath
-            }
-
-            val filterBuilder = StringBuilder()
-            filterBuilder.append(
-                "[0:v]scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
-                    "crop=$upWidth:$upHeight," +
-                    "setsar=1," +
-                    "$motionFilter," +
-                    "$baseGrade[v0];"
-            )
-
-            var stageIndex = 0
-            var inputCursor = 1
-
-            fixedOverlays.forEach { ov ->
-                val prevLabel = "v$stageIndex"
-                stageIndex++
-                val nextLabel = "v$stageIndex"
-                filterBuilder.append(
-                    "[$prevLabel][$inputCursor:v]overlay=${ov.x}:${ov.y}:eof_action=repeat[$nextLabel];"
-                )
-                inputCursor++
-            }
-
-            popCaptions.forEach { chunk ->
-                val prevLabel = "v$stageIndex"
-                stageIndex++
-                val nextLabel = "v$stageIndex"
-                val overlayY = if (height > width) {
-                    (height - chunk.stripHeight - 420).coerceAtLeast(0)
-                } else {
-                    (height - chunk.stripHeight - 55).coerceAtLeast(0)
-                }
-                val st = String.format(Locale.US, "%.2f", chunk.startSeconds)
-                val en = String.format(Locale.US, "%.2f", chunk.endSeconds)
-                filterBuilder.append(
-                    "[$prevLabel][$inputCursor:v]overlay=0:$overlayY:eof_action=repeat:enable='between(t,$st,$en)'[$nextLabel];"
-                )
-                inputCursor++
-            }
-
-            filterBuilder.append("[v$stageIndex]${edgeFades}format=yuv420p[vout]")
-
-            args += listOf(
-                "-filter_complex", filterBuilder.toString(),
-                "-map", "[vout]",
-                "-frames:v", frames.toString(),
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "21",
-                "-threads", "2",
-                "-pix_fmt", "yuv420p",
-                "-r", FRAME_RATE.toString(),
-                outputFile.absolutePath
-            )
-            return args.toTypedArray()
+        val args = mutableListOf("-y", "-stream_loop", "-1", "-i", clipFile.absolutePath)
+        val overlayInputs = mutableListOf<Triple<File, String, String>>()
+        overlayInputs += Triple(watermarkFile, if (height > width) "W-w-28" else "W-w-36", if (height > width) "95" else "32")
+        statBadgeFile?.takeIf { it.exists() }?.let {
+            overlayInputs += Triple(it, "(W-w)/2", if (height > width) "180" else "40")
+        }
+        subscribeBadgeFile?.takeIf { it.exists() }?.let {
+            val subY = if (height > width) (height - 260).toString() else (height - 150).toString()
+            overlayInputs += Triple(it, "(W-w)/2", subY)
         }
 
-        val filter =
-            "scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
-                "crop=$upWidth:$upHeight," +
-                "setsar=1," +
-                "$motionFilter," +
-                "$baseGrade," +
-                edgeFades +
-                "format=yuv420p"
+        overlayInputs.forEach { (f, _, _) -> args += "-i"; args += f.absolutePath }
+        popCaptions.forEach { chunk -> args += "-i"; args += chunk.file.absolutePath }
 
-        return arrayOf(
-            "-y",
-            "-i", imageFile.absolutePath,
-            "-vf", filter,
+        val filter = StringBuilder()
+        if (height > width) {
+            val maxFgH = ((height * 0.68).roundToInt() / 2) * 2
+            filter.append(
+                "[0:v]fps=$FRAME_RATE,setsar=1,split=2[bg_in][fg_in];" +
+                    "[bg_in]scale=54:96:flags=bilinear,scale=$width:$height:flags=bilinear,eq=brightness=-0.16,setsar=1[bg_blur];" +
+                    "[fg_in]scale=$width:$maxFgH:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1[fg_fit];" +
+                    "[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2-60,$baseGrade[v_0];"
+            )
+        } else {
+            filter.append(
+                "[0:v]fps=$FRAME_RATE,setsar=1,split=2[bg_in][fg_in];" +
+                    "[bg_in]scale=96:54:flags=bilinear,scale=$width:$height:flags=bilinear,eq=brightness=-0.16,setsar=1[bg_blur];" +
+                    "[fg_in]scale=$width:$height:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1[fg_fit];" +
+                    "[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,$baseGrade[v_0];"
+            )
+        }
+
+        var currentLabel = "v_0"
+        var step = 0
+        overlayInputs.forEachIndexed { idx, (_, xExpr, yExpr) ->
+            val inputIdx = 1 + idx
+            val nextLabel = "v_${++step}"
+            filter.append("[$currentLabel][$inputIdx:v]overlay=$xExpr:$yExpr:eof_action=repeat[$nextLabel];")
+            currentLabel = nextLabel
+        }
+
+        popCaptions.forEachIndexed { idx, chunk ->
+            val inputIdx = 1 + overlayInputs.size + idx
+            val nextLabel = "v_${++step}"
+            val overlayY = if (height > width) {
+                (height - chunk.stripHeight - 420).coerceAtLeast(0)
+            } else {
+                (height - chunk.stripHeight - 55).coerceAtLeast(0)
+            }
+            val st = String.format(Locale.US, "%.2f", chunk.startSeconds)
+            val en = String.format(Locale.US, "%.2f", chunk.endSeconds)
+            filter.append(
+                "[$currentLabel][$inputIdx:v]overlay=0:$overlayY:eof_action=repeat:enable='between(t,$st,$en)'[$nextLabel];"
+            )
+            currentLabel = nextLabel
+        }
+
+        filter.append("[$currentLabel]${edgeFades}format=yuv420p[vout]")
+
+        args += listOf(
+            "-filter_complex", filter.toString(),
+            "-map", "[vout]",
             "-frames:v", frames.toString(),
             "-an",
             "-c:v", "libx264",
@@ -2080,6 +1943,116 @@ class VideoRenderEngine @Inject constructor(
             "-r", FRAME_RATE.toString(),
             outputFile.absolutePath
         )
+        return args.toTypedArray()
+    }
+
+    private suspend fun renderPhotoSegmentWithOverlays(
+        sceneIndex: Int,
+        totalScenes: Int,
+        imageFile: File,
+        isPoster: Boolean,
+        sfxCue: String,
+        watermarkFile: File,
+        statBadgeFile: File?,
+        subscribeBadgeFile: File?,
+        popCaptions: List<PopCaptionChunk>,
+        outputFile: File,
+        width: Int,
+        height: Int,
+        segmentFrames: Int
+    ) {
+        val frames = segmentFrames.coerceAtLeast(1)
+        val denom = (frames - 1).coerceAtLeast(1)
+        val durationSeconds = frames.toDouble() / FRAME_RATE
+        val fadeOutStart = String.format(Locale.US, "%.2f", (durationSeconds - 0.30).coerceAtLeast(0.05))
+        val upWidth = (width * 3) / 2
+        val upHeight = (height * 3) / 2
+
+        val motionFilter = when {
+            isPoster ->
+                "zoompan=z='min(zoom+0.0012,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            sfxCue.equals("boom", ignoreCase = true) || sfxCue.equals("thunder", ignoreCase = true) ->
+                "zoompan=z='if(lte(on,1),1.26,max(1.0,zoom-0.0028))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            sceneIndex % 4 == 0 ->
+                "zoompan=z='min(zoom+0.0024,1.24)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            sceneIndex % 4 == 1 ->
+                "zoompan=z='if(lte(on,1),1.24,max(1.0,zoom-0.0024))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            sceneIndex % 4 == 2 ->
+                "zoompan=z='1.18':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            else ->
+                "zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+        }
+
+        val edgeFades = buildString {
+            if (sceneIndex == 0) append("fade=t=in:st=0:d=0.22,")
+            if (sceneIndex == totalScenes - 1) append("fade=t=out:st=$fadeOutStart:d=0.28,")
+        }
+        val baseGrade = "eq=contrast=1.06:saturation=1.10,vignette=PI/6"
+
+        val args = mutableListOf("-y", "-i", imageFile.absolutePath)
+        val overlayInputs = mutableListOf<Triple<File, String, String>>()
+        overlayInputs += Triple(watermarkFile, if (height > width) "W-w-28" else "W-w-36", if (height > width) "95" else "32")
+        statBadgeFile?.takeIf { it.exists() }?.let {
+            overlayInputs += Triple(it, "(W-w)/2", if (height > width) "180" else "40")
+        }
+        subscribeBadgeFile?.takeIf { it.exists() }?.let {
+            val subY = if (height > width) (height - 260).toString() else (height - 150).toString()
+            overlayInputs += Triple(it, "(W-w)/2", subY)
+        }
+
+        overlayInputs.forEach { (f, _, _) -> args += "-i"; args += f.absolutePath }
+        popCaptions.forEach { chunk -> args += "-i"; args += chunk.file.absolutePath }
+
+        val filter = StringBuilder()
+        filter.append(
+            "[0:v]scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
+                "crop=$upWidth:$upHeight," +
+                "setsar=1," +
+                "$motionFilter," +
+                "$baseGrade[v_0];"
+        )
+
+        var currentLabel = "v_0"
+        var step = 0
+        overlayInputs.forEachIndexed { idx, (_, xExpr, yExpr) ->
+            val inputIdx = 1 + idx
+            val nextLabel = "v_${++step}"
+            filter.append("[$currentLabel][$inputIdx:v]overlay=$xExpr:$yExpr:eof_action=repeat[$nextLabel];")
+            currentLabel = nextLabel
+        }
+
+        popCaptions.forEachIndexed { idx, chunk ->
+            val inputIdx = 1 + overlayInputs.size + idx
+            val nextLabel = "v_${++step}"
+            val overlayY = if (height > width) {
+                (height - chunk.stripHeight - 420).coerceAtLeast(0)
+            } else {
+                (height - chunk.stripHeight - 55).coerceAtLeast(0)
+            }
+            val st = String.format(Locale.US, "%.2f", chunk.startSeconds)
+            val en = String.format(Locale.US, "%.2f", chunk.endSeconds)
+            filter.append(
+                "[$currentLabel][$inputIdx:v]overlay=0:$overlayY:eof_action=repeat:enable='between(t,$st,$en)'[$nextLabel];"
+            )
+            currentLabel = nextLabel
+        }
+
+        filter.append("[$currentLabel]${edgeFades}format=yuv420p[vout]")
+
+        args += listOf(
+            "-filter_complex", filter.toString(),
+            "-map", "[vout]",
+            "-frames:v", frames.toString(),
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "21",
+            "-threads", "2",
+            "-pix_fmt", "yuv420p",
+            "-r", FRAME_RATE.toString(),
+            outputFile.absolutePath
+        )
+        runFfmpeg(args.toTypedArray())
     }
 
     private fun createConcatArguments(
@@ -2129,50 +2102,6 @@ class VideoRenderEngine @Inject constructor(
             }
         }
 
-    private fun publishThumbnailToMediaStore(sourceJpg: File, topic: String): Uri? {
-        val nowMs = System.currentTimeMillis()
-        val nowSec = nowMs / 1000L
-        val fileBase = "RSMovieSpot_Cover_${safeFileName(topic)}_$nowMs"
-        val displayName = "$fileBase.jpg"
-
-        val resolver = context.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Images.Media.TITLE, fileBase)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.DATE_ADDED, nowSec)
-            put(MediaStore.Images.Media.DATE_MODIFIED, nowSec)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.DATE_TAKEN, nowMs)
-                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/RS Movie Spot")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-        }
-
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        }
-
-        val uri = resolver.insert(collection, values) ?: return null
-        try {
-            val out = resolver.openOutputStream(uri) ?: return null
-            out.use { dst ->
-                sourceJpg.inputStream().use { src -> src.copyTo(dst) }
-                dst.flush()
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
-            }
-            return uri
-        } catch (_: Exception) {
-            resolver.delete(uri, null, null)
-            return null
-        }
-    }
-
     private fun publishToMediaStore(sourceFile: File, topic: String): Uri {
         require(sourceFile.exists() && sourceFile.length() > 1024L) {
             "Rendered video file is missing or empty (${sourceFile.length()} bytes)."
@@ -2202,7 +2131,7 @@ class VideoRenderEngine @Inject constructor(
                 put(MediaStore.Video.Media.DATE_TAKEN, nowMs)
                 put(
                     MediaStore.Video.Media.RELATIVE_PATH,
-                    "${Environment.DIRECTORY_DCIM}/Camera"
+                    "${Environment.DIRECTORY_MOVIES}/RS Movie Spot"
                 )
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
@@ -2266,6 +2195,47 @@ class VideoRenderEngine @Inject constructor(
                 exportCopy
             )
         }.getOrDefault(galleryUri)
+    }
+
+    private fun publishThumbnailToMediaStore(sourceFile: File, topic: String): Uri? {
+        if (!sourceFile.exists() || sourceFile.length() < 1024L) return null
+        val nowMs = System.currentTimeMillis()
+        val nowSec = nowMs / 1000L
+        val fileBase = "RSMovieSpot_Thumb_${safeFileName(topic)}_$nowMs"
+        val displayName = "$fileBase.jpg"
+
+        val resolver = context.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Images.Media.TITLE, fileBase)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATE_ADDED, nowSec)
+            put(MediaStore.Images.Media.DATE_MODIFIED, nowSec)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.DATE_TAKEN, nowMs)
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/RS Movie Spot")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val uri = resolver.insert(collection, values) ?: return null
+        return runCatching {
+            resolver.openOutputStream(uri)?.use { dst ->
+                sourceFile.inputStream().use { src -> src.copyTo(dst) }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(uri, ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }, null, null)
+            }
+            uri
+        }.getOrNull()
     }
 
     private fun safeFileName(value: String): String =
