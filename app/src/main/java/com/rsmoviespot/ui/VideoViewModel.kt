@@ -5,9 +5,6 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.rsmoviespot.data.api.PersonalVoiceApi
-import com.rsmoviespot.data.local.VoiceCloneConfig
-import com.rsmoviespot.data.local.VoiceCloneStore
 import com.rsmoviespot.data.repository.VideoRepository
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
@@ -21,7 +18,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.io.File
 import javax.inject.Inject
 
 data class VideoUiState(
@@ -31,6 +27,8 @@ data class VideoUiState(
     val selectedGender: VoiceGender = VoiceGender.MALE,
     val selectedBgmUri: Uri? = null,
     val selectedBgmName: String = "Built-in Cinematic BGM",
+    val isLoadingTrending: Boolean = false,
+    val trendingTopics: List<String> = emptyList(),
     val isPreviewingScript: Boolean = false,
     val draftScript: VideoScriptResponse? = null,
     val isGenerating: Boolean = false,
@@ -38,22 +36,17 @@ data class VideoUiState(
     val progressPercentage: Int = 0,
     val statusMessage: String = "",
     val generatedVideoUri: Uri? = null,
-    val voiceCloneConfig: VoiceCloneConfig = VoiceCloneConfig(),
-    val isTestingVoiceServer: Boolean = false,
-    val voiceTestMessage: String? = null
+    val generatedThumbnailUri: Uri? = null,
+    val completedScript: VideoScriptResponse? = null
 )
 
 @HiltViewModel
 class VideoViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val videoRepository: VideoRepository,
-    private val voiceCloneStore: VoiceCloneStore,
-    private val personalVoiceApi: PersonalVoiceApi
+    private val videoRepository: VideoRepository
 ) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(
-        VideoUiState(voiceCloneConfig = voiceCloneStore.getConfig())
-    )
+    private val _uiState = MutableStateFlow(VideoUiState())
     val uiState: StateFlow<VideoUiState> = _uiState.asStateFlow()
 
     init {
@@ -65,7 +58,9 @@ class VideoViewModel @Inject constructor(
                         progressText = serviceState.progressText,
                         progressPercentage = serviceState.progressPercentage,
                         statusMessage = serviceState.statusMessage,
-                        generatedVideoUri = serviceState.generatedVideoUri
+                        generatedVideoUri = serviceState.generatedVideoUri,
+                        generatedThumbnailUri = serviceState.generatedThumbnailUri,
+                        completedScript = serviceState.completedScript
                     )
                 }
             }
@@ -88,68 +83,29 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(selectedGender = gender, draftScript = null) }
     }
 
-    fun saveVoiceCloneSettings(serverUrl: String, secretPin: String, baseIsFemale: Boolean) {
-        voiceCloneStore.saveSettings(serverUrl, secretPin, baseIsFemale)
-        _uiState.update {
-            it.copy(
-                voiceCloneConfig = voiceCloneStore.getConfig(),
-                draftScript = null
-            )
-        }
-    }
-
-    fun onVoiceSamplePicked(uri: Uri?) {
-        if (uri == null) return
-        val saved = voiceCloneStore.saveSampleFromUri(uri)
-        _uiState.update {
-            it.copy(
-                voiceCloneConfig = voiceCloneStore.getConfig(),
-                voiceTestMessage = if (saved) {
-                    "Voice sample saved!"
-                } else {
-                    "Could not read selected audio file."
-                }
-            )
-        }
-    }
-
-    fun createRecordingTempFile(): File = voiceCloneStore.createRecordingTempFile()
-
-    fun onVoiceSampleRecorded(tempFile: File) {
-        val saved = voiceCloneStore.commitRecordedSample(tempFile)
-        _uiState.update {
-            it.copy(
-                voiceCloneConfig = voiceCloneStore.getConfig(),
-                voiceTestMessage = if (saved) {
-                    "Mic voice sample saved!"
-                } else {
-                    "Recording was empty or too short."
-                }
-            )
-        }
-    }
-
-    fun testVoiceServer(serverUrl: String, secretPin: String) {
-        if (_uiState.value.isTestingVoiceServer) return
+    fun fetchTrendingTopics() {
+        if (_uiState.value.isLoadingTrending) return
         viewModelScope.launch {
-            _uiState.update {
-                it.copy(isTestingVoiceServer = true, voiceTestMessage = "Checking Modal server…")
-            }
-            val result = personalVoiceApi.testConnection(serverUrl, secretPin)
+            _uiState.update { it.copy(isLoadingTrending = true) }
+            val topics = runCatching { videoRepository.fetchTrendingMovieTopics() }
+                .getOrDefault(emptyList())
             _uiState.update {
                 it.copy(
-                    isTestingVoiceServer = false,
-                    voiceTestMessage = result.fold(
-                        onSuccess = { msg -> msg },
-                        onFailure = { err -> "Test failed: ${err.message ?: "Connection error"}" }
-                    )
+                    isLoadingTrending = false,
+                    trendingTopics = topics,
+                    statusMessage = if (topics.isEmpty()) "Could not load trending movie news." else ""
                 )
             }
         }
     }
 
-    fun clearVoiceTestMessage() {
-        _uiState.update { it.copy(voiceTestMessage = null) }
+    fun onTrendingTopicSelected(headline: String) {
+        _uiState.update {
+            it.copy(
+                topic = "Make a viral YouTube Short video on this movie news: $headline",
+                draftScript = null
+            )
+        }
     }
 
     fun onBgmSelected(uri: Uri?) {
@@ -184,12 +140,6 @@ class VideoViewModel @Inject constructor(
             return
         }
 
-        val effectiveScriptGender = if (currentState.selectedGender == VoiceGender.MY_VOICE) {
-            if (currentState.voiceCloneConfig.baseIsFemale) VoiceGender.FEMALE else VoiceGender.MALE
-        } else {
-            currentState.selectedGender
-        }
-
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -203,7 +153,7 @@ class VideoViewModel @Inject constructor(
                     topic = topic,
                     isShorts = currentState.isShorts,
                     language = currentState.selectedLanguage,
-                    voiceGender = effectiveScriptGender
+                    voiceGender = currentState.selectedGender
                 )
                 _uiState.update {
                     it.copy(
@@ -230,6 +180,67 @@ class VideoViewModel @Inject constructor(
             if (index !in script.slabs.indices) return@update current
             val updatedSlabs = script.slabs.toMutableList()
             updatedSlabs[index] = updatedSlabs[index].copy(voiceover_text = newText)
+            current.copy(draftScript = script.copy(slabs = updatedSlabs))
+        }
+    }
+
+    fun onSlabLayoutChanged(index: Int, layoutMode: String) {
+        _uiState.update { current ->
+            val script = current.draftScript ?: return@update current
+            if (index !in script.slabs.indices) return@update current
+            val updatedSlabs = script.slabs.toMutableList()
+            val existing = updatedSlabs[index]
+            updatedSlabs[index] = existing.copy(
+                layout_mode = layoutMode,
+                image_prompt_2 = if (layoutMode != "single" && existing.image_prompt_2.isBlank()) {
+                    existing.image_prompt
+                } else {
+                    existing.image_prompt_2
+                }
+            )
+            current.copy(draftScript = script.copy(slabs = updatedSlabs))
+        }
+    }
+
+    fun onSlabStatBadgeChanged(index: Int, badge: String) {
+        _uiState.update { current ->
+            val script = current.draftScript ?: return@update current
+            if (index !in script.slabs.indices) return@update current
+            val updatedSlabs = script.slabs.toMutableList()
+            updatedSlabs[index] = updatedSlabs[index].copy(stat_badge = badge.take(32))
+            current.copy(draftScript = script.copy(slabs = updatedSlabs))
+        }
+    }
+
+    fun onSlabCustomPhotoPicked(index: Int, slotIndex: Int, uri: Uri) {
+        _uiState.update { current ->
+            val script = current.draftScript ?: return@update current
+            if (index !in script.slabs.indices) return@update current
+            val updatedSlabs = script.slabs.toMutableList()
+            val slab = updatedSlabs[index]
+            updatedSlabs[index] = if (slotIndex == 2) {
+                slab.copy(
+                    custom_image_uri_2 = uri.toString(),
+                    layout_mode = if (slab.layout_mode == "single") "split" else slab.layout_mode
+                )
+            } else {
+                slab.copy(custom_image_uri = uri.toString())
+            }
+            current.copy(draftScript = script.copy(slabs = updatedSlabs))
+        }
+    }
+
+    fun onSlabClearCustomPhoto(index: Int, slotIndex: Int) {
+        _uiState.update { current ->
+            val script = current.draftScript ?: return@update current
+            if (index !in script.slabs.indices) return@update current
+            val updatedSlabs = script.slabs.toMutableList()
+            val slab = updatedSlabs[index]
+            updatedSlabs[index] = if (slotIndex == 2) {
+                slab.copy(custom_image_uri_2 = null)
+            } else {
+                slab.copy(custom_image_uri = null)
+            }
             current.copy(draftScript = script.copy(slabs = updatedSlabs))
         }
     }
