@@ -2,6 +2,12 @@ package com.rsmoviespot.domain.models
 
 import kotlinx.serialization.Serializable
 
+enum class InputMode(val label: String) {
+    AUTO("Auto"),
+    EXACT_SCRIPT("Exact Script"),
+    AI_PROMPT("AI Prompt")
+}
+
 enum class VoiceGender(val label: String) {
     MALE("Male"),
     FEMALE("Female")
