@@ -43,6 +43,7 @@ data class VideoScriptResponse(
     val voice_name: String = "hi-IN-MadhurNeural",
     val youtube_title: String = "",
     val youtube_description: String = "",
+    val youtube_hashtags: String = "",
     val pinned_comment: String = "",
     val slabs: List<VideoSlab>
 )
