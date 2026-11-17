@@ -4,8 +4,7 @@ import kotlinx.serialization.Serializable
 
 enum class VoiceGender(val label: String) {
     MALE("Male"),
-    FEMALE("Female"),
-    MY_VOICE("My Voice")
+    FEMALE("Female")
 }
 
 enum class VideoLanguage(
@@ -32,12 +31,8 @@ enum class VideoLanguage(
     JAPANESE("Japanese", "natural Japanese", "ja-JP-KeitaNeural", "ja-JP-NanamiNeural"),
     ARABIC("Arabic", "natural Arabic", "ar-SA-HamedNeural", "ar-SA-ZariyahNeural");
 
-    fun resolveVoice(gender: VoiceGender, cloneBaseIsFemale: Boolean = false): String =
-        when (gender) {
-            VoiceGender.FEMALE -> femaleVoice
-            VoiceGender.MALE -> maleVoice
-            VoiceGender.MY_VOICE -> if (cloneBaseIsFemale) femaleVoice else maleVoice
-        }
+    fun resolveVoice(gender: VoiceGender): String =
+        if (gender == VoiceGender.FEMALE) femaleVoice else maleVoice
 }
 
 @Serializable
@@ -46,6 +41,10 @@ data class VideoScriptResponse(
     val visual_style: String = "",
     val bgm_mood: String = "epic_action",
     val voice_name: String = "hi-IN-MadhurNeural",
+    val youtube_title: String = "",
+    val youtube_description: String = "",
+    val youtube_hashtags: String = "",
+    val pinned_comment: String = "",
     val slabs: List<VideoSlab>
 )
 
@@ -58,5 +57,12 @@ data class VideoSlab(
     val has_character: Boolean = true,
     val voice_emotion: String = "normal",
     val visual_source: String = "ai_generated",
-    val real_photo_query: String = ""
+    val real_photo_query: String = "",
+    val layout_mode: String = "single",
+    val visual_source_2: String = "",
+    val real_photo_query_2: String = "",
+    val image_prompt_2: String = "",
+    val stat_badge: String = "",
+    val custom_image_uri: String? = null,
+    val custom_image_uri_2: String? = null
 )
