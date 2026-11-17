@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.rsmoviespot.data.repository.VideoRepository
+import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VoiceGender
@@ -22,6 +23,7 @@ import javax.inject.Inject
 
 data class VideoUiState(
     val topic: String = "",
+    val inputMode: InputMode = InputMode.AUTO,
     val isShorts: Boolean = true,
     val selectedLanguage: VideoLanguage = VideoLanguage.AUTO,
     val selectedGender: VoiceGender = VoiceGender.MALE,
@@ -71,10 +73,15 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(topic = topic, draftScript = null) }
     }
 
+    fun onInputModeSelected(mode: InputMode) {
+        _uiState.update { it.copy(inputMode = mode, draftScript = null) }
+    }
+
     fun onTopicSelectedFromTrending(selectedTopic: String) {
         _uiState.update {
             it.copy(
                 topic = selectedTopic,
+                inputMode = InputMode.AI_PROMPT,
                 draftScript = null,
                 statusMessage = ""
             )
@@ -150,7 +157,7 @@ class VideoViewModel @Inject constructor(
         val topic = currentState.topic.trim()
         if (topic.isBlank()) {
             _uiState.update {
-                it.copy(statusMessage = "Enter a topic before previewing a script.")
+                it.copy(statusMessage = "Enter a topic or script before previewing.")
             }
             return
         }
@@ -168,7 +175,8 @@ class VideoViewModel @Inject constructor(
                     topic = topic,
                     isShorts = currentState.isShorts,
                     language = currentState.selectedLanguage,
-                    voiceGender = currentState.selectedGender
+                    voiceGender = currentState.selectedGender,
+                    inputMode = currentState.inputMode
                 )
                 _uiState.update {
                     it.copy(
@@ -270,7 +278,7 @@ class VideoViewModel @Inject constructor(
         val topic = currentState.topic.trim()
         if (topic.isBlank()) {
             _uiState.update {
-                it.copy(statusMessage = "Enter a topic before generating a video.")
+                it.copy(statusMessage = "Enter a topic or script before generating a video.")
             }
             return
         }
@@ -282,7 +290,8 @@ class VideoViewModel @Inject constructor(
             bgmUri = currentState.selectedBgmUri,
             preGeneratedScript = currentState.draftScript,
             language = currentState.selectedLanguage,
-            voiceGender = currentState.selectedGender
+            voiceGender = currentState.selectedGender,
+            inputMode = currentState.inputMode
         )
     }
 
