@@ -54,15 +54,13 @@ data class VideoSlab(
     val voiceover_text: String,
     val image_prompt: String,
     val sfx_cue: String = "whoosh",
-    val has_character: Boolean = true,
+    val has_character: Boolean = false,
     val voice_emotion: String = "normal",
     val visual_source: String = "ai_generated",
     val real_photo_query: String = "",
     val layout_mode: String = "single",
-    val visual_source_2: String = "",
+    val visual_source_2: String = "ai_generated",
     val real_photo_query_2: String = "",
     val image_prompt_2: String = "",
-    val stat_badge: String = "",
-    val custom_image_uri: String? = null,
-    val custom_image_uri_2: String? = null
+    val stat_badge: String = ""
 )
