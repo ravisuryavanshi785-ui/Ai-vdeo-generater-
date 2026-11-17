@@ -192,11 +192,11 @@ class VideoRenderService : Service() {
                     it.copy(
                         isGenerating = false,
                         progressPercentage = 100,
-                        progressText = "Video & cover saved to your gallery.",
+                        progressText = "Video & cover thumbnail saved to gallery.",
                         statusMessage = "Video generation complete.",
                         generatedVideoUri = result.galleryUri,
                         generatedThumbnailUri = result.thumbnailUri,
-                        completedScript = result.renderedScript
+                        completedScript = result.script
                     )
                 }
 
