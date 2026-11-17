@@ -12,6 +12,7 @@ import com.rsmoviespot.data.api.GroqChatRequest
 import com.rsmoviespot.data.api.GroqMessage
 import com.rsmoviespot.data.api.GroqPlainChatRequest
 import com.rsmoviespot.data.api.GroqResponseFormat
+import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
@@ -49,7 +50,8 @@ interface VideoRepository {
         topic: String,
         isShorts: Boolean = true,
         language: VideoLanguage = VideoLanguage.AUTO,
-        voiceGender: VoiceGender = VoiceGender.MALE
+        voiceGender: VoiceGender = VoiceGender.MALE,
+        inputMode: InputMode = InputMode.AUTO
     ): VideoScriptResponse
 
     suspend fun generateImageForSlab(
@@ -126,15 +128,20 @@ class VideoRepositoryImpl @Inject constructor(
         topic: String,
         isShorts: Boolean,
         language: VideoLanguage,
-        voiceGender: VoiceGender
+        voiceGender: VoiceGender,
+        inputMode: InputMode
     ): VideoScriptResponse {
         val cleanInput = topic.trim()
         require(cleanInput.isNotBlank()) { "Topic must not be blank." }
         require(BuildConfig.GROQ_API_KEY.isNotBlank()) { "GROQ_API_KEY is empty." }
 
         val inputWordCount = cleanInput.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-        val isFullScriptMode = inputWordCount > FULL_SCRIPT_WORD_THRESHOLD &&
-            !isInstructionOrBriefPrompt(cleanInput)
+        val isFullScriptMode = when (inputMode) {
+            InputMode.EXACT_SCRIPT -> true
+            InputMode.AI_PROMPT -> false
+            InputMode.AUTO -> inputWordCount >= FULL_SCRIPT_WORD_THRESHOLD &&
+                !isInstructionOrBriefPrompt(cleanInput, language)
+        }
 
         val systemPrompt = if (isFullScriptMode) FULL_SCRIPT_SYSTEM_PROMPT else TOPIC_SYSTEM_PROMPT
         val targetGenderLabel = voiceGender.label
@@ -147,8 +154,9 @@ class VideoRepositoryImpl @Inject constructor(
         val userPrompt = if (isFullScriptMode) {
             buildString {
                 appendLine("MODE: FULL USER SCRIPT ($inputWordCount words).")
-                appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user text intact and split sequentially into 13 to 16 fast punchy visual scenes (~7-10 words / ~2.5-3.5s each so visuals change fast).")
-                appendLine("For every scene, put the exact visual action, setting, character look, and props implied or described in that sentence at the START of image_prompt.")
+                appendLine("DO NOT rewrite, paraphrase, translate, add, drop, or change EVEN A SINGLE WORD of the user's spoken script.")
+                appendLine("Split the exact text sequentially into fast punchy visual scenes (~6-10 words / ~2.5-3.2s each; add as many scenes as needed to cover 100% of the exact input).")
+                appendLine("Match each scene with the best visual_source according to script need: use multiple 'video_clip' scenes (action/movie/trailer beats), 'meme_clip' (reaction/comedy beats), 'real_photo' (named stars/posters), 'split'/'flip' (comparisons/clashes), and 'ai_generated' (custom/dramatic visuals) with exact scene details front-loaded in image_prompt.")
                 appendLine("Set voice_name matching the script's language and $targetGenderLabel gender (e.g., Hindi: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
                 appendLine()
                 appendLine("USER SCRIPT:")
@@ -166,9 +174,10 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine(cleanInput)
                 appendLine()
                 appendLine("CRITICAL PROMPT RULES:")
-                appendLine("1) NEVER copy meta-instructions ('Act as...', 'Write a script...', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Only put the spoken narration in voiceover_text.")
-                appendLine("2) Whenever the user describes visuals, scenes, camera shots, character appearance/costume, lighting, props, or style (in English, Hindi, or Hinglish), put those EXACT visual details right at the BEGINNING of image_prompt (in crisp English) with visual_source='ai_generated' — NEVER replace described visuals with generic crowds or unrelated real_photo.")
-                appendLine("3) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Use selective video_clip (1-3 hype/trailer/action scenes) & meme_clip (1-2 funny/shock reaction scenes) ONLY where clearly relevant, plus layout_mode='split'/'flip' on comparisons.")
+                appendLine("1) NEVER copy meta-instructions ('Act as...', 'Write a script...', 'Include:', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Put ONLY natural spoken storytelling in voiceover_text.")
+                appendLine("2) Choose MORE THAN ONE movie/motion scene ('video_clip', typically 3 to 7+ scenes across the video, plus 1 to 3 'meme_clip' reactions) dynamically whenever the narration highlights action, movie hype, trailers, dialogue energy, or reactions — with a DIFFERENT clean 2-3 word English query per scene so clips never repeat!")
+                appendLine("3) Whenever the user explicitly describes visuals, camera shots, character appearance/costume, lighting, props, or style, put those EXACT details right at the START of image_prompt with visual_source='ai_generated'.")
+                appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Use layout_mode='split'/'flip' on comparisons or VS clashes.")
                 appendLine(languageDirective)
                 appendLine("Format guideline: $formatGuide")
                 appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
@@ -231,29 +240,29 @@ class VideoRepositoryImpl @Inject constructor(
         throw lastError ?: IllegalStateException("Failed to generate script.")
     }
 
-    private fun isInstructionOrBriefPrompt(input: String): Boolean {
+    private fun isInstructionOrBriefPrompt(input: String, language: VideoLanguage): Boolean {
         val lower = input.lowercase()
 
         val metaPromptRegex = Regex(
-            """\b(act\s+as\s+an?|act\s+like\s+an?|you\s+are\s+an?\b.*\b(writer|director|engineer|expert|assistant)|your\s+task\s+is|your\s+job\s+is|prompt\s+engineer|image\s+generation\s+prompts?|critical\s+instructions|data\s+to\s+include|include\s+in\s+(?:the\s+)?script|aspect\s+ratio|9:16\s+framing|do\s+not\s+generate|describe\s+(?:him|her|it|the\s+scene)\s+as)\b""",
+            """\b(act\s+(?:as|like)\b|you\s+are\s+(?:a|an|the)?\s*[^\n.!?]{0,40}\b(writer|director|engineer|expert|assistant|narrator|storyteller|creator)\b|your\s+task\s+is|your\s+job\s+is|prompt\s+engineer|image\s+(?:generation\s+)?prompts?|critical\s+instructions|data\s+to\s+include|include\s+in\s+(?:the\s+)?script|aspect\s+ratio|9:16|16:9|do\s+not\s+(?:generate|copy|include)|describe\s+(?:him|her|it|the\s+scene)\s+as|start\s+with\s+(?:a|an)\s+(?:strong\s+)?hook|use\s+(?:fast|quick|short)\s+(?:cuts|scenes|pacing)|keep\s+(?:it|scenes?)\s+(?:under|around|within)|visual_source|video_clip|meme_clip|stat_badge|split\s+layout)\b""",
             RegexOption.IGNORE_CASE
         )
         if (metaPromptRegex.containsMatchIn(input)) return true
 
         val sceneDirectionRegex = Regex(
-            """(?:^|\n)\s*(?:scene\s*\d+\s*[:\-]|visuals?\s*:|image\s*prompt\s*:|voiceover\s*:|narration\s*:|\[visual[^\]]*\])""",
+            """(?:^|\n)\s*(?:scene\s*\d+\s*[:\-]|visuals?\s*:|image\s*prompt\s*:|voiceover\s*:|narration\s*:|include\s*:|tone\s*:|style\s*:|format\s*:|goal\s*:|role\s*:|pacing\s*:|\[visual[^\]]*\])""",
             RegexOption.IGNORE_CASE
         )
         if (sceneDirectionRegex.containsMatchIn(input)) return true
 
         val writeScriptRegex = Regex(
-            """\b(write|create|generate|make|prepare)\s+(?:me\s+)?(?:a|an|the)?\s*(?:[\w-]+\s+){0,4}(?:voiceover\s+)?(?:script|short|video|story|reel|scene)\b""",
+            """\b(write|create|generate|make|prepare|build|craft)\s+(?:me\s+)?(?:a|an|the)?\s*(?:[^\n.!?]{0,75}\s+)?(?:voiceover\s+)?(?:script|short|shorts|video|story|reel|scene)\b""",
             RegexOption.IGNORE_CASE
         )
         if (writeScriptRegex.containsMatchIn(input)) return true
 
         val hindiPromptRegex = Regex(
-            """\b(script\s+likh\w*|video\s+bana\w*|short\s+bana\w*|scene\s+bana\w*|visual\w*\s+bana\w*|par\s+(?:ek\s+)?video|ke\s+baare\s+mein\s+video|hindi\s+mein\s+script|(?:pehle|doosre|dusre|teesre|tisre)\s+scene\s+(?:me|mein)|scene\s+(?:me|mein)\s+.*dikha\w*)\b""",
+            """\b(script\s+likh\w*|video\s+bana\w*|short\s+bana\w*|reel\s+bana\w*|scene\s+bana\w*|visual\w*\s+bana\w*|par\s+(?:ek\s+)?video|ke\s+baare\s+mein\s+video|hindi\s+mein\s+script|(?:pehle|doosre|dusre|teesre|tisre)\s+scene\s+(?:me|mein)|scene\s+(?:me|mein)\s+.*dikha\w*)\b""",
             RegexOption.IGNORE_CASE
         )
         if (hindiPromptRegex.containsMatchIn(input)) return true
@@ -265,10 +274,22 @@ class VideoRepositoryImpl @Inject constructor(
         }
         val hasBriefHeaders = listOf(
             "release date:", "advance booking:", "prediction:", "highlight:",
-            "topic:", "instructions:", "requirements:", "note:"
+            "topic:", "instructions:", "requirements:", "note:", "include:",
+            "hooks:", "key points:", "visuals:"
         ).any { lower.contains(it) }
 
-        return bulletLines >= 3 && hasBriefHeaders
+        if ((bulletLines >= 2 && hasBriefHeaders) || bulletLines >= 4) return true
+
+        val hasDevanagari = input.any { it in '\u0900'..'\u097F' }
+        val requestsTargetLangInEnglish = language != VideoLanguage.ENGLISH_IN &&
+            language != VideoLanguage.ENGLISH_US &&
+            !hasDevanagari &&
+            Regex("""\b(hindi|hinglish|marathi|tamil|telugu|gujarati|bengali|urdu|punjabi)\b""", RegexOption.IGNORE_CASE)
+                .containsMatchIn(input) &&
+            Regex("""\b(explain|cover|mention|compare|highlight|show|make|focus|about)\b""", RegexOption.IGNORE_CASE)
+                .containsMatchIn(input)
+
+        return requestsTargetLangInEnglish
     }
 
     override suspend fun fetchTrendingMovieTopics(): List<String> = withContext(Dispatchers.IO) {
@@ -350,6 +371,8 @@ class VideoRepositoryImpl @Inject constructor(
     private fun buildNegativePrompt(promptLower: String): String {
         val base = mutableListOf(
             "filmstrip", "multi-panel", "stacked frames", "comic panels", "grid",
+            "2x2 grid", "3x3 grid", "4x4 grid", "photo grid", "grid of images",
+            "multiple panels", "tiled images", "contact sheet", "collage border", "stacked photo",
             "storyboard", "collage", "split screen", "abstract", "geometric shapes",
             "cubes", "blocks", "colorful squares", "disembodied eye", "close-up single eye",
             "text", "watermark", "signature", "logo", "letters", "words",
@@ -390,9 +413,17 @@ class VideoRepositoryImpl @Inject constructor(
         val candidates = mutableListOf<VideoClipCandidate>()
         if (isMeme) {
             runCatching { collectTenorMemeClips(cleanQuery, coreWords, candidates) }
+            if (candidates.none { it.url !in usedUrls } && coreWords.size >= 3) {
+                val shortWords = coreWords.take(2)
+                runCatching { collectTenorMemeClips(shortWords.joinToString(" "), shortWords, candidates) }
+            }
             runCatching { collectCoubVideoClips(cleanQuery, coreWords, candidates) }
         } else {
             runCatching { collectCoubVideoClips(cleanQuery, coreWords, candidates) }
+            if (candidates.none { it.url !in usedUrls } && coreWords.size >= 3) {
+                val shortWords = coreWords.take(2)
+                runCatching { collectCoubVideoClips(shortWords.joinToString(" "), shortWords, candidates) }
+            }
             runCatching { collectTenorMemeClips(cleanQuery, coreWords, candidates) }
         }
 
@@ -429,7 +460,7 @@ class VideoRepositoryImpl @Inject constructor(
         outList: MutableList<VideoClipCandidate>
     ) {
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val url = "https://coub.com/api/v2/search/coubs?per_page=12&q=$encoded"
+        val url = "https://coub.com/api/v2/search/coubs?per_page=20&q=$encoded"
         val bodyText = fetchTextString(url, BROWSER_USER_AGENT, "application/json") ?: return
         val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
         val coubs = root["coubs"] as? JsonArray ?: return
@@ -1152,7 +1183,7 @@ class VideoRepositoryImpl @Inject constructor(
 
     private companion object {
         const val MAX_API_ATTEMPTS = 5
-        const val FULL_SCRIPT_WORD_THRESHOLD = 25
+        const val FULL_SCRIPT_WORD_THRESHOLD = 22
         const val WIKIMEDIA_USER_AGENT = "RSMovieSpot/1.0 (https://rsmoviespot.app)"
         const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -1167,12 +1198,12 @@ class VideoRepositoryImpl @Inject constructor(
                 "- Whenever the user's prompt or script explicitly describes a specific visual scene, character appearance, outfit, location, lighting, style, camera shot, or action (whether in Hindi, Hinglish, or English, e.g., 'pehle scene me...', 'Scene 1:', '[Visual: ...]'), YOU MUST generate that EXACT visual in image_prompt and set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- Front-load the exact described subject, costume/outfit, action, setting, props, and lighting in the FIRST 25-35 words of image_prompt so the image generator prioritizes them!\n" +
                 "- If the user asks for a specific style (e.g., anime, 3D, noir, cyberpunk) or forbids posters/comics, strictly honor that style and never replace a user-described visual with a generic crowd or real_photo poster.\n\n" +
-                "INTERNET VIDEO CLIPS & MEMES + 2-PHOTO SCENES + STAT BADGES:\n" +
-                "- 'video_clip' (SELECTIVELY 1 to 3 scenes ONLY — NEVER every scene): When a high-energy movie/trailer/action/hype moment fits real motion footage, set visual_source='video_clip', layout_mode='single', and real_photo_query to 2-4 clean English search words (e.g. 'Avengers Doomsday', 'Pushpa Raj action', 'SRK entry').\n" +
-                "- 'meme_clip' (SELECTIVELY 1 to 2 scenes ONLY): When comedy, roast, or shock reaction fits, set visual_source='meme_clip', layout_mode='single', and real_photo_query to a popular clean meme query (e.g. 'Hera Pheri paisa meme', 'shocked Pikachu', 'crying laughing').\n" +
+                "DYNAMIC MULTI-CLIP MOVIE SCENES & MEMES + 2-PHOTO SCENES + STAT BADGES (PICK BASED ON SCRIPT NEED):\n" +
+                "- 'video_clip' (USE MULTIPLE CLIPS — typically 3 to 7+ scenes depending on script need!): Whenever a scene narrates movie action, trailer hype, actor swag, climax fight, superhero entry, crowd euphoria, or iconic film moments, set visual_source='video_clip', layout_mode='single', and real_photo_query to a UNIQUE 2-3 word clean English search phrase per scene (e.g. 'Avengers Endgame battle', 'Robert Downey Jr Iron Man', 'Spider-Man swinging', 'Pushpa Allu Arjun', 'Shah Rukh Khan entry', 'cinema explosion') so multiple distinct movie clips play across the video!\n" +
+                "- 'meme_clip' (1 to 3 reaction scenes based on script need): Whenever the line is funny, roasting, sarcastic, mind-blown, or shocked, set visual_source='meme_clip', layout_mode='single', and real_photo_query to a crisp meme query (e.g. 'Hera Pheri paisa meme', 'shocked Pikachu', 'mind blown explosion', 'crying laughing').\n" +
                 "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, or vs scenes, set layout_mode='split' (or 'flip' for rapid dual reveal) with visual_source in {'real_photo','ai_generated'} and fill BOTH primary AND secondary visual fields (visual_source_2, real_photo_query_2, image_prompt_2)!\n" +
                 "- STAT BADGES: Whenever a scene announces a HUGE number, release date, or record (e.g. '$150M PRE-SALES', '₹80 CR DAY 1?', '17 DEC RELEASE'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
-                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When user did NOT specify a custom visual and scene is not video_clip/meme_clip):\n" +
+                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (For non-clip scenes without custom AI instructions):\n" +
                 "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR named in the scene (e.g., Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr.):\n" +
                 "     Set visual_source='real_photo' and real_photo_query to ONLY their clean English name (e.g. 'Prabhas' or 'Robert Downey Jr').\n" +
                 "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene (e.g., Animal, Kabir Singh, Spirit, Pushpa 2, KGF, Avengers Endgame, Avengers Doomsday, Salaar, Spider-Man No Way Home):\n" +
@@ -1182,8 +1213,8 @@ class VideoRepositoryImpl @Inject constructor(
                 "     * ALL STORY / ACTION / DIALOGUE scenes: visual_source='ai_generated' with raw LIVE-ACTION MOVIE PHOTOGRAPH image_prompt.\n" +
                 "  4) ALL OTHER SCENES: set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab (even video_clip/meme_clip/real_photo scenes).\n\n" +
-                "IMAGE PROMPT RULES (RAW MOVIE STILL — ZERO COMIC ART LOOK):\n" +
-                "- Write every image_prompt as a REAL LIVE-ACTION FILM SET PHOTOGRAPH (brushed steel, heavy wool cloak, rain droplets, sweat, warm streetlights, cinema depth of field) — NEVER write 'Marvel', 'comic', 'concept art', or 'neon digital glow' unless asked!\n" +
+                "IMAGE PROMPT RULES (RAW MOVIE STILL — ZERO COMIC ART OR COLLAGE LOOK):\n" +
+                "- Write every image_prompt as a SINGLE continuous 9:16 RAW LIVE-ACTION FILM SET PHOTOGRAPH (brushed steel, heavy wool cloak, rain droplets, sweat, warm streetlights, cinema depth of field) — NEVER write 'Marvel', 'comic', 'concept art', 'grid', 'collage', 'multi-panel', or 'neon digital glow' unless asked!\n" +
                 "- NEVER write real living actor names inside image_prompt unless explicitly instructed for a mask/costume scene.\n" +
                 "- Avoid literal title words like 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' when referring to a movie title.\n" +
                 "- NEVER write 'box office', 'records', 'close-up eyes', 'comment box', 'subscribe', 'UI', 'poster', or 'text' inside image_prompt.\n" +
@@ -1211,8 +1242,8 @@ class VideoRepositoryImpl @Inject constructor(
                 "    {\n" +
                 "      \"voiceover_text\": \"Short 7-10 word narration segment\",\n" +
                 "      \"voice_emotion\": \"hook | suspense | climax | question | excited | normal\",\n" +
-                "      \"visual_source\": \"real_photo | ai_generated | video_clip | meme_clip\",\n" +
-                "      \"real_photo_query\": \"Clean English query if real_photo/video_clip/meme_clip, else ''\",\n" +
+                "      \"visual_source\": \"video_clip | meme_clip | real_photo | ai_generated\",\n" +
+                "      \"real_photo_query\": \"Clean English query if video_clip/meme_clip/real_photo, else ''\",\n" +
                 "      \"layout_mode\": \"single | split | flip\",\n" +
                 "      \"visual_source_2\": \"real_photo | ai_generated | ''\",\n" +
                 "      \"real_photo_query_2\": \"2nd photo query if split/flip and real_photo, else ''\",\n" +
@@ -1229,7 +1260,7 @@ class VideoRepositoryImpl @Inject constructor(
             "You are a film director splitting an existing user-written script into fast visual scenes for RS Movie Spot.\n" +
                 "CRITICAL FULL SCRIPT RULE:\n" +
                 "- DO NOT rewrite, paraphrase, translate, summarize, add, drop, or change EVEN A SINGLE WORD of the user's spoken input.\n" +
-                "- Keep exact user words intact and split sequentially into 13 to 16 fast punchy scenes (~7-10 words / ~2.5-3.5s each).\n" +
+                "- Keep exact user words intact and split sequentially into fast punchy scenes (~6-10 words / ~2.5-3.2s each; output as many scenes as needed to keep every word).\n" +
                 "- Concatenating all slabs' voiceover_text values with spaces MUST match the user's input word-for-word.\n\n" +
                 IMAGE_PROMPT_RULES +
                 VOICE_AND_BGM_RULES +
