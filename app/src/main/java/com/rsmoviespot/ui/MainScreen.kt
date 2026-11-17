@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.MediaRecorder
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,7 +24,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -37,10 +35,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,17 +44,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VoiceGender
-import kotlinx.coroutines.delay
-import java.io.File
 
 private val NeonGreen = Color(0xFF39FF14)
 private val DarkBg = Color(0xFF0A0E0B)
@@ -67,7 +61,6 @@ private val CardBg = Color(0xFF141A15)
 private val SelectedChipBg = Color(0xFF1B3A18)
 private val BorderGreen = Color(0xFF285C22)
 private val TextMuted = Color(0xFFA0ACA2)
-private val WarnAmber = Color(0xFFFFB74D)
 
 @Composable
 fun MainScreen(
@@ -75,8 +68,25 @@ fun MainScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
 
-    var showVoiceSetupDialog by remember { mutableStateOf(false) }
+    var pendingPhotoTarget by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        val target = pendingPhotoTarget
+        pendingPhotoTarget = null
+        if (uri != null && target != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.onSlabCustomPhotoPicked(target.first, target.second, uri)
+        }
+    }
 
     val bgmPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -89,14 +99,6 @@ fun MainScreen(
                 )
             }
             viewModel.onBgmSelected(uri)
-        }
-    }
-
-    val voiceSamplePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            viewModel.onVoiceSamplePicked(uri)
         }
     }
 
@@ -126,29 +128,70 @@ fun MainScreen(
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Text(
-            text = "RS MOVIE SPOT",
-            color = NeonGreen,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 1.2.sp
-        )
-        Text(
-            text = "AI Video Generator",
-            color = Color.White,
-            fontSize = 28.sp,
-            fontWeight = FontWeight.ExtraBold
-        )
-        Text(
-            text = "Enter a short topic or paste your full script.",
-            color = TextMuted,
-            fontSize = 14.sp
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = "RS MOVIE SPOT",
+                    color = NeonGreen,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.2.sp
+                )
+                Text(
+                    text = "AI Video Studio",
+                    color = Color.White,
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+            OutlinedButton(
+                onClick = viewModel::fetchTrendingTopics,
+                enabled = !uiState.isLoadingTrending && !uiState.isGenerating,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, BorderGreen),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+            ) {
+                Text(
+                    text = if (uiState.isLoadingTrending) "Loading…" else "Trending Ideas",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        if (uiState.trendingTopics.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                uiState.trendingTopics.forEach { headline ->
+                    FilterChip(
+                        selected = false,
+                        onClick = { viewModel.onTrendingTopicSelected(headline) },
+                        label = {
+                            Text(
+                                text = if (headline.length > 44) headline.take(44) + "…" else headline,
+                                maxLines = 1,
+                                fontSize = 12.sp
+                            )
+                        },
+                        colors = chipColors,
+                        border = chipBorder
+                    )
+                }
+            }
+        }
 
         OutlinedTextField(
             value = uiState.topic,
             onValueChange = viewModel::onTopicChanged,
-            label = { Text("Topic or full script (>25 words = exact script)") },
+            label = { Text("Topic, detailed prompt, or full script") },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(130.dp),
@@ -215,82 +258,16 @@ fun MainScreen(
             }
         }
 
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             VoiceGender.entries.forEach { gender ->
-                val labelText = if (gender == VoiceGender.MY_VOICE) {
-                    "My Voice (Clone)"
-                } else {
-                    "${gender.label} Voice"
-                }
                 FilterChip(
                     selected = uiState.selectedGender == gender,
                     onClick = { viewModel.onGenderSelected(gender) },
                     enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
-                    label = { Text(labelText) },
+                    label = { Text("${gender.label} Voice") },
                     colors = chipColors,
                     border = chipBorder
                 )
-            }
-        }
-
-        if (uiState.selectedGender == VoiceGender.MY_VOICE) {
-            val cloneConfig = uiState.voiceCloneConfig
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = CardBg),
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(
-                    1.dp,
-                    if (cloneConfig.isReady) BorderGreen else WarnAmber
-                )
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = if (cloneConfig.isReady) {
-                                "Voice Clone Ready"
-                            } else {
-                                "Setup Required (Edge Fallback Active)"
-                            },
-                            color = if (cloneConfig.isReady) NeonGreen else WarnAmber,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = if (cloneConfig.hasSample) {
-                                "Sample: ${cloneConfig.sampleName}"
-                            } else {
-                                "Tap Setup to record 15s voice & add Modal URL"
-                            },
-                            color = TextMuted,
-                            fontSize = 12.sp
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.clearVoiceTestMessage()
-                            showVoiceSetupDialog = true
-                        },
-                        enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
-                        shape = RoundedCornerShape(20.dp),
-                        border = BorderStroke(1.dp, NeonGreen),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
-                    ) {
-                        Text("Setup", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
             }
         }
 
@@ -504,6 +481,98 @@ fun MainScreen(
             }
         }
 
+        val uploadMetaScript = uiState.completedScript ?: uiState.draftScript
+        if (uploadMetaScript != null && (uploadMetaScript.youtube_title.isNotBlank() || uploadMetaScript.pinned_comment.isNotBlank())) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = CardBg),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "YouTube Upload Kit",
+                        color = NeonGreen,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (uiState.generatedThumbnailUri != null) {
+                        Text(
+                            text = "Cover Thumbnail saved to Pictures / RS Movie Spot",
+                            color = TextMuted,
+                            fontSize = 12.sp
+                        )
+                    }
+                    if (uploadMetaScript.youtube_title.isNotBlank()) {
+                        Text(
+                            text = "Title: ${uploadMetaScript.youtube_title}",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    if (uploadMetaScript.youtube_description.isNotBlank()) {
+                        Text(
+                            text = "${uploadMetaScript.youtube_description}\n${uploadMetaScript.youtube_hashtags}",
+                            color = TextMuted,
+                            fontSize = 12.sp
+                        )
+                    }
+                    if (uploadMetaScript.pinned_comment.isNotBlank()) {
+                        Text(
+                            text = "Pinned Comment: ${uploadMetaScript.pinned_comment}",
+                            color = Color(0xFFFFE135),
+                            fontSize = 12.sp
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (uploadMetaScript.youtube_title.isNotBlank()) {
+                            OutlinedButton(
+                                onClick = {
+                                    clipboard.setText(AnnotatedString(uploadMetaScript.youtube_title))
+                                    Toast.makeText(context, "Title copied!", Toast.LENGTH_SHORT).show()
+                                },
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, BorderGreen),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+                            ) {
+                                Text("Copy Title", fontSize = 12.sp)
+                            }
+                        }
+                        if (uploadMetaScript.youtube_description.isNotBlank()) {
+                            OutlinedButton(
+                                onClick = {
+                                    val fullDesc = "${uploadMetaScript.youtube_description}\n\n${uploadMetaScript.youtube_hashtags}".trim()
+                                    clipboard.setText(AnnotatedString(fullDesc))
+                                    Toast.makeText(context, "Desc & tags copied!", Toast.LENGTH_SHORT).show()
+                                },
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, BorderGreen),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+                            ) {
+                                Text("Copy Desc + Tags", fontSize = 12.sp)
+                            }
+                        }
+                        if (uploadMetaScript.pinned_comment.isNotBlank()) {
+                            OutlinedButton(
+                                onClick = {
+                                    clipboard.setText(AnnotatedString(uploadMetaScript.pinned_comment))
+                                    Toast.makeText(context, "Comment copied!", Toast.LENGTH_SHORT).show()
+                                },
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, BorderGreen),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFFE135))
+                            ) {
+                                Text("Copy Pin", fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         uiState.draftScript?.let { script ->
             Text(
                 text = "Script Preview (${script.slabs.size} scenes · ${script.voice_name})",
@@ -517,7 +586,10 @@ fun MainScreen(
                     colors = CardDefaults.cardColors(containerColor = CardBg),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         val visualTag = if (
                             slab.visual_source == "real_photo" &&
                             slab.real_photo_query.isNotBlank()
@@ -531,15 +603,110 @@ fun MainScreen(
                             color = TextMuted,
                             fontSize = 12.sp
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf("single" to "Single", "split" to "Split 2", "flip" to "Flip 2").forEach { (modeKey, modeLabel) ->
+                                FilterChip(
+                                    selected = slab.layout_mode == modeKey,
+                                    onClick = { viewModel.onSlabLayoutChanged(index, modeKey) },
+                                    enabled = !uiState.isGenerating,
+                                    label = { Text(modeLabel, fontSize = 11.sp) },
+                                    colors = chipColors,
+                                    border = chipBorder
+                                )
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    pendingPhotoTarget = index to 1
+                                    imagePickerLauncher.launch(arrayOf("image/*"))
+                                },
+                                enabled = !uiState.isGenerating,
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, BorderGreen),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = if (slab.custom_image_uri != null) NeonGreen else Color.White
+                                )
+                            ) {
+                                Text(
+                                    text = if (slab.custom_image_uri != null) "Photo 1 Set" else "Pick Photo 1",
+                                    fontSize = 11.sp
+                                )
+                            }
+                            if (slab.custom_image_uri != null) {
+                                OutlinedButton(
+                                    onClick = { viewModel.onSlabClearCustomPhoto(index, 1) },
+                                    enabled = !uiState.isGenerating,
+                                    shape = RoundedCornerShape(16.dp),
+                                    border = BorderStroke(1.dp, BorderGreen),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextMuted)
+                                ) {
+                                    Text("X", fontSize = 11.sp)
+                                }
+                            }
+
+                            if (slab.layout_mode != "single") {
+                                OutlinedButton(
+                                    onClick = {
+                                        pendingPhotoTarget = index to 2
+                                        imagePickerLauncher.launch(arrayOf("image/*"))
+                                    },
+                                    enabled = !uiState.isGenerating,
+                                    shape = RoundedCornerShape(16.dp),
+                                    border = BorderStroke(1.dp, BorderGreen),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = if (slab.custom_image_uri_2 != null) NeonGreen else Color.White
+                                    )
+                                ) {
+                                    Text(
+                                        text = if (slab.custom_image_uri_2 != null) "Photo 2 Set" else "Pick Photo 2",
+                                        fontSize = 11.sp
+                                    )
+                                }
+                                if (slab.custom_image_uri_2 != null) {
+                                    OutlinedButton(
+                                        onClick = { viewModel.onSlabClearCustomPhoto(index, 2) },
+                                        enabled = !uiState.isGenerating,
+                                        shape = RoundedCornerShape(16.dp),
+                                        border = BorderStroke(1.dp, BorderGreen),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextMuted)
+                                    ) {
+                                        Text("X", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+
                         OutlinedTextField(
-                            value = slab.voiceover_text,
-                            onValueChange = { viewModel.onSlabVoiceoverChanged(index, it) },
+                            value = slab.stat_badge,
+                            onValueChange = { viewModel.onSlabStatBadgeChanged(index, it) },
+                            label = { Text("Top Stat Badge (optional, e.g. ₹80 CR DAY 1)") },
+                            singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                             enabled = !uiState.isGenerating,
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = NeonGreen,
                                 unfocusedBorderColor = BorderGreen,
+                                focusedLabelColor = NeonGreen,
+                                unfocusedLabelColor = TextMuted,
+                                focusedTextColor = Color(0xFFFFE135),
+                                unfocusedTextColor = Color(0xFFFFE135)
+                            )
+                        )
+
+                        OutlinedTextField(
+                            value = slab.voiceover_text,
+                            onValueChange = { viewModel.onSlabVoiceoverChanged(index, it) },
+                            label = { Text("Voiceover") },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !uiState.isGenerating,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = NeonGreen,
+                                unfocusedBorderColor = BorderGreen,
+                                focusedLabelColor = NeonGreen,
+                                unfocusedLabelColor = TextMuted,
                                 focusedTextColor = Color.White,
                                 unfocusedTextColor = Color.White
                             )
@@ -549,309 +716,4 @@ fun MainScreen(
             }
         }
     }
-
-    if (showVoiceSetupDialog) {
-        VoiceCloneSetupDialog(
-            initialConfig = uiState.voiceCloneConfig,
-            isTesting = uiState.isTestingVoiceServer,
-            testMessage = uiState.voiceTestMessage,
-            onPickSample = { voiceSamplePickerLauncher.launch(arrayOf("audio/*")) },
-            createTempRecordingFile = viewModel::createRecordingTempFile,
-            onRecordedSample = viewModel::onVoiceSampleRecorded,
-            onTestConnection = viewModel::testVoiceServer,
-            onSave = { url, pin, baseIsFemale ->
-                viewModel.saveVoiceCloneSettings(url, pin, baseIsFemale)
-                showVoiceSetupDialog = false
-            },
-            onDismiss = { showVoiceSetupDialog = false }
-        )
-    }
-}
-
-@Composable
-private fun VoiceCloneSetupDialog(
-    initialConfig: com.rsmoviespot.data.local.VoiceCloneConfig,
-    isTesting: Boolean,
-    testMessage: String?,
-    onPickSample: () -> Unit,
-    createTempRecordingFile: () -> File,
-    onRecordedSample: (File) -> Unit,
-    onTestConnection: (String, String) -> Unit,
-    onSave: (String, String, Boolean) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val context = LocalContext.current
-    var serverUrl by remember(initialConfig) { mutableStateOf(initialConfig.serverUrl) }
-    var secretPin by remember(initialConfig) { mutableStateOf(initialConfig.secretPin) }
-    var baseIsFemale by remember(initialConfig) { mutableStateOf(initialConfig.baseIsFemale) }
-
-    var isRecording by remember { mutableStateOf(false) }
-    var recordSeconds by remember { mutableStateOf(0) }
-    var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
-    var activeRecordFile by remember { mutableStateOf<File?>(null) }
-
-    fun stopAndSaveRecording() {
-        val currentRecorder = recorder
-        val file = activeRecordFile
-        recorder = null
-        activeRecordFile = null
-        isRecording = false
-        runCatching {
-            currentRecorder?.stop()
-        }
-        runCatching {
-            currentRecorder?.release()
-        }
-        if (file != null) {
-            onRecordedSample(file)
-        }
-    }
-
-    fun startMicRecording() {
-        val targetFile = createTempRecordingFile()
-        runCatching {
-            val mr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(context)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }
-            mr.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioSamplingRate(44100)
-                setAudioEncodingBitRate(128000)
-                setOutputFile(targetFile.absolutePath)
-                prepare()
-                start()
-            }
-            recorder = mr
-            activeRecordFile = targetFile
-            recordSeconds = 0
-            isRecording = true
-        }.onFailure { err ->
-            Toast.makeText(
-                context,
-                "Mic error: ${err.message ?: "Could not start recording"}",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    val micPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            startMicRecording()
-        } else {
-            Toast.makeText(context, "Mic permission required to record voice.", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    LaunchedEffect(isRecording) {
-        while (isRecording) {
-            delay(1000L)
-            recordSeconds += 1
-            if (recordSeconds >= 25) {
-                stopAndSaveRecording()
-            }
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            runCatching { recorder?.stop() }
-            runCatching { recorder?.release() }
-            recorder = null
-        }
-    }
-
-    val fieldColors = OutlinedTextFieldDefaults.colors(
-        focusedBorderColor = NeonGreen,
-        unfocusedBorderColor = BorderGreen,
-        focusedLabelColor = NeonGreen,
-        unfocusedLabelColor = TextMuted,
-        focusedTextColor = Color.White,
-        unfocusedTextColor = Color.White,
-        cursorColor = NeonGreen
-    )
-
-    val chipColors = FilterChipDefaults.filterChipColors(
-        selectedContainerColor = SelectedChipBg,
-        selectedLabelColor = NeonGreen,
-        containerColor = DarkBg,
-        labelColor = Color.White
-    )
-    val chipBorder = FilterChipDefaults.filterChipBorder(
-        borderColor = BorderGreen,
-        selectedBorderColor = NeonGreen
-    )
-
-    AlertDialog(
-        onDismissRequest = {
-            if (isRecording) stopAndSaveRecording()
-            onDismiss()
-        },
-        containerColor = CardBg,
-        title = {
-            Text(
-                text = "My Voice (Modal Clone)",
-                color = NeonGreen,
-                fontWeight = FontWeight.Bold
-            )
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                OutlinedTextField(
-                    value = serverUrl,
-                    onValueChange = { serverUrl = it },
-                    label = { Text("Modal Server URL (.modal.run)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = fieldColors
-                )
-
-                OutlinedTextField(
-                    value = secretPin,
-                    onValueChange = { secretPin = it },
-                    label = { Text("Secret PIN (VOICE_API_SECRET)") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = fieldColors
-                )
-
-                Text(
-                    text = "Base Pitch Tone",
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = !baseIsFemale,
-                        onClick = { baseIsFemale = false },
-                        label = { Text("Male Tone") },
-                        colors = chipColors,
-                        border = chipBorder
-                    )
-                    FilterChip(
-                        selected = baseIsFemale,
-                        onClick = { baseIsFemale = true },
-                        label = { Text("Female Tone") },
-                        colors = chipColors,
-                        border = chipBorder
-                    )
-                }
-
-                Text(
-                    text = "Your 15–20s Voice Sample",
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    text = if (initialConfig.hasSample) {
-                        "Saved: ${initialConfig.sampleName}"
-                    } else {
-                        "No voice sample saved yet. Record in a quiet room."
-                    },
-                    color = if (initialConfig.hasSample) NeonGreen else TextMuted,
-                    fontSize = 12.sp
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            if (isRecording) {
-                                stopAndSaveRecording()
-                            } else if (ContextCompat.checkSelfPermission(
-                                    context,
-                                    Manifest.permission.RECORD_AUDIO
-                                ) == PackageManager.PERMISSION_GRANTED
-                            ) {
-                                startMicRecording()
-                            } else {
-                                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            }
-                        },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isRecording) Color(0xFFE53935) else NeonGreen,
-                            contentColor = if (isRecording) Color.White else Color.Black
-                        )
-                    ) {
-                        Text(
-                            text = if (isRecording) "Stop (${recordSeconds}s)" else "Record Mic",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    OutlinedButton(
-                        onClick = onPickSample,
-                        enabled = !isRecording,
-                        modifier = Modifier.weight(1f),
-                        border = BorderStroke(1.dp, BorderGreen),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
-                    ) {
-                        Text("Pick Audio", fontSize = 12.sp)
-                    }
-                }
-
-                OutlinedButton(
-                    onClick = { onTestConnection(serverUrl, secretPin) },
-                    enabled = !isTesting && !isRecording,
-                    modifier = Modifier.fillMaxWidth(),
-                    border = BorderStroke(1.dp, BorderGreen),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
-                ) {
-                    Text(if (isTesting) "Testing Server…" else "Test Server & PIN")
-                }
-
-                if (!testMessage.isNullOrBlank()) {
-                    val isErr = testMessage.contains("failed", ignoreCase = true) ||
-                        testMessage.contains("Invalid", ignoreCase = true)
-                    Text(
-                        text = testMessage,
-                        color = if (isErr) Color(0xFFFF6B6B) else NeonGreen,
-                        fontSize = 12.sp
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    if (isRecording) stopAndSaveRecording()
-                    onSave(serverUrl, secretPin, baseIsFemale)
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = NeonGreen,
-                    contentColor = Color.Black
-                )
-            ) {
-                Text("Save", fontWeight = FontWeight.Bold)
-            }
-        },
-        dismissButton = {
-            TextButton(
-                onClick = {
-                    if (isRecording) stopAndSaveRecording()
-                    onDismiss()
-                }
-            ) {
-                Text("Cancel", color = TextMuted)
-            }
-        }
-    )
 }
