@@ -37,7 +37,9 @@ data class RenderServiceState(
     val progressText: String = "",
     val progressPercentage: Int = 0,
     val statusMessage: String = "",
-    val generatedVideoUri: Uri? = null
+    val generatedVideoUri: Uri? = null,
+    val generatedThumbnailUri: Uri? = null,
+    val completedScript: VideoScriptResponse? = null
 )
 
 @AndroidEntryPoint
@@ -143,7 +145,9 @@ class VideoRenderService : Service() {
             progressText = "Starting video generation…",
             progressPercentage = 0,
             statusMessage = "",
-            generatedVideoUri = null
+            generatedVideoUri = null,
+            generatedThumbnailUri = null,
+            completedScript = null
         )
 
         val wakeLock = runCatching {
@@ -188,9 +192,11 @@ class VideoRenderService : Service() {
                     it.copy(
                         isGenerating = false,
                         progressPercentage = 100,
-                        progressText = "Video saved to your gallery.",
+                        progressText = "Video & cover saved to your gallery.",
                         statusMessage = "Video generation complete.",
-                        generatedVideoUri = result.galleryUri
+                        generatedVideoUri = result.galleryUri,
+                        generatedThumbnailUri = result.thumbnailUri,
+                        completedScript = result.renderedScript
                     )
                 }
 
