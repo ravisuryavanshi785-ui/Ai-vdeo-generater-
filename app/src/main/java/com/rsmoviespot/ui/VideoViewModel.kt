@@ -71,6 +71,46 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(topic = topic, draftScript = null) }
     }
 
+    fun onTopicSelectedFromTrending(selectedTopic: String) {
+        _uiState.update {
+            it.copy(
+                topic = selectedTopic,
+                draftScript = null,
+                statusMessage = ""
+            )
+        }
+    }
+
+    fun loadTrendingTopics() {
+        if (_uiState.value.isLoadingTrending) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingTrending = true) }
+            try {
+                val topics = videoRepository.fetchTrendingMovieTopics()
+                _uiState.update {
+                    it.copy(
+                        isLoadingTrending = false,
+                        trendingTopics = topics,
+                        statusMessage = if (topics.isEmpty()) {
+                            "Could not load trending movie news right now."
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingTrending = false,
+                        statusMessage = "Trending fetch failed: ${error.message ?: error::class.java.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
     fun onShortsChanged(isShorts: Boolean) {
         _uiState.update { it.copy(isShorts = isShorts, draftScript = null) }
     }
@@ -81,31 +121,6 @@ class VideoViewModel @Inject constructor(
 
     fun onGenderSelected(gender: VoiceGender) {
         _uiState.update { it.copy(selectedGender = gender, draftScript = null) }
-    }
-
-    fun fetchTrendingTopics() {
-        if (_uiState.value.isLoadingTrending) return
-        viewModelScope.launch {
-            _uiState.update { it.copy(isLoadingTrending = true) }
-            val topics = runCatching { videoRepository.fetchTrendingMovieTopics() }
-                .getOrDefault(emptyList())
-            _uiState.update {
-                it.copy(
-                    isLoadingTrending = false,
-                    trendingTopics = topics,
-                    statusMessage = if (topics.isEmpty()) "Could not load trending movie news." else ""
-                )
-            }
-        }
-    }
-
-    fun onTrendingTopicSelected(headline: String) {
-        _uiState.update {
-            it.copy(
-                topic = "Make a viral YouTube Short video on this movie news: $headline",
-                draftScript = null
-            )
-        }
     }
 
     fun onBgmSelected(uri: Uri?) {
@@ -184,63 +199,66 @@ class VideoViewModel @Inject constructor(
         }
     }
 
-    fun onSlabLayoutChanged(index: Int, layoutMode: String) {
+    fun onSlabVisualSourceChanged(index: Int, newSource: String) {
         _uiState.update { current ->
             val script = current.draftScript ?: return@update current
             if (index !in script.slabs.indices) return@update current
             val updatedSlabs = script.slabs.toMutableList()
-            val existing = updatedSlabs[index]
-            updatedSlabs[index] = existing.copy(
-                layout_mode = layoutMode,
-                image_prompt_2 = if (layoutMode != "single" && existing.image_prompt_2.isBlank()) {
-                    existing.image_prompt
-                } else {
-                    existing.image_prompt_2
-                }
+            val target = updatedSlabs[index]
+            val fallbackQuery = if (newSource != "ai_generated" && target.real_photo_query.isBlank()) {
+                current.topic.trim().take(60)
+            } else {
+                target.real_photo_query
+            }
+            updatedSlabs[index] = target.copy(
+                visual_source = newSource,
+                real_photo_query = fallbackQuery
             )
             current.copy(draftScript = script.copy(slabs = updatedSlabs))
         }
     }
 
-    fun onSlabStatBadgeChanged(index: Int, badge: String) {
+    fun onSlabRealPhotoQueryChanged(index: Int, newQuery: String) {
         _uiState.update { current ->
             val script = current.draftScript ?: return@update current
             if (index !in script.slabs.indices) return@update current
             val updatedSlabs = script.slabs.toMutableList()
-            updatedSlabs[index] = updatedSlabs[index].copy(stat_badge = badge.take(32))
+            updatedSlabs[index] = updatedSlabs[index].copy(real_photo_query = newQuery)
             current.copy(draftScript = script.copy(slabs = updatedSlabs))
         }
     }
 
-    fun onSlabCustomPhotoPicked(index: Int, slotIndex: Int, uri: Uri) {
+    fun onSlabLayoutModeChanged(index: Int, newLayoutMode: String) {
         _uiState.update { current ->
             val script = current.draftScript ?: return@update current
             if (index !in script.slabs.indices) return@update current
             val updatedSlabs = script.slabs.toMutableList()
-            val slab = updatedSlabs[index]
-            updatedSlabs[index] = if (slotIndex == 2) {
-                slab.copy(
-                    custom_image_uri_2 = uri.toString(),
-                    layout_mode = if (slab.layout_mode == "single") "split" else slab.layout_mode
-                )
+            val target = updatedSlabs[index]
+            val secondSource = if (newLayoutMode != "single" && target.visual_source_2.isBlank()) {
+                "ai_generated"
             } else {
-                slab.copy(custom_image_uri = uri.toString())
+                target.visual_source_2
             }
+            val secondPrompt = if (newLayoutMode != "single" && target.image_prompt_2.isBlank()) {
+                target.image_prompt
+            } else {
+                target.image_prompt_2
+            }
+            updatedSlabs[index] = target.copy(
+                layout_mode = newLayoutMode,
+                visual_source_2 = secondSource,
+                image_prompt_2 = secondPrompt
+            )
             current.copy(draftScript = script.copy(slabs = updatedSlabs))
         }
     }
 
-    fun onSlabClearCustomPhoto(index: Int, slotIndex: Int) {
+    fun onSlabStatBadgeChanged(index: Int, newBadge: String) {
         _uiState.update { current ->
             val script = current.draftScript ?: return@update current
             if (index !in script.slabs.indices) return@update current
             val updatedSlabs = script.slabs.toMutableList()
-            val slab = updatedSlabs[index]
-            updatedSlabs[index] = if (slotIndex == 2) {
-                slab.copy(custom_image_uri_2 = null)
-            } else {
-                slab.copy(custom_image_uri = null)
-            }
+            updatedSlabs[index] = updatedSlabs[index].copy(stat_badge = newBadge)
             current.copy(draftScript = script.copy(slabs = updatedSlabs))
         }
     }
@@ -266,6 +284,10 @@ class VideoViewModel @Inject constructor(
             language = currentState.selectedLanguage,
             voiceGender = currentState.selectedGender
         )
+    }
+
+    fun cancelGeneratingVideo() {
+        VideoRenderService.cancelRender(context)
     }
 
     private fun resolveDisplayName(uri: Uri): String? {
