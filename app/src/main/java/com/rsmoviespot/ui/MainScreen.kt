@@ -2,6 +2,8 @@ package com.rsmoviespot.ui
 
 import android.Manifest
 import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -38,16 +40,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -68,25 +66,6 @@ fun MainScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
-
-    var pendingPhotoTarget by remember { mutableStateOf<Pair<Int, Int>?>(null) }
-
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        val target = pendingPhotoTarget
-        pendingPhotoTarget = null
-        if (uri != null && target != null) {
-            runCatching {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            }
-            viewModel.onSlabCustomPhotoPicked(target.first, target.second, uri)
-        }
-    }
 
     val bgmPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -119,6 +98,16 @@ fun MainScreen(
         selectedBorderColor = NeonGreen
     )
 
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = NeonGreen,
+        unfocusedBorderColor = BorderGreen,
+        focusedLabelColor = NeonGreen,
+        unfocusedLabelColor = TextMuted,
+        focusedTextColor = Color.White,
+        unfocusedTextColor = Color.White,
+        cursorColor = NeonGreen
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -128,28 +117,38 @@ fun MainScreen(
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        Text(
+            text = "RS MOVIE SPOT",
+            color = NeonGreen,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.2.sp
+        )
+        Text(
+            text = "AI Video Generator",
+            color = Color.White,
+            fontSize = 28.sp,
+            fontWeight = FontWeight.ExtraBold
+        )
+        Text(
+            text = "Enter a topic, tap Trending Ideas, or paste your full script. Photos, movie clips & memes are fetched automatically from the internet.",
+            color = TextMuted,
+            fontSize = 13.sp
+        )
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
-                Text(
-                    text = "RS MOVIE SPOT",
-                    color = NeonGreen,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.2.sp
-                )
-                Text(
-                    text = "AI Video Studio",
-                    color = Color.White,
-                    fontSize = 26.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
-            }
+            Text(
+                text = "Topic or Script",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold
+            )
             OutlinedButton(
-                onClick = viewModel::fetchTrendingTopics,
+                onClick = viewModel::loadTrendingTopics,
                 enabled = !uiState.isLoadingTrending && !uiState.isGenerating,
                 shape = RoundedCornerShape(20.dp),
                 border = BorderStroke(1.dp, BorderGreen),
@@ -170,15 +169,16 @@ fun MainScreen(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                uiState.trendingTopics.forEach { headline ->
+                uiState.trendingTopics.forEach { idea ->
                     FilterChip(
-                        selected = false,
-                        onClick = { viewModel.onTrendingTopicSelected(headline) },
+                        selected = uiState.topic == idea,
+                        onClick = { viewModel.onTopicSelectedFromTrending(idea) },
+                        enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
                         label = {
                             Text(
-                                text = if (headline.length > 44) headline.take(44) + "…" else headline,
+                                text = idea,
                                 maxLines = 1,
-                                fontSize = 12.sp
+                                overflow = TextOverflow.Ellipsis
                             )
                         },
                         colors = chipColors,
@@ -191,20 +191,12 @@ fun MainScreen(
         OutlinedTextField(
             value = uiState.topic,
             onValueChange = viewModel::onTopicChanged,
-            label = { Text("Topic, detailed prompt, or full script") },
+            label = { Text("Topic or full script (>25 words = exact script)") },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(130.dp),
             enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = NeonGreen,
-                unfocusedBorderColor = BorderGreen,
-                focusedLabelColor = NeonGreen,
-                unfocusedLabelColor = TextMuted,
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White,
-                cursorColor = NeonGreen
-            )
+            colors = fieldColors
         )
 
         Text(
@@ -291,7 +283,7 @@ fun MainScreen(
                 border = BorderStroke(1.dp, BorderGreen),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
             ) {
-                Text(uiState.selectedBgmName, maxLines = 1)
+                Text(uiState.selectedBgmName, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (uiState.selectedBgmUri != null) {
                 OutlinedButton(
@@ -394,6 +386,15 @@ fun MainScreen(
                         color = NeonGreen,
                         trackColor = Color(0xFF263327)
                     )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = viewModel::cancelGeneratingVideo,
+                        shape = RoundedCornerShape(20.dp),
+                        border = BorderStroke(1.dp, Color(0xFF7A3A3A)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF8A8A))
+                    ) {
+                        Text("Cancel Render", fontSize = 12.sp)
+                    }
                 }
             }
         }
@@ -481,8 +482,63 @@ fun MainScreen(
             }
         }
 
-        val uploadMetaScript = uiState.completedScript ?: uiState.draftScript
-        if (uploadMetaScript != null && (uploadMetaScript.youtube_title.isNotBlank() || uploadMetaScript.pinned_comment.isNotBlank())) {
+        uiState.generatedThumbnailUri?.let { thumbUri ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = CardBg),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Cover Thumbnail Ready",
+                            color = NeonGreen,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Saved in Pictures/RS Movie Spot",
+                            color = TextMuted,
+                            fontSize = 11.sp
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            val viewThumb = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(thumbUri, "image/jpeg")
+                                addFlags(
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                        Intent.FLAG_ACTIVITY_NEW_TASK
+                                )
+                            }
+                            runCatching {
+                                context.startActivity(Intent.createChooser(viewThumb, "View Cover"))
+                            }.onFailure {
+                                Toast.makeText(context, "Saved in Gallery > Pictures/RS Movie Spot", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        shape = RoundedCornerShape(18.dp),
+                        border = BorderStroke(1.dp, BorderGreen),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+                    ) {
+                        Text("View Cover", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
+        val activeKitScript = uiState.completedScript ?: uiState.draftScript
+        if (activeKitScript != null &&
+            (activeKitScript.youtube_title.isNotBlank() ||
+                activeKitScript.youtube_description.isNotBlank() ||
+                activeKitScript.pinned_comment.isNotBlank())
+        ) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = CardBg),
@@ -498,74 +554,72 @@ fun MainScreen(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
                     )
-                    if (uiState.generatedThumbnailUri != null) {
+                    if (activeKitScript.youtube_title.isNotBlank()) {
                         Text(
-                            text = "Cover Thumbnail saved to Pictures / RS Movie Spot",
-                            color = TextMuted,
-                            fontSize = 12.sp
-                        )
-                    }
-                    if (uploadMetaScript.youtube_title.isNotBlank()) {
-                        Text(
-                            text = "Title: ${uploadMetaScript.youtube_title}",
+                            text = "Title: ${activeKitScript.youtube_title}",
                             color = Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
+                            fontSize = 12.sp
                         )
                     }
-                    if (uploadMetaScript.youtube_description.isNotBlank()) {
+                    if (activeKitScript.youtube_description.isNotBlank()) {
                         Text(
-                            text = "${uploadMetaScript.youtube_description}\n${uploadMetaScript.youtube_hashtags}",
+                            text = "Description: ${activeKitScript.youtube_description}",
                             color = TextMuted,
-                            fontSize = 12.sp
+                            fontSize = 11.sp,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
-                    if (uploadMetaScript.pinned_comment.isNotBlank()) {
+                    if (activeKitScript.pinned_comment.isNotBlank()) {
                         Text(
-                            text = "Pinned Comment: ${uploadMetaScript.pinned_comment}",
-                            color = Color(0xFFFFE135),
-                            fontSize = 12.sp
+                            text = "Pinned Comment: ${activeKitScript.pinned_comment}",
+                            color = TextMuted,
+                            fontSize = 11.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (uploadMetaScript.youtube_title.isNotBlank()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (activeKitScript.youtube_title.isNotBlank()) {
                             OutlinedButton(
                                 onClick = {
-                                    clipboard.setText(AnnotatedString(uploadMetaScript.youtube_title))
-                                    Toast.makeText(context, "Title copied!", Toast.LENGTH_SHORT).show()
+                                    copyToClipboard(context, "YouTube Title", activeKitScript.youtube_title)
                                 },
+                                modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp),
                                 border = BorderStroke(1.dp, BorderGreen),
                                 colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
                             ) {
-                                Text("Copy Title", fontSize = 12.sp)
+                                Text("Copy Title", fontSize = 11.sp)
                             }
                         }
-                        if (uploadMetaScript.youtube_description.isNotBlank()) {
+                        if (activeKitScript.youtube_description.isNotBlank()) {
                             OutlinedButton(
                                 onClick = {
-                                    val fullDesc = "${uploadMetaScript.youtube_description}\n\n${uploadMetaScript.youtube_hashtags}".trim()
-                                    clipboard.setText(AnnotatedString(fullDesc))
-                                    Toast.makeText(context, "Desc & tags copied!", Toast.LENGTH_SHORT).show()
+                                    copyToClipboard(context, "YouTube Description", activeKitScript.youtube_description)
                                 },
+                                modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp),
                                 border = BorderStroke(1.dp, BorderGreen),
                                 colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
                             ) {
-                                Text("Copy Desc + Tags", fontSize = 12.sp)
+                                Text("Copy Desc", fontSize = 11.sp)
                             }
                         }
-                        if (uploadMetaScript.pinned_comment.isNotBlank()) {
+                        if (activeKitScript.pinned_comment.isNotBlank()) {
                             OutlinedButton(
                                 onClick = {
-                                    clipboard.setText(AnnotatedString(uploadMetaScript.pinned_comment))
-                                    Toast.makeText(context, "Comment copied!", Toast.LENGTH_SHORT).show()
+                                    copyToClipboard(context, "Pinned Comment", activeKitScript.pinned_comment)
                                 },
+                                modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp),
                                 border = BorderStroke(1.dp, BorderGreen),
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFFE135))
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
                             ) {
-                                Text("Copy Pin", fontSize = 12.sp)
+                                Text("Copy Pin", fontSize = 11.sp)
                             }
                         }
                     }
@@ -590,110 +644,75 @@ fun MainScreen(
                         modifier = Modifier.padding(12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        val visualTag = if (
-                            slab.visual_source == "real_photo" &&
-                            slab.real_photo_query.isNotBlank()
-                        ) {
-                            "Real Photo: ${slab.real_photo_query}"
-                        } else {
-                            "AI Image"
-                        }
                         Text(
-                            text = "Scene ${index + 1} · $visualTag · ${slab.voice_emotion} · ${slab.sfx_cue}",
+                            text = "Scene ${index + 1} · ${slab.voice_emotion} · ${slab.sfx_cue}",
                             color = TextMuted,
                             fontSize = 12.sp
                         )
 
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf("single" to "Single", "split" to "Split 2", "flip" to "Flip 2").forEach { (modeKey, modeLabel) ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(
+                                "ai_generated" to "AI",
+                                "real_photo" to "Photo",
+                                "video_clip" to "Clip",
+                                "meme_clip" to "Meme"
+                            ).forEach { (sourceKey, label) ->
                                 FilterChip(
-                                    selected = slab.layout_mode == modeKey,
-                                    onClick = { viewModel.onSlabLayoutChanged(index, modeKey) },
+                                    selected = slab.visual_source.equals(sourceKey, ignoreCase = true),
+                                    onClick = { viewModel.onSlabVisualSourceChanged(index, sourceKey) },
                                     enabled = !uiState.isGenerating,
-                                    label = { Text(modeLabel, fontSize = 11.sp) },
+                                    label = { Text(label, fontSize = 11.sp) },
                                     colors = chipColors,
                                     border = chipBorder
                                 )
                             }
                         }
 
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(
-                                onClick = {
-                                    pendingPhotoTarget = index to 1
-                                    imagePickerLauncher.launch(arrayOf("image/*"))
-                                },
-                                enabled = !uiState.isGenerating,
-                                shape = RoundedCornerShape(16.dp),
-                                border = BorderStroke(1.dp, BorderGreen),
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = if (slab.custom_image_uri != null) NeonGreen else Color.White
-                                )
-                            ) {
-                                Text(
-                                    text = if (slab.custom_image_uri != null) "Photo 1 Set" else "Pick Photo 1",
-                                    fontSize = 11.sp
-                                )
-                            }
-                            if (slab.custom_image_uri != null) {
-                                OutlinedButton(
-                                    onClick = { viewModel.onSlabClearCustomPhoto(index, 1) },
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(
+                                "single" to "Single",
+                                "split" to "Split 2",
+                                "flip" to "Flip 2"
+                            ).forEach { (layoutKey, label) ->
+                                FilterChip(
+                                    selected = slab.layout_mode.equals(layoutKey, ignoreCase = true),
+                                    onClick = { viewModel.onSlabLayoutModeChanged(index, layoutKey) },
                                     enabled = !uiState.isGenerating,
-                                    shape = RoundedCornerShape(16.dp),
-                                    border = BorderStroke(1.dp, BorderGreen),
-                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextMuted)
-                                ) {
-                                    Text("X", fontSize = 11.sp)
-                                }
+                                    label = { Text(label, fontSize = 11.sp) },
+                                    colors = chipColors,
+                                    border = chipBorder
+                                )
                             }
+                        }
 
-                            if (slab.layout_mode != "single") {
-                                OutlinedButton(
-                                    onClick = {
-                                        pendingPhotoTarget = index to 2
-                                        imagePickerLauncher.launch(arrayOf("image/*"))
-                                    },
-                                    enabled = !uiState.isGenerating,
-                                    shape = RoundedCornerShape(16.dp),
-                                    border = BorderStroke(1.dp, BorderGreen),
-                                    colors = ButtonDefaults.outlinedButtonColors(
-                                        contentColor = if (slab.custom_image_uri_2 != null) NeonGreen else Color.White
-                                    )
-                                ) {
-                                    Text(
-                                        text = if (slab.custom_image_uri_2 != null) "Photo 2 Set" else "Pick Photo 2",
-                                        fontSize = 11.sp
-                                    )
-                                }
-                                if (slab.custom_image_uri_2 != null) {
-                                    OutlinedButton(
-                                        onClick = { viewModel.onSlabClearCustomPhoto(index, 2) },
-                                        enabled = !uiState.isGenerating,
-                                        shape = RoundedCornerShape(16.dp),
-                                        border = BorderStroke(1.dp, BorderGreen),
-                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextMuted)
-                                    ) {
-                                        Text("X", fontSize = 11.sp)
-                                    }
-                                }
-                            }
+                        if (!slab.visual_source.equals("ai_generated", ignoreCase = true)) {
+                            OutlinedTextField(
+                                value = slab.real_photo_query,
+                                onValueChange = { viewModel.onSlabRealPhotoQueryChanged(index, it) },
+                                label = { Text("Internet query (photo / clip / meme)") },
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = !uiState.isGenerating,
+                                singleLine = true,
+                                colors = fieldColors
+                            )
                         }
 
                         OutlinedTextField(
                             value = slab.stat_badge,
                             onValueChange = { viewModel.onSlabStatBadgeChanged(index, it) },
-                            label = { Text("Top Stat Badge (optional, e.g. ₹80 CR DAY 1)") },
-                            singleLine = true,
+                            label = { Text("Stat Badge (optional e.g. ₹500 Cr)") },
                             modifier = Modifier.fillMaxWidth(),
                             enabled = !uiState.isGenerating,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = NeonGreen,
-                                unfocusedBorderColor = BorderGreen,
-                                focusedLabelColor = NeonGreen,
-                                unfocusedLabelColor = TextMuted,
-                                focusedTextColor = Color(0xFFFFE135),
-                                unfocusedTextColor = Color(0xFFFFE135)
-                            )
+                            singleLine = true,
+                            colors = fieldColors
                         )
 
                         OutlinedTextField(
@@ -702,18 +721,18 @@ fun MainScreen(
                             label = { Text("Voiceover") },
                             modifier = Modifier.fillMaxWidth(),
                             enabled = !uiState.isGenerating,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = NeonGreen,
-                                unfocusedBorderColor = BorderGreen,
-                                focusedLabelColor = NeonGreen,
-                                unfocusedLabelColor = TextMuted,
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            )
+                            colors = fieldColors
                         )
                     }
                 }
             }
         }
     }
+}
+
+private fun copyToClipboard(context: Context, label: String, text: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        ?: return
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
+    Toast.makeText(context, "$label copied", Toast.LENGTH_SHORT).show()
 }
