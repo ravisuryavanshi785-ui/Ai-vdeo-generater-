@@ -65,6 +65,13 @@ interface VideoRepository {
         preferPortrait: Boolean = true
     ): Boolean
 
+    suspend fun downloadInternetVideoClip(
+        query: String,
+        isMeme: Boolean,
+        usedUrls: MutableSet<String>,
+        destinationFile: File
+    ): Boolean
+
     suspend fun fetchTrendingMovieTopics(): List<String>
 
     suspend fun generateAudioForSlab(text: String): ResponseBody
@@ -97,11 +104,7 @@ class VideoRepositoryImpl @Inject constructor(
         val maxTokens: Int
     )
 
-    private enum class RealVisualIntent {
-        PERSON,
-        MOVIE_POSTER,
-        CHARACTER
-    }
+    private enum class RealVisualIntent { PERSON, MOVIE_POSTER, CHARACTER }
 
     private data class PhotoCandidate(
         val url: String,
@@ -114,6 +117,11 @@ class VideoRepositoryImpl @Inject constructor(
             get() = width > 0 && height > 0 && height.toFloat() >= width.toFloat() * 0.92f
     }
 
+    private data class VideoClipCandidate(
+        val url: String,
+        val score: Int
+    )
+
     override suspend fun generateScript(
         topic: String,
         isShorts: Boolean,
@@ -122,20 +130,13 @@ class VideoRepositoryImpl @Inject constructor(
     ): VideoScriptResponse {
         val cleanInput = topic.trim()
         require(cleanInput.isNotBlank()) { "Topic must not be blank." }
-        require(BuildConfig.GROQ_API_KEY.isNotBlank()) {
-            "GROQ_API_KEY is empty."
-        }
+        require(BuildConfig.GROQ_API_KEY.isNotBlank()) { "GROQ_API_KEY is empty." }
 
         val inputWordCount = cleanInput.split(Regex("\\s+")).filter { it.isNotBlank() }.size
         val isFullScriptMode = inputWordCount > FULL_SCRIPT_WORD_THRESHOLD &&
             !isInstructionOrBriefPrompt(cleanInput)
 
-        val systemPrompt = if (isFullScriptMode) {
-            FULL_SCRIPT_SYSTEM_PROMPT
-        } else {
-            TOPIC_SYSTEM_PROMPT
-        }
-
+        val systemPrompt = if (isFullScriptMode) FULL_SCRIPT_SYSTEM_PROMPT else TOPIC_SYSTEM_PROMPT
         val targetGenderLabel = voiceGender.label
         val languageDirective = if (language == VideoLanguage.AUTO) {
             "Language: Auto-detect from user request. Default to spoken Hindi (Devanagari) with voice_name '${VideoLanguage.HINDI.resolveVoice(voiceGender)}', UNLESS the user explicitly requested another language (e.g. English, Marathi, Gujarati, Bengali, Tamil, Telugu, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, Japanese, Arabic), in which case write in THAT language and pick the matching $targetGenderLabel Edge TTS voice_name."
@@ -167,7 +168,7 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("CRITICAL PROMPT RULES:")
                 appendLine("1) NEVER copy meta-instructions ('Act as...', 'Write a script...', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Only put the spoken narration in voiceover_text.")
                 appendLine("2) Whenever the user describes visuals, scenes, camera shots, character appearance/costume, lighting, props, or style (in English, Hindi, or Hinglish), put those EXACT visual details right at the BEGINNING of image_prompt (in crisp English) with visual_source='ai_generated' — NEVER replace described visuals with generic crowds or unrelated real_photo.")
-                appendLine("3) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Use layout_mode='split' with 2 visuals on comparisons/VS moments, or layout_mode='flip' when 2 visuals fit one beat.")
+                appendLine("3) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Use selective video_clip (1-3 hype/trailer/action scenes) & meme_clip (1-2 funny/shock reaction scenes) ONLY where clearly relevant, plus layout_mode='split'/'flip' on comparisons.")
                 appendLine(languageDirective)
                 appendLine("Format guideline: $formatGuide")
                 appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
@@ -214,10 +215,7 @@ class VideoRepositoryImpl @Inject constructor(
                     }
                 }
 
-                val generatedText = response.choices
-                    .firstOrNull()
-                    ?.message
-                    ?.content
+                val generatedText = response.choices.firstOrNull()?.message?.content
                     ?.takeIf { it.isNotBlank() }
                     ?: throw IllegalStateException("Groq returned empty result.")
 
@@ -226,9 +224,7 @@ class VideoRepositoryImpl @Inject constructor(
                 throw cancelled
             } catch (error: Throwable) {
                 lastError = error
-                if (index == attempts.lastIndex) {
-                    throw error
-                }
+                if (index == attempts.lastIndex) throw error
             }
         }
 
@@ -278,16 +274,7 @@ class VideoRepositoryImpl @Inject constructor(
     override suspend fun fetchTrendingMovieTopics(): List<String> = withContext(Dispatchers.IO) {
         val rssUrl =
             "https://news.google.com/rss/search?q=Bollywood+OR+Hollywood+OR+Tollywood+box+office+movie+when:3d&hl=en-IN&gl=IN&ceid=IN:en"
-        val request = Request.Builder()
-            .url(rssUrl)
-            .header("User-Agent", WIKIMEDIA_USER_AGENT)
-            .build()
-
-        val xml = okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return@withContext emptyList()
-            response.body?.string().orEmpty()
-        }
-        if (xml.isBlank()) return@withContext emptyList()
+        val xml = fetchTextString(rssUrl, WIKIMEDIA_USER_AGENT) ?: return@withContext emptyList()
 
         val itemTitleRegex = Regex(
             """<item>.*?<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>""",
@@ -318,12 +305,8 @@ class VideoRepositoryImpl @Inject constructor(
         seed: Int
     ): ResponseBody {
         require(prompt.isNotBlank()) { "Image prompt must not be blank." }
-        require(BuildConfig.CLOUDFLARE_ACCOUNT_ID.isNotBlank()) {
-            "CLOUDFLARE_ACCOUNT_ID is empty."
-        }
-        require(BuildConfig.CLOUDFLARE_API_TOKEN.isNotBlank()) {
-            "CLOUDFLARE_API_TOKEN is empty."
-        }
+        require(BuildConfig.CLOUDFLARE_ACCOUNT_ID.isNotBlank()) { "CLOUDFLARE_ACCOUNT_ID is empty." }
+        require(BuildConfig.CLOUDFLARE_API_TOKEN.isNotBlank()) { "CLOUDFLARE_API_TOKEN is empty." }
 
         val imageWidth = if (isShorts) SHORTS_IMAGE_WIDTH else LANDSCAPE_IMAGE_WIDTH
         val imageHeight = if (isShorts) SHORTS_IMAGE_HEIGHT else LANDSCAPE_IMAGE_HEIGHT
@@ -392,6 +375,165 @@ class VideoRepositoryImpl @Inject constructor(
         return base.joinToString(", ")
     }
 
+    override suspend fun downloadInternetVideoClip(
+        query: String,
+        isMeme: Boolean,
+        usedUrls: MutableSet<String>,
+        destinationFile: File
+    ): Boolean = withContext(Dispatchers.IO) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return@withContext false
+
+        val coreWords = extractCoreQueryWords(cleanQuery)
+        if (coreWords.isEmpty()) return@withContext false
+
+        val candidates = mutableListOf<VideoClipCandidate>()
+        if (isMeme) {
+            runCatching { collectTenorMemeClips(cleanQuery, coreWords, candidates) }
+            runCatching { collectCoubVideoClips(cleanQuery, coreWords, candidates) }
+        } else {
+            runCatching { collectCoubVideoClips(cleanQuery, coreWords, candidates) }
+            runCatching { collectTenorMemeClips(cleanQuery, coreWords, candidates) }
+        }
+
+        val ordered = candidates.distinctBy { it.url }.sortedByDescending { it.score }
+        for (candidate in ordered) {
+            if (candidate.url in usedUrls) continue
+            val ok = runCatching { downloadAndValidateVideoUrl(candidate.url, destinationFile) }
+                .getOrDefault(false)
+            if (ok) {
+                usedUrls.add(candidate.url)
+                return@withContext true
+            }
+        }
+        false
+    }
+
+    private fun extractCoreQueryWords(query: String): List<String> {
+        val stopWords = setOf(
+            "the", "a", "an", "of", "in", "on", "and", "or", "for", "with", "from",
+            "movie", "film", "cinema", "scene", "trailer", "teaser", "clip", "video",
+            "meme", "funny", "reaction", "official", "hd", "4k", "whatsapp", "status",
+            "shorts", "bollywood", "hollywood", "indian"
+        )
+        return query.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.length >= 2 && it !in stopWords }
+            .distinct()
+    }
+
+    private fun collectCoubVideoClips(
+        cleanQuery: String,
+        coreWords: List<String>,
+        outList: MutableList<VideoClipCandidate>
+    ) {
+        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        val url = "https://coub.com/api/v2/search/coubs?per_page=12&q=$encoded"
+        val bodyText = fetchTextString(url, BROWSER_USER_AGENT, "application/json") ?: return
+        val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
+        val coubs = root["coubs"] as? JsonArray ?: return
+
+        val requiredHits = if (coreWords.size >= 2) 2 else 1
+        val phraseLower = coreWords.joinToString(" ")
+        val bannedTags = setOf(
+            "gaming", "gameplay", "fortnite", "minecraft", "roblox",
+            "valorant", "pubg", "freefire", "mannequin", "asmr", "amv"
+        )
+
+        for (item in coubs) {
+            val obj = item as? JsonObject ?: continue
+            val title = obj["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val tagsText = (obj["tags"] as? JsonArray)
+                ?.mapNotNull { (it as? JsonObject)?.get("title")?.jsonPrimitive?.contentOrNull }
+                ?.joinToString(" ")
+                .orEmpty()
+
+            val searchable = "$title $tagsText".lowercase()
+            if (bannedTags.any { tag -> Regex("""\b${Regex.escape(tag)}\b""").containsMatchIn(searchable) }) {
+                continue
+            }
+
+            val wordHits = coreWords.count { word ->
+                Regex("""\b${Regex.escape(word)}\b""").containsMatchIn(searchable)
+            }
+            if (wordHits < requiredHits) continue
+
+            val videoObj = ((obj["file_versions"] as? JsonObject)
+                ?.get("html5") as? JsonObject)
+                ?.get("video") as? JsonObject ?: continue
+
+            val mp4Url = (videoObj["high"] as? JsonObject)?.get("url")?.jsonPrimitive?.contentOrNull
+                ?: (videoObj["med"] as? JsonObject)?.get("url")?.jsonPrimitive?.contentOrNull
+                ?: continue
+            if (!mp4Url.startsWith("http")) continue
+
+            val likes = obj["likes_count"]?.jsonPrimitive?.intOrNull ?: 0
+            val phraseBonus = if (phraseLower.isNotBlank() && searchable.contains(phraseLower)) 60 else 0
+            val score = (wordHits * 100) + phraseBonus + (likes / 10).coerceAtMost(50) + 40
+            outList += VideoClipCandidate(mp4Url, score)
+        }
+    }
+
+    private fun collectTenorMemeClips(
+        cleanQuery: String,
+        coreWords: List<String>,
+        outList: MutableList<VideoClipCandidate>
+    ) {
+        val slug = cleanQuery.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        if (slug.isBlank()) return
+
+        val html = fetchTextString("https://tenor.com/search/$slug-gifs", BROWSER_USER_AGENT) ?: return
+        val mp4Regex = Regex("""https://media\.tenor\.com/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\.mp4""")
+        val matches = mp4Regex.findAll(html).map { it.value }.distinct().toList()
+
+        for (mp4Url in matches) {
+            val fileSlug = mp4Url.substringAfterLast('/').lowercase()
+            val slugHits = coreWords.count { word -> fileSlug.contains(word) }
+            if (slugHits == 0 && coreWords.isNotEmpty()) continue
+
+            val qualityBonus = if (mp4Url.contains("AAAPo")) 55 else 15
+            outList += VideoClipCandidate(mp4Url, (slugHits * 90) + qualityBonus)
+        }
+    }
+
+    private fun downloadAndValidateVideoUrl(url: String, destinationFile: File): Boolean {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", BROWSER_USER_AGENT)
+            .build()
+
+        okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return false
+            val contentType = response.header("Content-Type").orEmpty().lowercase()
+            if (contentType.contains("text/html")) return false
+
+            val body = response.body ?: return false
+            destinationFile.outputStream().use { out ->
+                body.byteStream().use { input -> input.copyTo(out) }
+            }
+        }
+
+        val size = destinationFile.length()
+        if (!destinationFile.exists() || size < 20_000L || size > 25_000_000L) {
+            destinationFile.delete()
+            return false
+        }
+
+        val header = ByteArray(64)
+        val readCount = destinationFile.inputStream().use { it.read(header) }
+        if (readCount < 12) {
+            destinationFile.delete()
+            return false
+        }
+        val headerStr = String(header, 0, readCount, Charsets.ISO_8859_1)
+        if (!headerStr.contains("ftyp")) {
+            destinationFile.delete()
+            return false
+        }
+        return true
+    }
+
     override suspend fun downloadRealPhoto(
         query: String,
         usedUrls: MutableSet<String>,
@@ -407,121 +549,28 @@ class VideoRepositoryImpl @Inject constructor(
 
         when (intent) {
             RealVisualIntent.MOVIE_POSTER -> {
-                runCatching {
-                    collectImdbPhotoCandidates(
-                        searchTerm = subject,
-                        outMap = candidates,
-                        preferMovies = true,
-                        allowPeople = false
-                    )
-                }
-                runCatching {
-                    collectItunesMovieCandidates(
-                        searchTerm = subject,
-                        outMap = candidates,
-                        countries = listOf("IN", "US")
-                    )
-                }
-                runCatching {
-                    collectWikipediaSummaryCandidates(
-                        pageQuery = "$subject (film)",
-                        outMap = candidates,
-                        requireEntertainment = true
-                    )
-                }
-                runCatching {
-                    collectWikipediaSummaryCandidates(
-                        pageQuery = subject,
-                        outMap = candidates,
-                        requireEntertainment = true
-                    )
-                }
-                runCatching {
-                    collectWikipediaSearchCandidates(
-                        searchQuery = "$subject film poster",
-                        outMap = candidates,
-                        requireEntertainment = true
-                    )
-                }
+                runCatching { collectImdbPhotoCandidates(subject, candidates, preferMovies = true, allowPeople = false) }
+                runCatching { collectItunesMovieCandidates(subject, candidates, listOf("IN", "US")) }
+                runCatching { collectWikipediaSummaryCandidates("$subject (film)", candidates, requireEntertainment = true) }
+                runCatching { collectWikipediaSummaryCandidates(subject, candidates, requireEntertainment = true) }
+                runCatching { collectWikipediaSearchCandidates("$subject film poster", candidates, requireEntertainment = true) }
             }
 
             RealVisualIntent.CHARACTER -> {
-                runCatching {
-                    collectWikipediaSummaryCandidates(
-                        pageQuery = "$subject (Marvel Cinematic Universe)",
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
-                runCatching {
-                    collectWikipediaSummaryCandidates(
-                        pageQuery = "$subject (character)",
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
-                runCatching {
-                    collectWikipediaSummaryCandidates(
-                        pageQuery = subject,
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
-                runCatching {
-                    collectImdbPhotoCandidates(
-                        searchTerm = subject,
-                        outMap = candidates,
-                        preferMovies = true,
-                        allowPeople = true
-                    )
-                }
-                runCatching {
-                    collectWikipediaSearchCandidates(
-                        searchQuery = "$subject character",
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
-                runCatching {
-                    collectWikipediaSearchCandidates(
-                        searchQuery = subject,
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
-                runCatching {
-                    collectItunesMovieCandidates(
-                        searchTerm = subject,
-                        outMap = candidates,
-                        countries = listOf("US", "IN")
-                    )
-                }
+                runCatching { collectWikipediaSummaryCandidates("$subject (Marvel Cinematic Universe)", candidates, false) }
+                runCatching { collectWikipediaSummaryCandidates("$subject (character)", candidates, false) }
+                runCatching { collectWikipediaSummaryCandidates(subject, candidates, false) }
+                runCatching { collectImdbPhotoCandidates(subject, candidates, preferMovies = true, allowPeople = true) }
+                runCatching { collectWikipediaSearchCandidates("$subject character", candidates, false) }
+                runCatching { collectWikipediaSearchCandidates(subject, candidates, false) }
+                runCatching { collectItunesMovieCandidates(subject, candidates, listOf("US", "IN")) }
                 runCatching { collectWikimediaCommonsCandidates(subject, candidates) }
             }
 
             RealVisualIntent.PERSON -> {
-                runCatching {
-                    collectImdbPhotoCandidates(
-                        searchTerm = subject,
-                        outMap = candidates,
-                        preferMovies = false,
-                        allowPeople = true
-                    )
-                }
-                runCatching {
-                    collectWikipediaSummaryCandidates(
-                        pageQuery = subject,
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
-                runCatching {
-                    collectWikipediaSearchCandidates(
-                        searchQuery = subject,
-                        outMap = candidates,
-                        requireEntertainment = false
-                    )
-                }
+                runCatching { collectImdbPhotoCandidates(subject, candidates, preferMovies = false, allowPeople = true) }
+                runCatching { collectWikipediaSummaryCandidates(subject, candidates, false) }
+                runCatching { collectWikipediaSearchCandidates(subject, candidates, false) }
                 runCatching { collectWikimediaCommonsCandidates(subject, candidates) }
             }
         }
@@ -535,14 +584,9 @@ class VideoRepositoryImpl @Inject constructor(
             if (candidate.url in usedUrls) continue
             if (candidate.fallbackUrl != null && candidate.fallbackUrl in usedUrls) continue
 
-            var downloaded = runCatching {
-                downloadAndValidateImageUrl(candidate.url, destinationFile)
-            }.getOrDefault(false)
-
+            var downloaded = runCatching { downloadAndValidateImageUrl(candidate.url, destinationFile) }.getOrDefault(false)
             if (!downloaded && candidate.fallbackUrl != null) {
-                downloaded = runCatching {
-                    downloadAndValidateImageUrl(candidate.fallbackUrl, destinationFile)
-                }.getOrDefault(false)
+                downloaded = runCatching { downloadAndValidateImageUrl(candidate.fallbackUrl, destinationFile) }.getOrDefault(false)
             }
 
             if (downloaded) {
@@ -551,7 +595,6 @@ class VideoRepositoryImpl @Inject constructor(
                 return@withContext true
             }
         }
-
         false
     }
 
@@ -560,9 +603,7 @@ class VideoRepositoryImpl @Inject constructor(
         val movieKeywords = listOf(
             "movie", "film", "poster", "web series", "tv series", "series", "cinema", "trailer", "box office"
         )
-        if (movieKeywords.any { lower.contains(it) }) {
-            return RealVisualIntent.MOVIE_POSTER
-        }
+        if (movieKeywords.any { lower.contains(it) }) return RealVisualIntent.MOVIE_POSTER
 
         val characterKeywords = listOf(
             "character", "superhero", "supervillain", "villain", "comic", "anime",
@@ -573,9 +614,7 @@ class VideoRepositoryImpl @Inject constructor(
             "ant-man", "hawkeye", "scarlet witch", "black widow", "goku", "naruto",
             "luffy", "krrish", "shaktimaan", "baahubali", "pushpa raj", "rocky bhai"
         )
-        if (characterKeywords.any { lower.contains(it) }) {
-            return RealVisualIntent.CHARACTER
-        }
+        if (characterKeywords.any { lower.contains(it) }) return RealVisualIntent.CHARACTER
 
         return RealVisualIntent.PERSON
     }
@@ -592,10 +631,7 @@ class VideoRepositoryImpl @Inject constructor(
             .replace(Regex("""\s+"""), " ")
             .trim(' ', '-', ':', ',', '.', '"', '\'')
 
-        if (cleaned.isBlank()) {
-            cleaned = rawQuery.trim()
-        }
-
+        if (cleaned.isBlank()) cleaned = rawQuery.trim()
         return when (cleaned.lowercase()) {
             "ironman" -> "Iron Man"
             "spiderman" -> "Spider-Man"
@@ -646,7 +682,6 @@ class VideoRepositoryImpl @Inject constructor(
                 qLabel.contains("feature") ||
                 qLabel.contains("series")
             val isPerson = id.startsWith("nm")
-
             if (!allowPeople && isPerson) continue
 
             val matchesName = queryWords.isEmpty() || queryWords.any { label.contains(it) }
@@ -660,7 +695,6 @@ class VideoRepositoryImpl @Inject constructor(
             val h = imgObj["height"]?.jsonPrimitive?.intOrNull ?: 0
             val upgradedUrl = upgradeImdbUrl(rawUrl)
             val isHdUpgraded = upgradedUrl != rawUrl
-
             if (!isHdUpgraded && (w in 1..299 || h in 1..299)) continue
 
             val finalW = if (isHdUpgraded && w in 1..999) 1000 else w
@@ -687,13 +721,7 @@ class VideoRepositoryImpl @Inject constructor(
 
             outMap.putIfAbsent(
                 upgradedUrl,
-                PhotoCandidate(
-                    url = upgradedUrl,
-                    width = finalW,
-                    height = finalH,
-                    priority = exactTitleBoost + recencyBoost + typeBoost,
-                    fallbackUrl = fallback
-                )
+                PhotoCandidate(upgradedUrl, finalW, finalH, exactTitleBoost + recencyBoost + typeBoost, fallback)
             )
         }
     }
@@ -716,22 +744,18 @@ class VideoRepositoryImpl @Inject constructor(
             for (item in results) {
                 val obj = item as? JsonObject ?: continue
                 val trackName = obj["trackName"]?.jsonPrimitive?.contentOrNull.orEmpty().lowercase()
-                val matchesTitle = queryWords.isEmpty() || queryWords.any { trackName.contains(it) }
-                if (!matchesTitle) continue
+                if (queryWords.isNotEmpty() && queryWords.none { trackName.contains(it) }) continue
 
                 val artwork100 = obj["artworkUrl100"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 if (!artwork100.startsWith("http")) continue
 
                 val releaseYear = obj["releaseDate"]?.jsonPrimitive?.contentOrNull
-                    ?.substringBefore("-")
-                    ?.toIntOrNull()
-                    ?: 0
+                    ?.substringBefore("-")?.toIntOrNull() ?: 0
                 val recencyBoost = when {
                     releaseYear >= 2021 -> 3
                     releaseYear >= 2015 -> 1
                     else -> 0
                 }
-
                 val artworkHd = artwork100.replace(Regex("""\d+x\d+bb"""), "1400x1400bb")
                 val artworkFallback = artwork100.replace(Regex("""\d+x\d+bb"""), "1000x1000bb")
                 val exactBoost = if (trackName == queryClean) 5 else if (trackName.startsWith(queryClean)) 3 else 1
@@ -739,11 +763,11 @@ class VideoRepositoryImpl @Inject constructor(
                 outMap.putIfAbsent(
                     artworkHd,
                     PhotoCandidate(
-                        url = artworkHd,
-                        width = 933,
-                        height = 1400,
-                        priority = 4 + exactBoost + recencyBoost,
-                        fallbackUrl = if (artworkFallback != artworkHd) artworkFallback else null
+                        artworkHd,
+                        933,
+                        1400,
+                        4 + exactBoost + recencyBoost,
+                        if (artworkFallback != artworkHd) artworkFallback else null
                     )
                 )
             }
@@ -770,15 +794,11 @@ class VideoRepositoryImpl @Inject constructor(
         outMap: MutableMap<String, PhotoCandidate>,
         requireEntertainment: Boolean
     ) {
-        val title = pageQuery.replace(' ', '_')
-        val encodedTitle = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
-        val url = "https://en.wikipedia.org/api/rest_v1/page/summary/$encodedTitle"
-        val bodyText = fetchJsonString(url) ?: return
+        val encodedTitle = URLEncoder.encode(pageQuery.replace(' ', '_'), "UTF-8").replace("+", "%20")
+        val bodyText = fetchJsonString("https://en.wikipedia.org/api/rest_v1/page/summary/$encodedTitle") ?: return
         val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
 
-        val pageType = root["type"]?.jsonPrimitive?.contentOrNull.orEmpty().lowercase()
-        if (pageType == "disambiguation") return
-
+        if (root["type"]?.jsonPrimitive?.contentOrNull.orEmpty().equals("disambiguation", ignoreCase = true)) return
         val description = root["description"]?.jsonPrimitive?.contentOrNull.orEmpty()
         val extract = root["extract"]?.jsonPrimitive?.contentOrNull.orEmpty()
         if (isNonEntertainmentWikiSummary(description, extract, requireEntertainment)) return
@@ -808,8 +828,7 @@ class VideoRepositoryImpl @Inject constructor(
 
         val bodyText = fetchJsonString(url) ?: return
         val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
-        val queryObj = root["query"] as? JsonObject ?: return
-        val pages = queryObj["pages"] as? JsonObject ?: return
+        val pages = (root["query"] as? JsonObject)?.get("pages") as? JsonObject ?: return
 
         for (pageElem in pages.values) {
             val pageObj = pageElem as? JsonObject ?: continue
@@ -841,14 +860,12 @@ class VideoRepositoryImpl @Inject constructor(
 
         val bodyText = fetchJsonString(url) ?: return
         val root = json.parseToJsonElement(bodyText) as? JsonObject ?: return
-        val queryObj = root["query"] as? JsonObject ?: return
-        val pages = queryObj["pages"] as? JsonObject ?: return
+        val pages = (root["query"] as? JsonObject)?.get("pages") as? JsonObject ?: return
 
         for (pageElem in pages.values) {
             val pageObj = pageElem as? JsonObject ?: continue
             val title = pageObj["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
-            val imageInfo = (pageObj["imageinfo"] as? JsonArray)
-                ?.firstOrNull() as? JsonObject ?: continue
+            val imageInfo = (pageObj["imageinfo"] as? JsonArray)?.firstOrNull() as? JsonObject ?: continue
 
             val mime = imageInfo["mime"]?.jsonPrimitive?.contentOrNull.orEmpty().lowercase()
             val width = imageInfo["width"]?.jsonPrimitive?.intOrNull ?: 0
@@ -877,34 +894,30 @@ class VideoRepositoryImpl @Inject constructor(
         return bannedTokens.none { lower.contains(it) }
     }
 
-    private fun fetchJsonString(url: String): String? {
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", WIKIMEDIA_USER_AGENT)
-            .header("Accept", "application/json")
-            .build()
+    private fun fetchJsonString(url: String): String? =
+        fetchTextString(url, WIKIMEDIA_USER_AGENT, "application/json")
 
-        okHttpClient.newCall(request).execute().use { response ->
+    private fun fetchTextString(
+        url: String,
+        userAgent: String,
+        acceptHeader: String? = null
+    ): String? {
+        val builder = Request.Builder().url(url).header("User-Agent", userAgent)
+        if (!acceptHeader.isNullOrBlank()) builder.header("Accept", acceptHeader)
+        okHttpClient.newCall(builder.build()).execute().use { response ->
             if (!response.isSuccessful) return null
             return response.body?.string()?.takeIf { it.isNotBlank() }
         }
     }
 
     private fun downloadAndValidateImageUrl(url: String, destinationFile: File): Boolean {
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", WIKIMEDIA_USER_AGENT)
-            .build()
-
+        val request = Request.Builder().url(url).header("User-Agent", WIKIMEDIA_USER_AGENT).build()
         okHttpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return false
             val contentType = response.header("Content-Type").orEmpty().lowercase()
-            if (contentType.isNotBlank() &&
-                (!contentType.startsWith("image/") || contentType.contains("svg"))
-            ) {
+            if (contentType.isNotBlank() && (!contentType.startsWith("image/") || contentType.contains("svg"))) {
                 return false
             }
-
             val body = response.body ?: return false
             destinationFile.outputStream().use { out ->
                 body.byteStream().use { input -> input.copyTo(out) }
@@ -927,20 +940,12 @@ class VideoRepositoryImpl @Inject constructor(
 
     override suspend fun generateAudioForSlab(text: String): ResponseBody {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
-        return edgeTtsApi.synthesize(
-            EdgeTtsRequest(
-                text = text,
-                voice = VideoLanguage.HINDI.maleVoice
-            )
-        )
+        return edgeTtsApi.synthesize(EdgeTtsRequest(text = text, voice = VideoLanguage.HINDI.maleVoice))
     }
 
     override suspend fun generateContinuousAudioWithVtt(text: String): EdgeTtsSynthesisResult {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
-        return edgeTtsApi.synthesizeWithSubtitles(
-            text = text,
-            voice = VideoLanguage.HINDI.maleVoice
-        )
+        return edgeTtsApi.synthesizeWithSubtitles(text = text, voice = VideoLanguage.HINDI.maleVoice)
     }
 
     override suspend fun generateDynamicVoiceClip(
@@ -954,6 +959,7 @@ class VideoRepositoryImpl @Inject constructor(
             "suspense" -> "+6%" to "-6Hz"
             "climax" -> "+21%" to "-1Hz"
             "question" -> "+11%" to "+2Hz"
+            "excited", "roast" -> "+17%" to "+3Hz"
             else -> "+14%" to "-2Hz"
         }
         return edgeTtsApi.synthesizeSpeechClip(
@@ -969,8 +975,7 @@ class VideoRepositoryImpl @Inject constructor(
         requestedLanguage: VideoLanguage,
         requestedGender: VoiceGender
     ): VideoScriptResponse {
-        val extractedJson = extractJsonPayload(rawText)
-            .replace(Regex(",\\s*([}\\]])"), "$1")
+        val extractedJson = extractJsonPayload(rawText).replace(Regex(",\\s*([}\\]])"), "$1")
         val root = json.parseToJsonElement(extractedJson)
 
         var characterBible = ""
@@ -987,26 +992,22 @@ class VideoRepositoryImpl @Inject constructor(
             is JsonObject -> {
                 characterBible = root["character_bible"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 visualStyle = root["visual_style"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-                bgmMood = root["bgm_mood"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-                    .ifBlank { "epic_action" }
+                bgmMood = root["bgm_mood"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty().ifBlank { "epic_action" }
                 parsedVoiceName = root["voice_name"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 youtubeTitle = root["youtube_title"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 youtubeDescription = root["youtube_description"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 youtubeHashtags = root["youtube_hashtags"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 pinnedComment = root["pinned_comment"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
 
-                val array = root["slabs"]
-                    ?: root["scenes"]
-                    ?: root["script"]
+                val array = root["slabs"] ?: root["scenes"] ?: root["script"]
                     ?: root.values.firstOrNull { it is JsonArray }
                     ?: error("Expected a JSON array of scenes in Groq response.")
-
-                array as? JsonArray
-                    ?: error("'slabs' or 'scenes' must be a JSON array.")
+                array as? JsonArray ?: error("'slabs' or 'scenes' must be a JSON array.")
             }
             else -> error("Groq response must be a JSON array or object.")
         }
 
+        val allowedSources = setOf("ai_generated", "real_photo", "video_clip", "meme_clip")
         val slabs = slabElements.mapIndexedNotNull { index, element ->
             val dto = json.decodeFromJsonElement<GeneratedSlabDto>(element)
             val voiceover = dto.voiceoverText.trim()
@@ -1016,11 +1017,11 @@ class VideoRepositoryImpl @Inject constructor(
 
             val rawQuery = dto.realPhotoQuery?.trim().orEmpty()
             val realQuery = if (rawQuery.lowercase() in setOf("none", "null", "n/a", "-")) "" else rawQuery
-            val visualSource = if (
-                dto.visualSource?.trim()?.equals("real_photo", ignoreCase = true) == true &&
-                realQuery.isNotBlank()
+            val requestedSource = dto.visualSource?.trim()?.lowercase().orEmpty()
+            val visualSource = if (requestedSource in allowedSources &&
+                (requestedSource == "ai_generated" || realQuery.isNotBlank())
             ) {
-                "real_photo"
+                requestedSource
             } else {
                 "ai_generated"
             }
@@ -1035,7 +1036,13 @@ class VideoRepositoryImpl @Inject constructor(
             }
             val rawLayout = dto.layoutMode?.trim()?.lowercase().orEmpty()
             val hasSecondVisual = (visualSource2 == "real_photo" && realQuery2.isNotBlank()) || prompt2.isNotBlank()
-            val layoutMode = if (hasSecondVisual && rawLayout in setOf("split", "flip")) rawLayout else "single"
+            val layoutMode = if (visualSource !in setOf("video_clip", "meme_clip") &&
+                hasSecondVisual && rawLayout in setOf("split", "flip")
+            ) {
+                rawLayout
+            } else {
+                "single"
+            }
             val statBadge = dto.statBadge?.trim().orEmpty().take(32)
 
             if (voiceover.isBlank() || prompt.isBlank()) {
@@ -1049,11 +1056,11 @@ class VideoRepositoryImpl @Inject constructor(
                     has_character = dto.hasCharacter ?: false,
                     voice_emotion = emotion,
                     visual_source = visualSource,
-                    real_photo_query = if (visualSource == "real_photo") realQuery else "",
+                    real_photo_query = if (visualSource != "ai_generated") realQuery else "",
                     layout_mode = layoutMode,
-                    visual_source_2 = visualSource2,
-                    real_photo_query_2 = if (visualSource2 == "real_photo") realQuery2 else "",
-                    image_prompt_2 = prompt2,
+                    visual_source_2 = if (layoutMode != "single") visualSource2 else "",
+                    real_photo_query_2 = if (layoutMode != "single" && visualSource2 == "real_photo") realQuery2 else "",
+                    image_prompt_2 = if (layoutMode != "single") prompt2 else "",
                     stat_badge = statBadge
                 )
             }
@@ -1081,31 +1088,20 @@ class VideoRepositoryImpl @Inject constructor(
     }
 
     private fun extractJsonPayload(rawText: String): String {
-        val withoutFences = rawText
-            .trim()
+        val withoutFences = rawText.trim()
             .replace(Regex("^```(?:json)?\\s*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s*```$"), "")
             .trim()
-
         val firstBracket = withoutFences.indexOf('[')
         val firstBrace = withoutFences.indexOf('{')
-
         return when {
             firstBracket != -1 && (firstBrace == -1 || firstBracket < firstBrace) -> {
-                val lastBracket = withoutFences.lastIndexOf(']')
-                if (lastBracket > firstBracket) {
-                    withoutFences.substring(firstBracket, lastBracket + 1)
-                } else {
-                    withoutFences
-                }
+                val last = withoutFences.lastIndexOf(']')
+                if (last > firstBracket) withoutFences.substring(firstBracket, last + 1) else withoutFences
             }
             firstBrace != -1 -> {
-                val lastBrace = withoutFences.lastIndexOf('}')
-                if (lastBrace > firstBrace) {
-                    withoutFences.substring(firstBrace, lastBrace + 1)
-                } else {
-                    withoutFences
-                }
+                val last = withoutFences.lastIndexOf('}')
+                if (last > firstBrace) withoutFences.substring(firstBrace, last + 1) else withoutFences
             }
             else -> withoutFences
         }
@@ -1113,7 +1109,6 @@ class VideoRepositoryImpl @Inject constructor(
 
     private suspend fun <T> callWithHttpUrl(request: suspend () -> T): T {
         var lastError: Throwable? = null
-
         repeat(MAX_API_ATTEMPTS) { attempt ->
             try {
                 return request()
@@ -1121,17 +1116,9 @@ class VideoRepositoryImpl @Inject constructor(
                 throw cancelled
             } catch (error: HttpException) {
                 val code = error.code()
-                val url = error.response()
-                    ?.raw()
-                    ?.request
-                    ?.url
-                    ?.toString()
-                    ?: "URL unavailable"
+                val url = error.response()?.raw()?.request?.url?.toString() ?: "URL unavailable"
                 val body = error.response()?.errorBody()?.string().orEmpty()
-                val wrapped = IllegalStateException(
-                    "HTTP $code Error at URL: $url. Body: $body",
-                    error
-                )
+                val wrapped = IllegalStateException("HTTP $code Error at URL: $url. Body: $body", error)
                 lastError = wrapped
                 if ((code == 429 || code in 500..599) && attempt < MAX_API_ATTEMPTS - 1) {
                     delay(2000L * (attempt + 1))
@@ -1140,50 +1127,35 @@ class VideoRepositoryImpl @Inject constructor(
                 }
             } catch (error: IOException) {
                 lastError = error
-                if (attempt < MAX_API_ATTEMPTS - 1) {
-                    delay(2000L * (attempt + 1))
-                } else {
-                    throw error
-                }
+                if (attempt < MAX_API_ATTEMPTS - 1) delay(2000L * (attempt + 1)) else throw error
             }
         }
-
         throw lastError ?: IllegalStateException("API request failed.")
     }
 
     @Serializable
     private data class GeneratedSlabDto(
         val id: Int? = null,
-        @SerialName("voiceover_text")
-        val voiceoverText: String,
-        @SerialName("image_prompt")
-        val imagePrompt: String,
-        @SerialName("sfx_cue")
-        val sfxCue: String? = null,
-        @SerialName("has_character")
-        val hasCharacter: Boolean? = null,
-        @SerialName("voice_emotion")
-        val voiceEmotion: String? = null,
-        @SerialName("visual_source")
-        val visualSource: String? = null,
-        @SerialName("real_photo_query")
-        val realPhotoQuery: String? = null,
-        @SerialName("layout_mode")
-        val layoutMode: String? = null,
-        @SerialName("visual_source_2")
-        val visualSource2: String? = null,
-        @SerialName("real_photo_query_2")
-        val realPhotoQuery2: String? = null,
-        @SerialName("image_prompt_2")
-        val imagePrompt2: String? = null,
-        @SerialName("stat_badge")
-        val statBadge: String? = null
+        @SerialName("voiceover_text") val voiceoverText: String,
+        @SerialName("image_prompt") val imagePrompt: String,
+        @SerialName("sfx_cue") val sfxCue: String? = null,
+        @SerialName("has_character") val hasCharacter: Boolean? = null,
+        @SerialName("voice_emotion") val voiceEmotion: String? = null,
+        @SerialName("visual_source") val visualSource: String? = null,
+        @SerialName("real_photo_query") val realPhotoQuery: String? = null,
+        @SerialName("layout_mode") val layoutMode: String? = null,
+        @SerialName("visual_source_2") val visualSource2: String? = null,
+        @SerialName("real_photo_query_2") val realPhotoQuery2: String? = null,
+        @SerialName("image_prompt_2") val imagePrompt2: String? = null,
+        @SerialName("stat_badge") val statBadge: String? = null
     )
 
     private companion object {
         const val MAX_API_ATTEMPTS = 5
         const val FULL_SCRIPT_WORD_THRESHOLD = 25
         const val WIKIMEDIA_USER_AGENT = "RSMovieSpot/1.0 (https://rsmoviespot.app)"
+        const val BROWSER_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
         const val SHORTS_IMAGE_WIDTH = 768
         const val SHORTS_IMAGE_HEIGHT = 1344
@@ -1195,32 +1167,32 @@ class VideoRepositoryImpl @Inject constructor(
                 "- Whenever the user's prompt or script explicitly describes a specific visual scene, character appearance, outfit, location, lighting, style, camera shot, or action (whether in Hindi, Hinglish, or English, e.g., 'pehle scene me...', 'Scene 1:', '[Visual: ...]'), YOU MUST generate that EXACT visual in image_prompt and set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- Front-load the exact described subject, costume/outfit, action, setting, props, and lighting in the FIRST 25-35 words of image_prompt so the image generator prioritizes them!\n" +
                 "- If the user asks for a specific style (e.g., anime, 3D, noir, cyberpunk) or forbids posters/comics, strictly honor that style and never replace a user-described visual with a generic crowd or real_photo poster.\n\n" +
-                "2-PHOTO SCENES (SPLIT SCREEN VS & FAST FLIP) + STAT BADGES:\n" +
-                "- For record-comparison, clash, or vs scenes (e.g. comparing two movies, two box-office records, or actor vs character), set layout_mode='split' and fill BOTH primary visual (visual_source/image_prompt/real_photo_query) AND secondary visual (visual_source_2, real_photo_query_2, image_prompt_2)!\n" +
-                "- For dynamic dual-action beats, set layout_mode='flip' and provide a 2nd visual so the shot rapidly flips mid-line.\n" +
-                "- Otherwise keep layout_mode='single', visual_source_2='', real_photo_query_2='', image_prompt_2=''.\n" +
-                "- Whenever a scene announces a HUGE number, release date, or record (e.g. '$150M PRE-SALES', '₹80 CR DAY 1?', '17 DEC RELEASE'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
-                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When user did NOT specify a custom visual for that scene):\n" +
+                "INTERNET VIDEO CLIPS & MEMES + 2-PHOTO SCENES + STAT BADGES:\n" +
+                "- 'video_clip' (SELECTIVELY 1 to 3 scenes ONLY — NEVER every scene): When a high-energy movie/trailer/action/hype moment fits real motion footage, set visual_source='video_clip', layout_mode='single', and real_photo_query to 2-4 clean English search words (e.g. 'Avengers Doomsday', 'Pushpa Raj action', 'SRK entry').\n" +
+                "- 'meme_clip' (SELECTIVELY 1 to 2 scenes ONLY): When comedy, roast, or shock reaction fits, set visual_source='meme_clip', layout_mode='single', and real_photo_query to a popular clean meme query (e.g. 'Hera Pheri paisa meme', 'shocked Pikachu', 'crying laughing').\n" +
+                "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, or vs scenes, set layout_mode='split' (or 'flip' for rapid dual reveal) with visual_source in {'real_photo','ai_generated'} and fill BOTH primary AND secondary visual fields (visual_source_2, real_photo_query_2, image_prompt_2)!\n" +
+                "- STAT BADGES: Whenever a scene announces a HUGE number, release date, or record (e.g. '$150M PRE-SALES', '₹80 CR DAY 1?', '17 DEC RELEASE'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
+                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When user did NOT specify a custom visual and scene is not video_clip/meme_clip):\n" +
                 "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR named in the scene (e.g., Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr.):\n" +
                 "     Set visual_source='real_photo' and real_photo_query to ONLY their clean English name (e.g. 'Prabhas' or 'Robert Downey Jr').\n" +
                 "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene (e.g., Animal, Kabir Singh, Spirit, Pushpa 2, KGF, Avengers Endgame, Avengers Doomsday, Salaar, Spider-Man No Way Home):\n" +
-                "     Set visual_source='real_photo' and real_photo_query to '<Exact Clean English Title> movie poster' (include full sequel/subtitle if relevant so latest HD poster is fetched). NEVER combine actor + movie in one query.\n" +
-                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN / ICONIC HERO (e.g., Iron Man, Superman, Batman, Spider-Man, Doctor Doom, Thanos, Joker, Deadpool, Thor, Goku, Rocky Bhai, Pushpa Raj, Hanuman):\n" +
-                "     * For MAX 1 or 2 iconic introduction/reveal scenes of that character, set visual_source='real_photo' and real_photo_query='<Clean English Character Name> character'.\n" +
-                "     * For ALL STORY, ACTION, BATTLE, DIALOGUE, OR EMOTIONAL SCENES involving that character, set visual_source='ai_generated' and write a raw LIVE-ACTION MOVIE PHOTOGRAPH image_prompt featuring THAT character in realistic textured costume performing the exact scene action!\n" +
+                "     Set visual_source='real_photo' and real_photo_query to '<Exact Clean English Title> movie poster'. NEVER combine actor + movie in one query.\n" +
+                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN (e.g., Iron Man, Superman, Batman, Spider-Man, Doctor Doom, Thanos, Joker, Deadpool, Thor, Goku, Rocky Bhai, Pushpa Raj, Hanuman):\n" +
+                "     * MAX 1 or 2 iconic introduction scenes: visual_source='real_photo' and real_photo_query='<Clean English Character Name> character'.\n" +
+                "     * ALL STORY / ACTION / DIALOGUE scenes: visual_source='ai_generated' with raw LIVE-ACTION MOVIE PHOTOGRAPH image_prompt.\n" +
                 "  4) ALL OTHER SCENES: set visual_source='ai_generated' and real_photo_query=''.\n" +
-                "- ALWAYS still write a rich, content-matched fallback image_prompt for EVERY slab.\n\n" +
+                "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab (even video_clip/meme_clip/real_photo scenes).\n\n" +
                 "IMAGE PROMPT RULES (RAW MOVIE STILL — ZERO COMIC ART LOOK):\n" +
-                "- Write every image_prompt as a REAL LIVE-ACTION FILM SET PHOTOGRAPH (concrete real materials: brushed scratched steel, heavy woven wool cloak, mud, rain droplets, sweat, warm sodium streetlights, natural cinema depth of field) — NEVER write comic-trigger words like 'Marvel', 'comic', 'concept art', 'epic energy blast', or 'neon digital glow' unless explicitly asked!\n" +
-                "- NEVER write real living actor names inside image_prompt unless explicitly instructed in the user prompt for a character mask/costume scene.\n" +
-                "- Only avoid literal words like 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' when referring to a MOVIE TITLE of that name.\n" +
-                "- NEVER write abstract phrases like 'box office', 'records', or 'close-up eyes', and NEVER write 'comment box', 'subscribe', 'UI', 'poster', or 'text' inside image_prompt.\n" +
+                "- Write every image_prompt as a REAL LIVE-ACTION FILM SET PHOTOGRAPH (brushed steel, heavy wool cloak, rain droplets, sweat, warm streetlights, cinema depth of field) — NEVER write 'Marvel', 'comic', 'concept art', or 'neon digital glow' unless asked!\n" +
+                "- NEVER write real living actor names inside image_prompt unless explicitly instructed for a mask/costume scene.\n" +
+                "- Avoid literal title words like 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' when referring to a movie title.\n" +
+                "- NEVER write 'box office', 'records', 'close-up eyes', 'comment box', 'subscribe', 'UI', 'poster', or 'text' inside image_prompt.\n" +
                 "- Vary camera framing across scenes (wide shot, medium shot, over-the-shoulder, low-angle).\n\n"
 
         const val VOICE_AND_BGM_RULES =
             "VOICE EMOTION, BGM & YOUTUBE METADATA RULES:\n" +
                 "- Pick bgm_mood: 'comedy_roast', 'epic_action', 'suspense_thriller', 'emotional_sad', 'devotional', 'sci_fi_tech', 'motivational', or 'horror_dark'.\n" +
-                "- For each scene, set voice_emotion: 'hook', 'suspense', 'climax', 'question', or 'normal'.\n" +
+                "- For each scene, set voice_emotion: 'hook', 'suspense', 'climax', 'question', 'excited', or 'normal'.\n" +
                 "- Pick valid Edge TTS voice_name (e.g. hi-IN-MadhurNeural, hi-IN-SwaraNeural, en-IN-PrabhatNeural, en-IN-NeerjaNeural, en-US-AndrewNeural, en-US-AvaNeural, etc.).\n" +
                 "- Also generate youtube_title (catchy <75 chars viral title with 1 emoji), youtube_description (2-3 crisp SEO lines for RS Movies Spot), youtube_hashtags ('#shorts #movies ...'), and pinned_comment (a debate/question to spark viewer comments).\n\n"
 
@@ -1238,9 +1210,9 @@ class VideoRepositoryImpl @Inject constructor(
                 "  \"slabs\": [\n" +
                 "    {\n" +
                 "      \"voiceover_text\": \"Short 7-10 word narration segment\",\n" +
-                "      \"voice_emotion\": \"hook | suspense | climax | question | normal\",\n" +
-                "      \"visual_source\": \"real_photo | ai_generated\",\n" +
-                "      \"real_photo_query\": \"Clean English query if visual_source='real_photo', else ''\",\n" +
+                "      \"voice_emotion\": \"hook | suspense | climax | question | excited | normal\",\n" +
+                "      \"visual_source\": \"real_photo | ai_generated | video_clip | meme_clip\",\n" +
+                "      \"real_photo_query\": \"Clean English query if real_photo/video_clip/meme_clip, else ''\",\n" +
                 "      \"layout_mode\": \"single | split | flip\",\n" +
                 "      \"visual_source_2\": \"real_photo | ai_generated | ''\",\n" +
                 "      \"real_photo_query_2\": \"2nd photo query if split/flip and real_photo, else ''\",\n" +
