@@ -14,6 +14,7 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VoiceGender
@@ -80,6 +81,9 @@ class VideoRenderService : Service() {
                 val voiceGender = intent.getStringExtra(EXTRA_VOICE_GENDER)
                     ?.let { name -> runCatching { VoiceGender.valueOf(name) }.getOrNull() }
                     ?: VoiceGender.MALE
+                val inputMode = intent.getStringExtra(EXTRA_INPUT_MODE)
+                    ?.let { name -> runCatching { InputMode.valueOf(name) }.getOrNull() }
+                    ?: InputMode.AUTO
 
                 startAsForeground(
                     buildNotification("Preparing video render…", 0)
@@ -89,7 +93,7 @@ class VideoRenderService : Service() {
                     _renderState.update {
                         it.copy(
                             isGenerating = false,
-                            statusMessage = "Enter a topic before generating a video."
+                            statusMessage = "Enter a topic or script before generating a video."
                         )
                     }
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -103,7 +107,8 @@ class VideoRenderService : Service() {
                     customBgmUri = bgmUri,
                     preGeneratedScript = preGeneratedScript,
                     language = language,
-                    voiceGender = voiceGender
+                    voiceGender = voiceGender,
+                    inputMode = inputMode
                 )
             }
 
@@ -136,7 +141,8 @@ class VideoRenderService : Service() {
         customBgmUri: Uri?,
         preGeneratedScript: VideoScriptResponse?,
         language: VideoLanguage,
-        voiceGender: VoiceGender
+        voiceGender: VoiceGender,
+        inputMode: InputMode
     ) {
         if (renderJob?.isActive == true) return
 
@@ -168,7 +174,8 @@ class VideoRenderService : Service() {
                     customBgmUri = customBgmUri,
                     preGeneratedScript = preGeneratedScript,
                     language = language,
-                    voiceGender = voiceGender
+                    voiceGender = voiceGender,
+                    inputMode = inputMode
                 ) { rawPercent, message ->
                     val percent = rawPercent.coerceIn(0, 100)
                     _renderState.update {
@@ -301,6 +308,7 @@ class VideoRenderService : Service() {
         const val EXTRA_SCRIPT_JSON = "extra_script_json"
         const val EXTRA_LANGUAGE = "extra_language"
         const val EXTRA_VOICE_GENDER = "extra_voice_gender"
+        const val EXTRA_INPUT_MODE = "extra_input_mode"
 
         private const val CHANNEL_ID = "video_render_channel"
         private const val NOTIFICATION_ID = 4101
@@ -317,7 +325,8 @@ class VideoRenderService : Service() {
             bgmUri: Uri? = null,
             preGeneratedScript: VideoScriptResponse? = null,
             language: VideoLanguage = VideoLanguage.AUTO,
-            voiceGender: VoiceGender = VoiceGender.MALE
+            voiceGender: VoiceGender = VoiceGender.MALE,
+            inputMode: InputMode = InputMode.AUTO
         ) {
             val scriptJson = preGeneratedScript?.let {
                 serviceJson.encodeToString(VideoScriptResponse.serializer(), it)
@@ -330,6 +339,7 @@ class VideoRenderService : Service() {
                 .putExtra(EXTRA_SCRIPT_JSON, scriptJson)
                 .putExtra(EXTRA_LANGUAGE, language.name)
                 .putExtra(EXTRA_VOICE_GENDER, voiceGender.name)
+                .putExtra(EXTRA_INPUT_MODE, inputMode.name)
             ContextCompat.startForegroundService(context, intent)
         }
 
