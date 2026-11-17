@@ -25,6 +25,7 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
 import com.rsmoviespot.data.repository.VideoRepository
+import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VideoSlab
@@ -49,7 +50,6 @@ import javax.inject.Inject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -102,6 +102,7 @@ class VideoRenderEngine @Inject constructor(
         preGeneratedScript: VideoScriptResponse? = null,
         language: VideoLanguage = VideoLanguage.AUTO,
         voiceGender: VoiceGender = VoiceGender.MALE,
+        inputMode: InputMode = InputMode.AUTO,
         progress: (Int, String) -> Unit = { _, _ -> }
     ): VideoRenderResult = withContext(Dispatchers.IO) {
         require(topic.isNotBlank()) { "Topic must not be blank." }
@@ -127,7 +128,8 @@ class VideoRenderEngine @Inject constructor(
                     topic = topic,
                     isShorts = isShorts,
                     language = language,
-                    voiceGender = voiceGender
+                    voiceGender = voiceGender,
+                    inputMode = inputMode
                 )
             }
             require(script.slabs.isNotEmpty()) { "The generated script has no slabs." }
@@ -193,18 +195,24 @@ class VideoRenderEngine @Inject constructor(
             val usedRealPhotoUrls = mutableSetOf<String>()
             val usedClipUrls = mutableSetOf<String>()
             var coverBaseImageFile: File? = null
+            val useTransitions = slabCount >= 2
 
             script.slabs.forEachIndexed { index, slab ->
-                val baseProgress = 14 + (index * 68 / slabCount)
+                val baseProgress = 14 + (index * 66 / slabCount)
                 val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
-                val segmentExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
+                val voiceExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
+                val renderFrames = if (useTransitions && index < slabCount - 1) {
+                    sceneFramesList[index] + TRANSITION_FRAMES
+                } else {
+                    sceneFramesList[index]
+                }
 
                 val popCaptions = runCatching {
                     createPopCaptionOverlays(
                         renderDirectory = renderDirectory,
                         sceneIndex = index,
                         fullSceneText = slab.voiceover_text,
-                        sceneDurationSeconds = segmentExactDuration,
+                        sceneDurationSeconds = voiceExactDuration,
                         videoWidth = width,
                         isShorts = isShorts
                     )
@@ -222,7 +230,7 @@ class VideoRenderEngine @Inject constructor(
                     statBadgePng = statBadgePng,
                     watermarkPng = watermarkPng,
                     subscribeEndCardPng = if (index == slabCount - 1) subscribeEndCardPng else null,
-                    sceneDurationSeconds = segmentExactDuration,
+                    sceneDurationSeconds = voiceExactDuration,
                     videoWidth = width,
                     videoHeight = height,
                     isShorts = isShorts
@@ -238,7 +246,7 @@ class VideoRenderEngine @Inject constructor(
                     } else {
                         "Fetching movie/trailer clip (${slab.real_photo_query})…"
                     }
-                    progress(baseProgress.coerceIn(14, 82), clipLabel)
+                    progress(baseProgress.coerceIn(14, 80), clipLabel)
 
                     val rawClipFile = File(renderDirectory, "clip_raw_${index + 1}.mp4")
                     val downloaded = runCatching {
@@ -251,10 +259,26 @@ class VideoRenderEngine @Inject constructor(
                     }.getOrDefault(false)
 
                     if (downloaded) {
-                        val renderProgress = 14 + (((index + 0.5) * 68) / slabCount).roundToInt()
+                        if (index == 0 && coverBaseImageFile == null) {
+                            val rawCover = File(renderDirectory, "cover_raw_clip.png")
+                            val gotRawCover = runCatching {
+                                runFfmpeg(
+                                    arrayOf(
+                                        "-y", "-ss", "0.35",
+                                        "-i", rawClipFile.absolutePath,
+                                        "-vframes", "1",
+                                        rawCover.absolutePath
+                                    )
+                                )
+                                rawCover.exists() && rawCover.length() > 2048L
+                            }.getOrDefault(false)
+                            if (gotRawCover) coverBaseImageFile = rawCover
+                        }
+
+                        val renderProgress = 14 + (((index + 0.5) * 66) / slabCount).roundToInt()
                         progress(
-                            renderProgress.coerceIn(14, 82),
-                            "Compositing clip scene ${index + 1} of $slabCount…"
+                            renderProgress.coerceIn(14, 80),
+                            "Editing clip scene ${index + 1} of $slabCount…"
                         )
                         encodedClip = runCatching {
                             runFfmpeg(
@@ -264,9 +288,10 @@ class VideoRenderEngine @Inject constructor(
                                     outputFile = videoSegmentFile,
                                     width = width,
                                     height = height,
-                                    frames = sceneFramesList[index],
+                                    frames = renderFrames,
                                     sceneIndex = index,
-                                    totalScenes = slabCount
+                                    totalScenes = slabCount,
+                                    useTransitions = useTransitions
                                 )
                             )
                             videoSegmentFile.exists() && videoSegmentFile.length() > 2048L
@@ -291,7 +316,7 @@ class VideoRenderEngine @Inject constructor(
                         height = height,
                         seed = baseSeed + (index * 37),
                         usedUrls = usedRealPhotoUrls,
-                        progressUpdate = { msg -> progress(baseProgress.coerceIn(14, 82), msg) },
+                        progressUpdate = { msg -> progress(baseProgress.coerceIn(14, 80), msg) },
                         sceneIndex = index,
                         slabCount = slabCount
                     )
@@ -321,15 +346,15 @@ class VideoRenderEngine @Inject constructor(
                             height = height,
                             seed = baseSeed + (index * 37) + 19,
                             usedUrls = usedRealPhotoUrls,
-                            progressUpdate = { msg -> progress(baseProgress.coerceIn(14, 82), msg) },
+                            progressUpdate = { msg -> progress(baseProgress.coerceIn(14, 80), msg) },
                             sceneIndex = index,
                             slabCount = slabCount
                         )
 
-                        val renderProgress = 14 + (((index + 0.5) * 68) / slabCount).roundToInt()
+                        val renderProgress = 14 + (((index + 0.5) * 66) / slabCount).roundToInt()
                         progress(
-                            renderProgress.coerceIn(14, 82),
-                            "Animating scene ${index + 1} of $slabCount…"
+                            renderProgress.coerceIn(14, 80),
+                            "Editing scene ${index + 1} of $slabCount…"
                         )
 
                         if (layoutMode == "split") {
@@ -343,7 +368,8 @@ class VideoRenderEngine @Inject constructor(
                                     outputFile = videoSegmentFile,
                                     width = width,
                                     height = height,
-                                    segmentFrames = sceneFramesList[index]
+                                    segmentFrames = renderFrames,
+                                    useTransitions = useTransitions
                                 )
                             )
                         } else {
@@ -357,15 +383,16 @@ class VideoRenderEngine @Inject constructor(
                                     outputFile = videoSegmentFile,
                                     width = width,
                                     height = height,
-                                    segmentFrames = sceneFramesList[index]
+                                    segmentFrames = renderFrames,
+                                    useTransitions = useTransitions
                                 )
                             )
                         }
                     } else {
-                        val renderProgress = 14 + (((index + 0.5) * 68) / slabCount).roundToInt()
+                        val renderProgress = 14 + (((index + 0.5) * 66) / slabCount).roundToInt()
                         progress(
-                            renderProgress.coerceIn(14, 82),
-                            "Animating scene ${index + 1} of $slabCount…"
+                            renderProgress.coerceIn(14, 80),
+                            "Editing scene ${index + 1} of $slabCount…"
                         )
 
                         runFfmpeg(
@@ -377,7 +404,8 @@ class VideoRenderEngine @Inject constructor(
                                 outputFile = videoSegmentFile,
                                 width = width,
                                 height = height,
-                                segmentFrames = sceneFramesList[index]
+                                segmentFrames = renderFrames,
+                                useTransitions = useTransitions
                             )
                         )
                     }
@@ -386,16 +414,15 @@ class VideoRenderEngine @Inject constructor(
                 videoSegmentFiles += videoSegmentFile
             }
 
-            progress(85, "Syncing scenes with voiceover…")
-            val concatList = File(renderDirectory, "segments.txt")
-            concatList.writeText(
-                videoSegmentFiles.joinToString(separator = "\n") { file ->
-                    "file '${escapeConcatPath(file.absolutePath)}'"
-                } + "\n"
-            )
-
+            progress(83, "Applying cinematic transitions & syncing voiceover…")
             val silentVideoFile = File(renderDirectory, "silent_video.mp4")
-            runFfmpeg(createConcatArguments(concatList, silentVideoFile))
+            assembleSilentVideoWithTransitions(
+                renderDirectory = renderDirectory,
+                videoSegmentFiles = videoSegmentFiles,
+                sceneFramesList = sceneFramesList,
+                useTransitions = useTransitions,
+                outputFile = silentVideoFile
+            )
 
             if (coverBaseImageFile == null) {
                 val extractedCover = File(renderDirectory, "cover_extracted.png")
@@ -468,6 +495,123 @@ class VideoRenderEngine @Inject constructor(
             )
         } finally {
             renderDirectory.deleteRecursively()
+        }
+    }
+
+    private suspend fun assembleSilentVideoWithTransitions(
+        renderDirectory: File,
+        videoSegmentFiles: List<File>,
+        sceneFramesList: List<Int>,
+        useTransitions: Boolean,
+        outputFile: File
+    ) {
+        if (!useTransitions || videoSegmentFiles.size < 2) {
+            val concatList = File(renderDirectory, "segments.txt")
+            concatList.writeText(
+                videoSegmentFiles.joinToString("\n") { "file '${escapeConcatPath(it.absolutePath)}'" } + "\n"
+            )
+            runFfmpeg(createConcatArguments(concatList, outputFile))
+            return
+        }
+
+        val transitionNames = listOf(
+            "smoothleft", "wipeleft", "dissolve", "circleopen",
+            "slideup", "radial", "wiperight", "slideright"
+        )
+        val transSecStr = String.format(Locale.US, "%.2f", TRANSITION_FRAMES.toDouble() / FRAME_RATE)
+
+        val assembledOk = runCatching {
+            val assembledParts = mutableListOf<File>()
+
+            for (i in videoSegmentFiles.indices) {
+                val segFile = videoSegmentFiles[i]
+                val bodyStart = if (i == 0) 0 else TRANSITION_FRAMES
+                val bodyEnd = sceneFramesList[i]
+                val bodyCount = bodyEnd - bodyStart
+
+                if (bodyCount > 0) {
+                    val bodyFile = File(renderDirectory, "part_body_$i.mp4")
+                    runFfmpeg(
+                        arrayOf(
+                            "-y",
+                            "-i", segFile.absolutePath,
+                            "-vf", "trim=start_frame=$bodyStart:end_frame=$bodyEnd,setpts=PTS-STARTPTS,fps=$FRAME_RATE,setsar=1,format=yuv420p",
+                            "-frames:v", bodyCount.toString(),
+                            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                            "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
+                            "-video_track_timescale", "12800",
+                            bodyFile.absolutePath
+                        )
+                    )
+                    assembledParts += bodyFile
+                }
+
+                if (i < videoSegmentFiles.lastIndex) {
+                    val nextSegFile = videoSegmentFiles[i + 1]
+                    val tailStart = sceneFramesList[i]
+                    val tailEnd = tailStart + TRANSITION_FRAMES
+                    val transName = transitionNames[i % transitionNames.size]
+                    val transFile = File(renderDirectory, "part_trans_$i.mp4")
+
+                    val filter = "[0:v]trim=start_frame=$tailStart:end_frame=$tailEnd,setpts=PTS-STARTPTS,settb=1/1000,setsar=1[a];" +
+                        "[1:v]trim=start_frame=0:end_frame=$TRANSITION_FRAMES,setpts=PTS-STARTPTS,settb=1/1000,setsar=1[b];" +
+                        "[a][b]xfade=transition=$transName:duration=$transSecStr:offset=0,fps=$FRAME_RATE,setsar=1,format=yuv420p[vout]"
+
+                    runFfmpeg(
+                        arrayOf(
+                            "-y",
+                            "-i", segFile.absolutePath,
+                            "-i", nextSegFile.absolutePath,
+                            "-filter_complex", filter,
+                            "-map", "[vout]",
+                            "-frames:v", TRANSITION_FRAMES.toString(),
+                            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                            "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
+                            "-video_track_timescale", "12800",
+                            transFile.absolutePath
+                        )
+                    )
+                    assembledParts += transFile
+                }
+            }
+
+            val partsList = File(renderDirectory, "transition_parts.txt")
+            partsList.writeText(
+                assembledParts.joinToString("\n") { "file '${escapeConcatPath(it.absolutePath)}'" } + "\n"
+            )
+            runFfmpeg(createConcatArguments(partsList, outputFile))
+            outputFile.exists() && outputFile.length() > 2048L
+        }.getOrDefault(false)
+
+        if (!assembledOk) {
+            val fallbackParts = videoSegmentFiles.mapIndexed { i, segFile ->
+                val exactFrames = sceneFramesList[i]
+                if (i < videoSegmentFiles.lastIndex) {
+                    val trimmed = File(renderDirectory, "part_fallback_$i.mp4")
+                    val trimmedOk = runCatching {
+                        runFfmpeg(
+                            arrayOf(
+                                "-y", "-i", segFile.absolutePath,
+                                "-vf", "trim=start_frame=0:end_frame=$exactFrames,setpts=PTS-STARTPTS,fps=$FRAME_RATE,setsar=1,format=yuv420p",
+                                "-frames:v", exactFrames.toString(),
+                                "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                                "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
+                                "-video_track_timescale", "12800",
+                                trimmed.absolutePath
+                            )
+                        )
+                        trimmed.exists() && trimmed.length() > 1024L
+                    }.getOrDefault(false)
+                    if (trimmedOk) trimmed else segFile
+                } else {
+                    segFile
+                }
+            }
+            val concatList = File(renderDirectory, "segments_fallback.txt")
+            concatList.writeText(
+                fallbackParts.joinToString("\n") { "file '${escapeConcatPath(it.absolutePath)}'" } + "\n"
+            )
+            runFfmpeg(createConcatArguments(concatList, outputFile))
         }
     }
 
@@ -662,7 +806,7 @@ class VideoRenderEngine @Inject constructor(
             Rect(left, 0, left + cropW, src.height)
         } else {
             val cropH = (src.width / dstAspect).roundToInt().coerceIn(1, src.height)
-            val top = ((src.height - cropH) * 0.25f).roundToInt().coerceIn(0, src.height - cropH)
+            val top = ((src.height - cropH) * 0.08f).roundToInt().coerceIn(0, src.height - cropH)
             Rect(0, top, src.width, top + cropH)
         }
         canvas.drawBitmap(src, srcRect, dst, paint)
@@ -699,7 +843,7 @@ class VideoRenderEngine @Inject constructor(
                     Rect(left, 0, left + cropW, srcH)
                 } else {
                     val cropH = (srcW / dstAspect).roundToInt().coerceIn(1, srcH)
-                    val top = ((srcH - cropH) * 0.16f).roundToInt().coerceIn(0, srcH - cropH)
+                    val top = ((srcH - cropH) * 0.10f).roundToInt().coerceIn(0, srcH - cropH)
                     Rect(0, top, srcW, top + cropH)
                 }
                 canvas.drawBitmap(srcBitmap, cropRect, Rect(0, 0, targetWidth, targetHeight), paint)
@@ -1209,7 +1353,7 @@ class VideoRenderEngine @Inject constructor(
         raw
             .replace(
                 Regex(
-                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay)\\b",
+                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay|stat badge|youtube shorts?|video_clip|meme_clip|split layout|act as|collage|photo grid|grid of|panels)\\b",
                     RegexOption.IGNORE_CASE
                 ),
                 "dramatic packed Indian cinema theater"
@@ -1914,7 +2058,12 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun buildEdgeFades(sceneIndex: Int, totalScenes: Int, frames: Int): String {
+    private fun buildEdgeFades(
+        sceneIndex: Int,
+        totalScenes: Int,
+        frames: Int,
+        useTransitions: Boolean
+    ): String {
         val durationSeconds = frames.toDouble() / FRAME_RATE
         val fadeOutStart = String.format(
             Locale.US,
@@ -1924,6 +2073,7 @@ class VideoRenderEngine @Inject constructor(
         return buildString {
             if (sceneIndex == 0) append("fade=t=in:st=0:d=0.22,")
             if (sceneIndex == totalScenes - 1) append("fade=t=out:st=$fadeOutStart:d=0.28,")
+            if (!useTransitions && sceneIndex > 0) append("fade=t=in:st=0:d=0.08,")
         }
     }
 
@@ -1937,22 +2087,28 @@ class VideoRenderEngine @Inject constructor(
         val upWidth = (width * 3) / 2
         val upHeight = (height * 3) / 2
 
-        val motionFilter = when (sceneIndex % 4) {
+        val motionFilter = when (sceneIndex % 6) {
             0 ->
-                "zoompan=z='min(zoom+0.0025,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
+                "zoompan=z='min(zoom+0.0028,1.26)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
             1 ->
-                "zoompan=z='if(lte(on,1),1.25,max(1.0,zoom-0.0025))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
+                "zoompan=z='if(lte(on,1),1.24,max(1.0,zoom-0.0025))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
             2 ->
                 "zoompan=z='1.20':x='(iw-iw/zoom)*on/$denom':y='ih/2-(ih/zoom/2)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
-            else ->
+            3 ->
+                "zoompan=z='1.20':x='(iw-iw/zoom)*(1-on/$denom)':y='ih/2-(ih/zoom/2)':" +
+                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            4 ->
                 "zoompan=z='1.20':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
+                    "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
+            else ->
+                "zoompan=z='min(zoom+0.0022,1.22)':x='(iw-iw/zoom)*on/$denom':y='(ih-ih/zoom)*0.32':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
         }
 
-        val baseGrade = "eq=contrast=1.06:saturation=1.10,vignette=PI/6"
+        val baseGrade = "eq=contrast=1.07:saturation=1.12:brightness=0.01,unsharp=3:3:0.35,vignette=PI/6"
         return "scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
             "crop=$upWidth:$upHeight,setsar=1,$motionFilter,$baseGrade"
     }
@@ -1991,11 +2147,12 @@ class VideoRenderEngine @Inject constructor(
         outputFile: File,
         width: Int,
         height: Int,
-        segmentFrames: Int
+        segmentFrames: Int,
+        useTransitions: Boolean
     ): Array<String> {
         val frames = segmentFrames.coerceAtLeast(MIN_SCENE_FRAMES)
         val motionAndGrade = buildMotionAndGradeFilter(sceneIndex, width, height, frames)
-        val edgeFades = buildEdgeFades(sceneIndex, totalScenes, frames)
+        val edgeFades = buildEdgeFades(sceneIndex, totalScenes, frames, useTransitions)
 
         val args = mutableListOf("-y", "-i", imageFile.absolutePath)
         val filterBuilder = StringBuilder("[0:v]$motionAndGrade[bgbase];")
@@ -2007,6 +2164,7 @@ class VideoRenderEngine @Inject constructor(
             "-frames:v", frames.toString(),
             "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
             "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
+            "-video_track_timescale", "12800",
             outputFile.absolutePath
         )
         return args.toTypedArray()
@@ -2021,11 +2179,12 @@ class VideoRenderEngine @Inject constructor(
         outputFile: File,
         width: Int,
         height: Int,
-        segmentFrames: Int
+        segmentFrames: Int,
+        useTransitions: Boolean
     ): Array<String> {
         val frames = segmentFrames.coerceAtLeast(MIN_SCENE_FRAMES)
         val motionAndGrade = buildMotionAndGradeFilter(sceneIndex, width, height, frames)
-        val edgeFades = buildEdgeFades(sceneIndex, totalScenes, frames)
+        val edgeFades = buildEdgeFades(sceneIndex, totalScenes, frames, useTransitions)
         val switchSec = String.format(Locale.US, "%.2f", (frames.toDouble() / FRAME_RATE) * 0.5)
 
         val args = mutableListOf("-y", "-i", imageFile1.absolutePath, "-i", imageFile2.absolutePath)
@@ -2042,6 +2201,7 @@ class VideoRenderEngine @Inject constructor(
             "-frames:v", frames.toString(),
             "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
             "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
+            "-video_track_timescale", "12800",
             outputFile.absolutePath
         )
         return args.toTypedArray()
@@ -2055,20 +2215,24 @@ class VideoRenderEngine @Inject constructor(
         height: Int,
         frames: Int,
         sceneIndex: Int,
-        totalScenes: Int
+        totalScenes: Int,
+        useTransitions: Boolean
     ): Array<String> {
         val safeFrames = frames.coerceAtLeast(MIN_SCENE_FRAMES)
         val blurW = (width / 16).coerceAtLeast(32).let { if (it % 2 == 0) it else it + 1 }
         val blurH = (height / 16).coerceAtLeast(32).let { if (it % 2 == 0) it else it + 1 }
-        val edgeFades = buildEdgeFades(sceneIndex, totalScenes, safeFrames)
+        val edgeFades = buildEdgeFades(sceneIndex, totalScenes, safeFrames, useTransitions)
+
+        val safeCrop =
+            "crop='if(gt(iw,ih),trunc(iw*0.92/2)*2,trunc(iw*0.96/2)*2)':'if(gt(iw,ih),trunc(ih*0.88/2)*2,trunc(ih*0.94/2)*2)':'iw*0.02':'ih*0.02'"
 
         val args = mutableListOf("-y", "-stream_loop", "-1", "-i", clipFile.absolutePath)
         val filterBuilder = StringBuilder(
-            "[0:v]fps=$FRAME_RATE,setsar=1,split=2[bgsrc][fgsrc];" +
+            "[0:v]fps=$FRAME_RATE,setsar=1,$safeCrop,split=2[bgsrc][fgsrc];" +
                 "[bgsrc]scale=$blurW:$blurH:force_original_aspect_ratio=increase,crop=$blurW:$blurH," +
-                "scale=$width:$height:flags=bilinear,eq=brightness=-0.16:saturation=0.9[bg0];" +
+                "scale=$width:$height:flags=bilinear,eq=brightness=-0.20:saturation=0.85[bg0];" +
                 "[fgsrc]scale=$width:$height:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2[fg];" +
-                "[bg0][fg]overlay=(W-w)/2:(H-h)/2,eq=contrast=1.06:saturation=1.10,vignette=PI/6[clipbase];"
+                "[bg0][fg]overlay=(W-w)/2:(H-h)/2,eq=contrast=1.07:saturation=1.12,unsharp=3:3:0.30,vignette=PI/6[clipbase];"
         )
         appendOverlayChain(args, filterBuilder, "clipbase", overlaySpecs, startInputIndex = 1, edgeFades = edgeFades)
 
@@ -2078,6 +2242,7 @@ class VideoRenderEngine @Inject constructor(
             "-frames:v", safeFrames.toString(),
             "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
             "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
+            "-video_track_timescale", "12800",
             outputFile.absolutePath
         )
         return args.toTypedArray()
@@ -2276,6 +2441,7 @@ class VideoRenderEngine @Inject constructor(
         const val LANDSCAPE_HEIGHT = 1080
         const val FRAME_RATE = 25
         const val MIN_SCENE_FRAMES = 15
+        const val TRANSITION_FRAMES = 6
         const val AUDIO_TAIL_PADDING_SECONDS = 0.35
     }
 }
