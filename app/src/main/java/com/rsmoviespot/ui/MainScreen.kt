@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VoiceGender
 
@@ -131,7 +132,7 @@ fun MainScreen(
             fontWeight = FontWeight.ExtraBold
         )
         Text(
-            text = "Enter a topic, tap Trending Ideas, or paste your full script. Photos, movie clips & memes are fetched automatically from the internet.",
+            text = "Paste a ready script (Exact Script) or write a topic/director prompt (AI Prompt). Movie clips, memes & photos are fetched automatically.",
             color = TextMuted,
             fontSize = 13.sp
         )
@@ -188,10 +189,32 @@ fun MainScreen(
             }
         }
 
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            InputMode.entries.forEach { mode ->
+                FilterChip(
+                    selected = uiState.inputMode == mode,
+                    onClick = { viewModel.onInputModeSelected(mode) },
+                    enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                    label = { Text(mode.label, fontSize = 12.sp) },
+                    colors = chipColors,
+                    border = chipBorder
+                )
+            }
+        }
+
+        val inputHint = when (uiState.inputMode) {
+            InputMode.AUTO -> "Auto: ready script = exact voice, prompt/topic = AI acts on it"
+            InputMode.EXACT_SCRIPT -> "Exact Script: speaks your exact text word-for-word"
+            InputMode.AI_PROMPT -> "AI Prompt: follows all instructions & writes fresh script"
+        }
+
         OutlinedTextField(
             value = uiState.topic,
             onValueChange = viewModel::onTopicChanged,
-            label = { Text("Topic or full script (>25 words = exact script)") },
+            label = { Text(inputHint) },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(130.dp),
@@ -537,8 +560,19 @@ fun MainScreen(
         if (activeKitScript != null &&
             (activeKitScript.youtube_title.isNotBlank() ||
                 activeKitScript.youtube_description.isNotBlank() ||
+                activeKitScript.youtube_hashtags.isNotBlank() ||
                 activeKitScript.pinned_comment.isNotBlank())
         ) {
+            val fullDescriptionWithTags = buildString {
+                if (activeKitScript.youtube_description.isNotBlank()) {
+                    append(activeKitScript.youtube_description.trim())
+                }
+                if (activeKitScript.youtube_hashtags.isNotBlank()) {
+                    if (isNotEmpty()) append("\n\n")
+                    append(activeKitScript.youtube_hashtags.trim())
+                }
+            }
+
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = CardBg),
@@ -561,12 +595,12 @@ fun MainScreen(
                             fontSize = 12.sp
                         )
                     }
-                    if (activeKitScript.youtube_description.isNotBlank()) {
+                    if (fullDescriptionWithTags.isNotBlank()) {
                         Text(
-                            text = "Description: ${activeKitScript.youtube_description}",
+                            text = "Description: $fullDescriptionWithTags",
                             color = TextMuted,
                             fontSize = 11.sp,
-                            maxLines = 4,
+                            maxLines = 5,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
@@ -596,10 +630,10 @@ fun MainScreen(
                                 Text("Copy Title", fontSize = 11.sp)
                             }
                         }
-                        if (activeKitScript.youtube_description.isNotBlank()) {
+                        if (fullDescriptionWithTags.isNotBlank()) {
                             OutlinedButton(
                                 onClick = {
-                                    copyToClipboard(context, "YouTube Description", activeKitScript.youtube_description)
+                                    copyToClipboard(context, "YouTube Description", fullDescriptionWithTags)
                                 },
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp),
