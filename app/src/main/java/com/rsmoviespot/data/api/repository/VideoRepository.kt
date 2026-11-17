@@ -125,7 +125,8 @@ class VideoRepositoryImpl @Inject constructor(
         }
 
         val inputWordCount = cleanInput.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-        val isFullScriptMode = inputWordCount > FULL_SCRIPT_WORD_THRESHOLD
+        val isFullScriptMode = inputWordCount > FULL_SCRIPT_WORD_THRESHOLD &&
+            !isInstructionOrBriefPrompt(cleanInput)
 
         val systemPrompt = if (isFullScriptMode) {
             FULL_SCRIPT_SYSTEM_PROMPT
@@ -144,6 +145,7 @@ class VideoRepositoryImpl @Inject constructor(
             buildString {
                 appendLine("MODE: FULL USER SCRIPT ($inputWordCount words).")
                 appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user text intact and split sequentially into 12 to 15 short punchy visual scenes (splitting longer sentences cleanly at commas/clauses so each cut stays ~3.5-4.5s).")
+                appendLine("For every scene, put the exact visual action, setting, character look, and props implied or described in that sentence at the START of image_prompt.")
                 appendLine("Set voice_name matching the script's language and $targetGenderLabel gender (e.g., Hindi: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
                 appendLine()
                 appendLine("USER SCRIPT:")
@@ -157,9 +159,13 @@ class VideoRepositoryImpl @Inject constructor(
             }
 
             buildString {
-                appendLine("MODE: TOPIC MODE ($inputWordCount words). FOLLOW EVERY INSTRUCTION STRICTLY:")
+                appendLine("MODE: TOPIC / PROMPT MODE ($inputWordCount words). FOLLOW EVERY INSTRUCTION, DATA POINT, VISUAL STYLE, AND USER-DESCRIBED SCENE STRICTLY:")
                 appendLine(cleanInput)
                 appendLine()
+                appendLine("CRITICAL PROMPT RULES:")
+                appendLine("1) NEVER copy meta-instructions ('Act as...', 'Write a script...', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Only put the spoken narration in voiceover_text.")
+                appendLine("2) Whenever the user describes visuals, scenes, camera shots, character appearance/costume, lighting, props, or style (in English, Hindi, or Hinglish), put those EXACT visual details right at the BEGINNING of image_prompt (in crisp English) with visual_source='ai_generated' — NEVER replace described visuals with generic crowds or unrelated real_photo.")
+                appendLine("3) If the user says not to use posters/comics or specifies AI-only visuals, strictly obey that for every scene.")
                 appendLine(languageDirective)
                 appendLine("Format guideline: $formatGuide")
                 appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
@@ -227,6 +233,46 @@ class VideoRepositoryImpl @Inject constructor(
         throw lastError ?: IllegalStateException("Failed to generate script.")
     }
 
+    private fun isInstructionOrBriefPrompt(input: String): Boolean {
+        val lower = input.lowercase()
+
+        val metaPromptRegex = Regex(
+            """\b(act\s+as\s+an?|act\s+like\s+an?|you\s+are\s+an?\b.*\b(writer|director|engineer|expert|assistant)|your\s+task\s+is|your\s+job\s+is|prompt\s+engineer|image\s+generation\s+prompts?|critical\s+instructions|data\s+to\s+include|include\s+in\s+(?:the\s+)?script|aspect\s+ratio|9:16\s+framing|do\s+not\s+generate|describe\s+(?:him|her|it|the\s+scene)\s+as)\b""",
+            RegexOption.IGNORE_CASE
+        )
+        if (metaPromptRegex.containsMatchIn(input)) return true
+
+        val sceneDirectionRegex = Regex(
+            """(?:^|\n)\s*(?:scene\s*\d+\s*[:\-]|visuals?\s*:|image\s*prompt\s*:|voiceover\s*:|narration\s*:|\[visual[^\]]*\])""",
+            RegexOption.IGNORE_CASE
+        )
+        if (sceneDirectionRegex.containsMatchIn(input)) return true
+
+        val writeScriptRegex = Regex(
+            """\b(write|create|generate|make|prepare)\s+(?:me\s+)?(?:a|an|the)?\s*(?:[\w-]+\s+){0,4}(?:voiceover\s+)?(?:script|short|video|story|reel|scene)\b""",
+            RegexOption.IGNORE_CASE
+        )
+        if (writeScriptRegex.containsMatchIn(input)) return true
+
+        val hindiPromptRegex = Regex(
+            """\b(script\s+likh\w*|video\s+bana\w*|short\s+bana\w*|scene\s+bana\w*|visual\w*\s+bana\w*|par\s+(?:ek\s+)?video|ke\s+baare\s+mein\s+video|hindi\s+mein\s+script|(?:pehle|doosre|dusre|teesre|tisre)\s+scene\s+(?:me|mein)|scene\s+(?:me|mein)\s+.*dikha\w*)\b""",
+            RegexOption.IGNORE_CASE
+        )
+        if (hindiPromptRegex.containsMatchIn(input)) return true
+
+        val lines = input.lines().map { it.trim() }.filter { it.isNotBlank() }
+        val bulletLines = lines.count {
+            it.startsWith("- ") || it.startsWith("* ") || it.startsWith("• ") ||
+                it.matches(Regex("""^\d+[.)]\s+.+"""))
+        }
+        val hasBriefHeaders = listOf(
+            "release date:", "advance booking:", "prediction:", "highlight:",
+            "topic:", "instructions:", "requirements:", "note:"
+        ).any { lower.contains(it) }
+
+        return bulletLines >= 3 && hasBriefHeaders
+    }
+
     override suspend fun generateImageForSlab(
         prompt: String,
         isShorts: Boolean,
@@ -242,8 +288,10 @@ class VideoRepositoryImpl @Inject constructor(
 
         val imageWidth = if (isShorts) SHORTS_IMAGE_WIDTH else LANDSCAPE_IMAGE_WIDTH
         val imageHeight = if (isShorts) SHORTS_IMAGE_HEIGHT else LANDSCAPE_IMAGE_HEIGHT
-        val suffix = if (isShorts) IMAGE_SUFFIX_SHORTS else IMAGE_SUFFIX_LANDSCAPE
-        val finalPrompt = prompt.trim().trimEnd(',', '.') + suffix
+        val cleanPrompt = prompt.trim().trimEnd(',', '.')
+        val promptLower = cleanPrompt.lowercase()
+        val finalPrompt = cleanPrompt + buildImageSuffix(promptLower, isShorts)
+        val negativePrompt = buildNegativePrompt(promptLower)
 
         return callWithHttpUrl {
             cloudflareApi.generateImage(
@@ -254,13 +302,53 @@ class VideoRepositoryImpl @Inject constructor(
                     prompt = finalPrompt,
                     width = imageWidth,
                     height = imageHeight,
-                    negativePrompt = DEFAULT_NEGATIVE_PROMPT,
+                    negativePrompt = negativePrompt,
                     seed = seed,
                     numSteps = 20,
                     guidance = 7.5
                 )
             )
         }
+    }
+
+    private fun buildImageSuffix(promptLower: String, isShorts: Boolean): String {
+        val aspect = if (isShorts) "vertical 9:16 full-bleed frame" else "horizontal 16:9 full-bleed frame"
+        val isStylized = listOf(
+            "anime", "cartoon", "3d ", "pixar", "cgi", "comic",
+            "illustration", "oil painting", "watercolor", "sketch"
+        ).any { promptLower.contains(it) }
+
+        return if (isStylized) {
+            ", single continuous $aspect, ultra-detailed art direction, sharp focus, dramatic atmospheric lighting, no text, no watermark, no UI, no logos"
+        } else {
+            ", single continuous $aspect, photorealistic IMAX live-action movie still, sharp focus, realistic skin and material textures, dramatic cinema lighting, no text, no watermark, no UI, no logos"
+        }
+    }
+
+    private fun buildNegativePrompt(promptLower: String): String {
+        val base = mutableListOf(
+            "filmstrip", "multi-panel", "stacked frames", "comic panels", "grid",
+            "storyboard", "collage", "split screen", "abstract", "geometric shapes",
+            "cubes", "blocks", "colorful squares", "disembodied eye", "close-up single eye",
+            "text", "watermark", "signature", "logo", "letters", "words",
+            "ui", "interface", "comment box", "subscribe button", "social media", "website",
+            "blurry", "low quality", "distorted", "deformed", "extra limbs", "extra arms", "extra fingers"
+        )
+        if (!promptLower.contains("poster") && !promptLower.contains("title card")) {
+            base += listOf("poster", "title card")
+        }
+        val stylizedTokens = listOf(
+            "anime", "cartoon", "3d", "pixar", "cgi", "comic",
+            "illustration", "painting", "drawing", "sketch"
+        )
+        if (stylizedTokens.none { promptLower.contains(it) }) {
+            base += listOf(
+                "cartoon", "anime", "3d render", "cgi", "illustration",
+                "painting", "drawing", "sketch", "plastic skin", "wax figure",
+                "cosplay", "toy", "action figure"
+            )
+        }
+        return base.joinToString(", ")
     }
 
     override suspend fun downloadRealPhoto(
@@ -439,7 +527,7 @@ class VideoRepositoryImpl @Inject constructor(
             "character", "superhero", "supervillain", "villain", "comic", "anime",
             "marvel", "dc comics", "mcu", "iron man", "ironman", "superman",
             "batman", "spider-man", "spiderman", "thor", "hulk", "captain america",
-            "doctor strange", "black panther", "deadpool", "wolverine", "joker",
+            "doctor strange", "doctor doom", "black panther", "deadpool", "wolverine", "joker",
             "thanos", "loki", "flash", "aquaman", "wonder woman", "venom",
             "ant-man", "hawkeye", "scarlet witch", "black widow", "goku", "naruto",
             "luffy", "krrish", "shaktimaan", "baahubali", "pushpa raj", "rocky bhai"
@@ -1003,41 +1091,36 @@ class VideoRepositoryImpl @Inject constructor(
         const val LANDSCAPE_IMAGE_WIDTH = 1344
         const val LANDSCAPE_IMAGE_HEIGHT = 768
 
-        const val IMAGE_SUFFIX_SHORTS =
-            ", single continuous full-bleed live-action IMAX movie still, photorealistic 8k cinema photography, ARRI Alexa 65mm lens, realistic skin pores and costume fabric/metal textures, real-world atmospheric lighting, vertical 9:16 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
-        const val IMAGE_SUFFIX_LANDSCAPE =
-            ", single continuous full-bleed live-action IMAX movie still, photorealistic 8k cinema photography, ARRI Alexa 65mm lens, realistic skin pores and costume fabric/metal textures, real-world atmospheric lighting, horizontal 16:9 aspect ratio, no text, no watermark, no letters, no UI, no logos, no words"
-
-        const val DEFAULT_NEGATIVE_PROMPT =
-            "filmstrip, multi-panel, stacked frames, comic panels, grid, storyboard, collage, split screen, cartoon, anime, 3d render, cgi, illustration, painting, drawing, sketch, plastic skin, wax figure, cosplay, toy, action figure, bird, wild animal, abstract, geometric shapes, cubes, blocks, colorful squares, disembodied eye, close-up single eye, text, watermark, signature, logo, letters, words, ui, interface, comment box, subscribe button, social media, website, poster, title card, blurry, low quality, distorted, deformed, extra limbs, extra arms, extra fingers"
-
         const val IMAGE_PROMPT_RULES =
-            "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (VERY IMPORTANT):\n" +
-                "- Balance REAL PHOTOS/POSTERS with CONTENT-MATCHED PHOTOREALISTIC AI SCENES:\n" +
+            "PRIORITY 0 — USER-DESCRIBED SCENES & VISUALS ALWAYS WIN (HIGHEST PRIORITY):\n" +
+                "- Whenever the user's prompt or script explicitly describes a specific visual scene, character appearance, outfit, location, lighting, style, camera shot, or action (whether in Hindi, Hinglish, or English, e.g., 'pehle scene me...', 'Scene 1:', '[Visual: ...]'), YOU MUST generate that EXACT visual in image_prompt and set visual_source='ai_generated' and real_photo_query=''.\n" +
+                "- Front-load the exact described subject, costume/outfit, action, setting, props, and lighting in the FIRST 25-35 words of image_prompt so the image generator prioritizes them!\n" +
+                "- If the user asks for a specific style (e.g., anime, 3D, noir, cyberpunk) or forbids posters/comics, strictly honor that style and never replace a user-described visual with a generic crowd or real_photo poster.\n\n" +
+                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When user did NOT specify a custom visual for that scene):\n" +
                 "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR named in the scene (e.g., Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr.):\n" +
-                "     Set visual_source='real_photo' and real_photo_query to ONLY their clean English name (e.g. 'Prabhas').\n" +
-                "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene (e.g., Animal, Kabir Singh, Spirit, Pushpa 2, KGF, Avengers Endgame, Salaar):\n" +
+                "     Set visual_source='real_photo' and real_photo_query to ONLY their clean English name (e.g. 'Prabhas' or 'Robert Downey Jr').\n" +
+                "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene (e.g., Animal, Kabir Singh, Spirit, Pushpa 2, KGF, Avengers Endgame, Avengers Doomsday, Salaar):\n" +
                 "     Set visual_source='real_photo' and real_photo_query to '<Clean English Title> movie poster' (e.g. 'Animal movie poster'). NEVER combine actor + movie in one query.\n" +
-                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN / ICONIC HERO (e.g., Iron Man, Superman, Batman, Spider-Man, Thanos, Joker, Deadpool, Thor, Goku, Rocky Bhai, Pushpa Raj, Hanuman):\n" +
+                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN / ICONIC HERO (e.g., Iron Man, Superman, Batman, Spider-Man, Doctor Doom, Thanos, Joker, Deadpool, Thor, Goku, Rocky Bhai, Pushpa Raj, Hanuman):\n" +
                 "     * For MAX 1 or 2 iconic introduction/reveal scenes of that character, set visual_source='real_photo' and real_photo_query='<Clean English Character Name> character' (e.g. 'Iron Man character' or 'Superman character') to pull their real picture/poster.\n" +
-                "     * For ALL STORY, ACTION, BATTLE, DIALOGUE, OR EMOTIONAL SCENES involving that character (what the scene content actually describes!), set visual_source='ai_generated' and real_photo_query='', AND write a hyper-detailed LIVE-ACTION photorealistic image_prompt featuring THAT EXACT CHARACTER in their iconic live-action costume/look performing the EXACT action, emotion, and setting from that scene's voiceover_text!\n" +
+                "     * For ALL STORY, ACTION, BATTLE, DIALOGUE, OR EMOTIONAL SCENES involving that character, set visual_source='ai_generated' and real_photo_query='', AND write a hyper-detailed LIVE-ACTION photorealistic image_prompt featuring THAT EXACT CHARACTER in their iconic costume/look performing the EXACT action and setting from that scene's voiceover_text!\n" +
                 "  4) ALL OTHER SCENES (action sequences, cinema theater crowds, box-office hype, atmospheric shots, final CTA):\n" +
                 "     Set visual_source='ai_generated' and real_photo_query=''.\n" +
-                "- ALWAYS still write a rich, content-matched live-action fallback image_prompt for EVERY slab (even real_photo slabs).\n\n" +
+                "- ALWAYS still write a rich, content-matched fallback image_prompt for EVERY slab (even real_photo slabs).\n\n" +
                 "IMAGE PROMPT RULES (PHOTOREALISTIC & CONTENT-MATCHED):\n" +
-                "- EVERY image_prompt MUST visually match the EXACT action, location, mood, and character state of that specific scene's voiceover_text — NEVER write generic unrelated scenes!\n" +
-                "- When a fictional/superhero/mythological character is in the scene, explicitly name the character and describe realistic movie costume textures (scratched painted metal armor, woven suit fabric, real human skin pores, sweat, rain, dust, sparks, cinematic depth of field) so it looks like a real live-action movie frame — NEVER cartoon, CGI, or toy-like:\n" +
-                "  * Iron Man example (flying/battle content): 'photorealistic live-action movie still of Iron Man in battle-scratched metallic red and gold Mark 85 armor hovering over a burning city street at night, glowing blue chest arc reactor and palm repulsor energy, flying embers, dramatic shadows'\n" +
-                "  * Superman example (rain/intensity content): 'photorealistic live-action movie still of Superman with dark hair and intense expression wearing dark textured blue suit and flowing heavy red wool cape floating in stormy night rain amidst lightning and city skyscrapers'\n" +
-                "  * Cop / Indian action hero example: 'photorealistic live-action Indian cinema still of a rugged bearded police officer in sweat-stained khaki uniform standing in heavy monsoon rain beside glowing red and blue police siren lights'\n" +
-                "  * Theater / box office hype example: 'massive roaring Indian cinema audience cheering inside a grand packed movie hall facing a bright silver screen'\n" +
-                "- NEVER write real living actor names (e.g. Prabhas, Ranbir, Tom Cruise) inside image_prompt — keep real living celebrities in real_photo, and describe Indian hero action shots physically.\n" +
-                "- NEVER write movie title words with literal meanings in image_prompt or visual_style — specifically NEVER write the words 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' (otherwise the image model draws actual wild animals or birds!).\n" +
-                "- NEVER write abstract phrases like 'dark violence', 'blood rivers', 'box office', 'records', 'explosion of red and blue blocks', or 'close-up eyes'.\n" +
-                "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text' inside image_prompt.\n" +
-                "- For the final call-to-action scene, set visual_source='ai_generated' and describe an epic wide hero shot matching the story's main character or hero under dramatic cinema spotlights.\n" +
+                "- EVERY image_prompt MUST visually match the user's described visual first, and otherwise depict the EXACT action, location, objects, and mood of that scene's voiceover_text.\n" +
+                "- Keep image_prompt concrete (35-55 crisp English words: subject + costume + action + setting + lighting + camera framing) — never vague abstractions.\n" +
+                "- When a fictional/superhero character is in the scene, explicitly name the character and describe realistic costume textures (scratched painted metal armor, woven suit fabric, real skin pores, sweat, rain, embers, cinematic depth of field):\n" +
+                "  * Iron Man example: 'Iron Man in battle-scratched metallic red and gold Mark 85 armor hovering over a burning city street at night, glowing blue chest arc reactor and palm repulsor energy, flying embers, dramatic shadows'\n" +
+                "  * Doctor Doom example: 'Doctor Doom wearing the iconic cinematic metallic green and silver mask and heavy armored cloak standing amidst swirling dark smoke and sparks, menacing eyes visible behind steel faceplate'\n" +
+                "  * Superman example: 'Superman with dark hair wearing dark textured blue suit and flowing heavy red wool cape floating in stormy night rain amidst lightning and city skyscrapers'\n" +
+                "- NEVER write real living actor names inside image_prompt unless explicitly instructed in the user prompt for a character mask/costume scene — keep real living celebrities in real_photo.\n" +
+                "- Only avoid literal words like 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' when referring to a MOVIE TITLE of that name (if the user's described scene actually asks for a literal lion, ghost, king, or animal, DO include it accurately!).\n" +
+                "- NEVER write abstract phrases like 'box office', 'records', 'explosion of red and blue blocks', or 'close-up eyes'.\n" +
+                "- NEVER include words like 'comment box', 'subscribe', 'website', 'UI', 'social media', 'poster', 'title card', or 'text' inside image_prompt unless the user explicitly asked to show one.\n" +
+                "- For the final call-to-action scene (unless the user described something specific), set visual_source='ai_generated' and describe an epic wide hero shot matching the story's main character or hero under dramatic cinema spotlights.\n" +
                 "- Set has_character=true whenever the main character/hero is physically visible in frame; set has_character=false only for pure crowds, empty exteriors, or theater audience shots.\n" +
-                "- Vary camera framing across consecutive scenes (wide establishing shot, medium hero shot, dramatic over-the-shoulder action, rain-soaked silhouette, low-angle power shot — NEVER extreme close-up single eye).\n\n"
+                "- Vary camera framing across consecutive scenes unless the user specified a framing — NEVER extreme close-up single eye.\n\n"
 
         const val VOICE_AND_BGM_RULES =
             "VOICE EMOTION & BGM RULES:\n" +
@@ -1048,8 +1131,8 @@ class VideoRepositoryImpl @Inject constructor(
         const val JSON_SCHEMA_SPEC =
             "Return ONLY valid JSON matching this schema:\n" +
                 "{\n" +
-                "  \"character_bible\": \"Concrete physical live-action costume and appearance of the story's main character or action hero in English (no real living actor names)\",\n" +
-                "  \"visual_style\": \"Live-action photorealistic IMAX cinema look, real-world textures, dramatic warm amber and deep shadow lighting (NO Unreal Engine, NO abstract colors)\",\n" +
+                "  \"character_bible\": \"Concrete physical costume and appearance of the story's main character or action hero in English\",\n" +
+                "  \"visual_style\": \"Visual style requested by the user, or live-action photorealistic IMAX cinema look with real-world textures\",\n" +
                 "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
                 "  \"voice_name\": \"Edge TTS voice shortName matching language and gender\",\n" +
                 "  \"slabs\": [\n" +
@@ -1059,7 +1142,7 @@ class VideoRepositoryImpl @Inject constructor(
                 "      \"visual_source\": \"real_photo | ai_generated\",\n" +
                 "      \"real_photo_query\": \"Clean query: 'Prabhas' (actor), 'Animal movie poster' (film), or 'Iron Man character' (hero intro) if visual_source='real_photo', else ''\",\n" +
                 "      \"has_character\": true,\n" +
-                "      \"image_prompt\": \"Photorealistic live-action English scene matching exact voiceover_text action and character costume (NO 'Animal'/'Spirit'/cubes/eyes/UI/posters/living actor names)\",\n" +
+                "      \"image_prompt\": \"Front-loaded crisp English scene description matching exact user-described visual or voiceover_text action and costume\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
                 "    }\n" +
                 "  ]\n" +
@@ -1068,7 +1151,7 @@ class VideoRepositoryImpl @Inject constructor(
         const val FULL_SCRIPT_SYSTEM_PROMPT =
             "You are a film director splitting an existing user-written script into fast visual scenes for RS Movie Spot.\n" +
                 "CRITICAL FULL SCRIPT RULE:\n" +
-                "- DO NOT rewrite, paraphrase, translate, summarize, add, drop, or change EVEN A SINGLE WORD of the user's input.\n" +
+                "- DO NOT rewrite, paraphrase, translate, summarize, add, drop, or change EVEN A SINGLE WORD of the user's spoken input.\n" +
                 "- Keep exact user words intact and split sequentially into 12 to 15 short punchy scenes (splitting long sentences cleanly at commas/clauses so each visual stays ~3.5-4.5s).\n" +
                 "- Concatenating all slabs' voiceover_text values with spaces MUST match the user's input word-for-word.\n\n" +
                 IMAGE_PROMPT_RULES +
