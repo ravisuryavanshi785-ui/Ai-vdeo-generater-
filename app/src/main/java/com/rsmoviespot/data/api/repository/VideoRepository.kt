@@ -157,7 +157,7 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("MODE: FULL USER SCRIPT ($inputWordCount words).")
                 appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user text intact and split sequentially into 12 to 18 fast punchy visual scenes (~6-10 words / ~2.4-3.5s each so visuals change rapidly).")
                 appendLine("Select MULTIPLE distinct 'video_clip' (3-7+ action/trailer/movie scenes depending on script need) and 'meme_clip' (1-3 reaction scenes) with different clean English search queries — NEVER stop after just 1 clip!")
-                appendLine("For ai_generated scenes, put the exact visual action, setting, character look, and props implied or described in that sentence at the START of image_prompt.")
+                appendLine("For ai_generated scenes, match the exact character/action/environment of THAT scene (set has_character=false whenever another character or wide scenery is featured instead of the hero). Front-load the exact scene subject and action in the first 25 words of image_prompt.")
                 appendLine("Set voice_name matching the script's language and $targetGenderLabel gender (e.g., Hindi: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
                 appendLine("Return ONLY ONE complete valid JSON object with properly closed 'slabs' array ']' and root object '}'. Avoid unescaped double quotes inside JSON strings.")
                 appendLine()
@@ -178,7 +178,8 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("CRITICAL DIRECTOR PROMPT RULES:")
                 appendLine("1) NEVER speak or copy meta-instructions ('Act as...', 'Create a fast 9:16...', 'Write a script...', 'Include...', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Put ONLY natural spoken storytelling narration in voiceover_text.")
                 appendLine("2) Whenever the user describes visuals, scenes, camera shots, character appearance/costume, lighting, props, or style (in English, Hindi, or Hinglish), put those EXACT visual details right at the BEGINNING of image_prompt (in crisp English) with visual_source='ai_generated' — NEVER replace described visuals with generic crowds or unrelated real_photo.")
-                appendLine("3) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Dynamically choose MORE THAN ONE 'video_clip' (3 to 7+ action/trailer/movie scenes depending on script need — each with a UNIQUE clean 2-3 word English query!) + 'meme_clip' (1 to 3 reaction scenes) + 'real_photo' + 'ai_generated', plus layout_mode='split'/'flip' on comparisons.")
+                appendLine("3) Match each scene's image_prompt to THAT SPECIFIC scene's action/character! If a scene focuses on a secondary character (e.g. laughing monkey, butterfly, rabbit and parrot, wide rainbow sky), put THAT character/scenery FIRST in image_prompt and set has_character=false so the main hero doesn't replace them. Keep hero outfit consistent with no random hats/accessories.")
+                appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Dynamically choose MORE THAN ONE 'video_clip' (3 to 7+ action/trailer/movie scenes depending on script need — each with a UNIQUE clean 2-3 word English query!) + 'meme_clip' (1 to 3 reaction scenes) + 'real_photo' + 'ai_generated' (unless user forbids video/real photos).")
                 appendLine(languageDirective)
                 appendLine("Format guideline: $formatGuide")
                 appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
@@ -364,16 +365,19 @@ class VideoRepositoryImpl @Inject constructor(
     }
 
     private fun buildImageSuffix(promptLower: String, isShorts: Boolean): String {
-        val aspect = if (isShorts) "vertical 9:16 full-bleed single photograph" else "horizontal 16:9 full-bleed single photograph"
-        val isStylized = listOf(
-            "anime", "cartoon", "3d ", "pixar", "cgi", "comic",
-            "illustration", "oil painting", "watercolor", "sketch"
+        val aspect = if (isShorts) "vertical 9:16 full-bleed single camera frame" else "horizontal 16:9 full-bleed single camera frame"
+        val is3dAnimated = listOf("3d", "pixar", "disney", "cgi", "dreamworks").any { promptLower.contains(it) }
+        val isStylized = is3dAnimated || listOf(
+            "anime", "cartoon", "comic", "illustration", "oil painting", "watercolor", "sketch"
         ).any { promptLower.contains(it) }
 
-        return if (isStylized) {
-            ", ONE single unified $aspect, ultra-detailed art direction, sharp focus, dramatic atmospheric lighting, no collage, no grid, no split frames, no text, no watermark, no UI, no logos"
-        } else {
-            ", raw 35mm DSLR live-action movie set photograph, ONE single unified $aspect, candid film still, realistic human skin pores and natural fabric textures, shallow depth of field, cinema lighting, no collage, no grid, no multiple panels, no text, no watermark, no UI, no logos"
+        return when {
+            is3dAnimated ->
+                ", ONE single unified 3D animated Pixar feature film frame, $aspect, cinematic depth of field, rich outdoor 3D environment, soft volumetric sunlight, single cohesive story shot, no repeating pattern, no wallpaper, no sticker sheet, no collage, no grid, no text, no watermark"
+            isStylized ->
+                ", ONE single unified $aspect, ultra-detailed art direction, sharp focus, dramatic atmospheric lighting, no repeating pattern, no wallpaper, no collage, no grid, no split frames, no text, no watermark, no UI, no logos"
+            else ->
+                ", raw 35mm DSLR live-action movie set photograph, ONE single unified $aspect, candid film still, realistic human skin pores and natural fabric textures, shallow depth of field, cinema lighting, no collage, no grid, no multiple panels, no text, no watermark, no UI, no logos"
         }
     }
 
@@ -383,17 +387,22 @@ class VideoRepositoryImpl @Inject constructor(
             "photo grid", "picture grid", "triptych", "diptych", "quadrant", "contact sheet",
             "stacked frames", "comic panels", "grid", "storyboard", "collage", "photo collage",
             "split screen", "split frame", "montage", "mosaic", "tiled", "frames", "borders",
+            "wallpaper", "repeating pattern", "seamless pattern", "sticker sheet", "clipart",
+            "doodle pattern", "multiple copies", "clones", "duplicate character", "crowd of clones",
             "abstract", "geometric shapes", "cubes", "blocks", "colorful squares",
             "disembodied eye", "close-up single eye",
             "text", "watermark", "signature", "logo", "letters", "words", "caption", "subtitle",
+            "gibberish text", "pedestal text", "plaque", "signboard", "typography", "banner text",
             "ui", "interface", "comment box", "subscribe button", "social media", "website",
-            "blurry", "low quality", "distorted", "deformed", "extra limbs", "extra arms", "extra fingers"
+            "blurry", "low quality", "distorted", "deformed", "mutated anatomy",
+            "extra limbs", "extra arms", "extra legs", "extra fingers", "extra tail",
+            "extra ears", "extra eyes", "extra trunk", "double trunk", "two trunks"
         )
         if (!promptLower.contains("poster") && !promptLower.contains("title card")) {
             base += listOf("poster", "title card")
         }
         val stylizedTokens = listOf(
-            "anime", "cartoon", "3d", "pixar", "cgi", "comic",
+            "anime", "cartoon", "3d", "pixar", "disney", "dreamworks", "cgi", "comic",
             "illustration", "painting", "drawing", "sketch"
         )
         if (stylizedTokens.none { promptLower.contains(it) }) {
@@ -1201,7 +1210,6 @@ class VideoRepositoryImpl @Inject constructor(
                 }
                 '}', ']' -> {
                     if (stack.isEmpty()) {
-                        // Top-level JSON ended cleanly; ignore any trailing prose/extra closers.
                         break
                     }
                     if (stack.last() == ch) {
@@ -1302,13 +1310,14 @@ class VideoRepositoryImpl @Inject constructor(
             "PRIORITY 0 — USER-DESCRIBED SCENES & VISUALS ALWAYS WIN (HIGHEST PRIORITY):\n" +
                 "- Whenever the user's prompt or script explicitly describes a specific visual scene, character appearance, outfit, location, lighting, style, camera shot, or action (whether in Hindi, Hinglish, or English, e.g., 'pehle scene me...', 'Scene 1:', '[Visual: ...]'), YOU MUST generate that EXACT visual in image_prompt and set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- Front-load the exact described subject, costume/outfit, action, setting, props, and lighting in the FIRST 25-35 words of image_prompt so the image generator prioritizes them!\n" +
-                "- If the user asks for a specific style (e.g., anime, 3D, noir, cyberpunk) or forbids posters/comics, strictly honor that style and never replace a user-described visual with a generic crowd or real_photo poster.\n\n" +
+                "- If the user asks for a specific style (e.g., anime, 3D Pixar, noir, cyberpunk) or forbids posters/comics/real_photo, strictly honor that style across every scene.\n" +
+                "- SCENE-BY-SCENE CHARACTER & ACTION MATCHING: NEVER put the main hero alone in every scene! If a scene talks about a monkey, butterfly, rabbit, parrot, villain, crowd, mud splash, rainbow sky, or water spray, describe THAT EXACT subject and action in the first 15 words of image_prompt, and set has_character=false whenever the scene is focused on secondary characters or scenery! Keep the main character's look consistent across their scenes with zero random hats/outfits unless mentioned.\n\n" +
                 "DYNAMIC MULTI-CLIP MOVIE SCENES, MEMES, 2-PHOTO SPLITS & STAT BADGES:\n" +
-                "- 'video_clip' (USE MULTIPLE CLIPS — 3 to 7+ SCENES depending on script/topic need, NEVER stop at just 1 clip!): Whenever action, fight, entry, crowd hype, explosion, hero moment, or movie footage fits the narration, set visual_source='video_clip', layout_mode='single', and give EACH clip a DIFFERENT, short 2-3 word clean English search query (e.g., Scene 1: 'Avengers Doomsday', Scene 4: 'Robert Downey Jr', Scene 7: 'Thanos snap', Scene 10: 'cinema explosion'). Never repeat the same query across clips!\n" +
-                "- 'meme_clip' (1 to 3 SCENES where comedy, shock, hype, or roast fits): Set visual_source='meme_clip', layout_mode='single', and real_photo_query to a unique clean meme search (e.g. 'Hera Pheri paisa', 'shocked Pikachu', 'mind blown').\n" +
+                "- 'video_clip' (USE MULTIPLE CLIPS — 3 to 7+ SCENES depending on script/topic need, UNLESS user requests pure AI animation/no clips): Whenever action, fight, entry, crowd hype, explosion, hero moment, or movie footage fits the narration, set visual_source='video_clip', layout_mode='single', and give EACH clip a DIFFERENT, short 2-3 word clean English search query (e.g., Scene 1: 'Avengers Doomsday', Scene 4: 'Robert Downey Jr', Scene 7: 'Thanos snap', Scene 10: 'cinema explosion'). Never repeat the same query across clips!\n" +
+                "- 'meme_clip' (1 to 3 SCENES where comedy, shock, hype, or roast fits, unless user disables memes): Set visual_source='meme_clip', layout_mode='single', and real_photo_query to a unique clean meme search (e.g. 'Hera Pheri paisa', 'shocked Pikachu', 'mind blown').\n" +
                 "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, or vs scenes, set layout_mode='split' (or 'flip' for rapid dual reveal) with visual_source in {'real_photo','ai_generated'} and fill BOTH primary AND secondary visual fields (visual_source_2, real_photo_query_2, image_prompt_2)!\n" +
                 "- STAT BADGES: Whenever a scene announces a HUGE number, budget, box office record, or release date (e.g. '$150M PRE-SALES', '₹2000 CR BUDGET', '17 DEC RELEASE'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
-                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When scene is not video_clip/meme_clip and user did NOT specify a custom scene):\n" +
+                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When scene is not video_clip/meme_clip and user did NOT specify a custom/animated style):\n" +
                 "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR named in the scene (e.g., Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr.):\n" +
                 "     Set visual_source='real_photo' and real_photo_query to ONLY their clean English name (e.g. 'Prabhas' or 'Robert Downey Jr').\n" +
                 "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene (e.g., Animal, Kabir Singh, Spirit, Pushpa 2, KGF, Avengers Endgame, Avengers Doomsday, Salaar, Spider-Man No Way Home):\n" +
@@ -1318,9 +1327,9 @@ class VideoRepositoryImpl @Inject constructor(
                 "     * ALL STORY / ACTION / DIALOGUE scenes: visual_source='ai_generated' with raw LIVE-ACTION MOVIE PHOTOGRAPH image_prompt.\n" +
                 "  4) ALL OTHER SCENES: set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab (even video_clip/meme_clip/real_photo scenes).\n\n" +
-                "IMAGE PROMPT RULES (SINGLE UNIFIED RAW MOVIE STILL — ZERO GRID / ZERO COLLAGE):\n" +
-                "- Every image_prompt MUST describe ONE SINGLE CONTINUOUS PHOTOGRAPH (1 camera shot, 1 cohesive scene) — NEVER request collages, grids, split frames, or multiple panels.\n" +
-                "- Write every image_prompt as a REAL LIVE-ACTION FILM SET PHOTOGRAPH (brushed steel, heavy wool cloak, rain droplets, sweat, warm streetlights, cinema depth of field) — NEVER write 'Marvel', 'comic', 'concept art', or 'neon digital glow' unless asked!\n" +
+                "IMAGE PROMPT RULES (SINGLE UNIFIED SCENE — ZERO GRID / ZERO WALLPAPER / ZERO COLLAGE):\n" +
+                "- Every image_prompt MUST describe ONE SINGLE CONTINUOUS CAMERA SHOT of the exact scene (never collages, grids, wallpapers, sticker patterns, or multiple panels).\n" +
+                "- Unless user specifies animation/3D/anime/cartoon, write every image_prompt as a REAL LIVE-ACTION FILM SET PHOTOGRAPH (brushed steel, heavy wool cloak, rain droplets, sweat, warm streetlights, cinema depth of field) — NEVER write 'Marvel', 'comic', 'concept art', or 'neon digital glow' unless asked!\n" +
                 "- NEVER write real living actor names inside image_prompt unless explicitly instructed for a mask/costume scene.\n" +
                 "- Avoid literal title words like 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' when referring to a movie title.\n" +
                 "- NEVER write 'box office', 'records', 'close-up eyes', 'comment box', 'subscribe', 'UI', 'poster', or 'text' inside image_prompt.\n" +
@@ -1336,8 +1345,8 @@ class VideoRepositoryImpl @Inject constructor(
         const val JSON_SCHEMA_SPEC =
             "Return ONLY ONE valid JSON object (no markdown fences, no commentary) matching this schema:\n" +
                 "{\n" +
-                "  \"character_bible\": \"Concrete physical live-action costume and appearance of main character in English\",\n" +
-                "  \"visual_style\": \"Raw live-action 35mm film photography, natural skin and fabric textures, dramatic cinema lighting\",\n" +
+                "  \"character_bible\": \"Fixed simple visual look of main character in English (no random hats/outfits unless needed)\",\n" +
+                "  \"visual_style\": \"Visual medium matching user request (e.g. 3D Pixar animation or Raw live-action 35mm film)\",\n" +
                 "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
                 "  \"voice_name\": \"Edge TTS voice shortName matching language and gender\",\n" +
                 "  \"youtube_title\": \"Catchy viral YouTube title under 75 chars\",\n" +
@@ -1355,8 +1364,8 @@ class VideoRepositoryImpl @Inject constructor(
                 "      \"real_photo_query_2\": \"2nd photo query if split/flip and real_photo, else ''\",\n" +
                 "      \"image_prompt_2\": \"2nd scene English prompt if split/flip, else ''\",\n" +
                 "      \"stat_badge\": \"Optional 2-4 word uppercase stat headline (e.g. '₹80 CR DAY 1?') or ''\",\n" +
-                "      \"has_character\": true,\n" +
-                "      \"image_prompt\": \"Front-loaded crisp English DSLR cinema still matching user-described scene or voiceover_text\",\n" +
+                "      \"has_character\": false,\n" +
+                "      \"image_prompt\": \"Front-loaded crisp English prompt matching THAT scene's exact characters, props & action\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
                 "    }\n" +
                 "  ]\n" +
