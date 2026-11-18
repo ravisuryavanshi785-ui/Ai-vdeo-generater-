@@ -7,6 +7,8 @@ import io.github.whitemagic2014.tts.TTSVoice
 import io.github.whitemagic2014.tts.bean.Voice
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -19,6 +21,10 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -32,6 +38,23 @@ class EdgeTtsApi @Inject constructor(
     private val okHttpClient: OkHttpClient,
     @ApplicationContext private val context: Context
 ) {
+    private val edgeConcurrencyGate = Semaphore(2)
+    private val edgeExecutor = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "edge-tts-worker").apply { isDaemon = true }
+    }
+    private val consecutiveEdgeFailures = AtomicInteger(0)
+
+    @Volatile
+    private var edgeCooldownUntilMs: Long = 0L
+
+    private val ttsHttpClient: OkHttpClient by lazy {
+        okHttpClient.newBuilder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(25, TimeUnit.SECONDS)
+            .build()
+    }
+
     suspend fun synthesize(request: EdgeTtsRequest): ResponseBody {
         val result = synthesizeWithSubtitles(request.text, request.voice)
         return result.audioBytes.toResponseBody("audio/mpeg".toMediaType())
@@ -46,15 +69,13 @@ class EdgeTtsApi @Inject constructor(
         val cleanText = text.trim()
         require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
 
-        val edgeResult = runCatching {
-            synthesizeWithEdgeNeural(
-                text = cleanText,
-                voiceName = voice,
-                rate = rate,
-                pitch = pitch,
-                withVtt = false
-            )
-        }.getOrNull()
+        val edgeResult = tryEdgeWithCircuitBreaker(
+            text = cleanText,
+            voice = voice,
+            rate = rate,
+            pitch = pitch,
+            withVtt = false
+        )
 
         if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
             return@withContext edgeResult.audioBytes
@@ -76,15 +97,13 @@ class EdgeTtsApi @Inject constructor(
         val cleanText = text.trim()
         require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
 
-        val edgeResult = runCatching {
-            synthesizeWithEdgeNeural(
-                text = cleanText,
-                voiceName = voice,
-                rate = rate,
-                pitch = pitch,
-                withVtt = true
-            )
-        }.getOrNull()
+        val edgeResult = tryEdgeWithCircuitBreaker(
+            text = cleanText,
+            voice = voice,
+            rate = rate,
+            pitch = pitch,
+            withVtt = true
+        )
 
         if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
             return@withContext edgeResult
@@ -101,6 +120,79 @@ class EdgeTtsApi @Inject constructor(
         )
     }
 
+    private suspend fun tryEdgeWithCircuitBreaker(
+        text: String,
+        voice: String,
+        rate: String,
+        pitch: String,
+        withVtt: Boolean
+    ): EdgeTtsSynthesisResult? {
+        if (System.currentTimeMillis() < edgeCooldownUntilMs) {
+            return null
+        }
+
+        return edgeConcurrencyGate.withPermit {
+            if (System.currentTimeMillis() < edgeCooldownUntilMs) {
+                return@withPermit null
+            }
+
+            val result = runEdgeNeuralWithTimeout(
+                text = text,
+                voiceName = voice,
+                rate = rate,
+                pitch = pitch,
+                withVtt = withVtt
+            )
+
+            if (result != null && result.audioBytes.isNotEmpty()) {
+                consecutiveEdgeFailures.set(0)
+                result
+            } else {
+                if (consecutiveEdgeFailures.incrementAndGet() >= 2) {
+                    edgeCooldownUntilMs = System.currentTimeMillis() + EDGE_COOLDOWN_MS
+                }
+                null
+            }
+        }
+    }
+
+    private fun runEdgeNeuralWithTimeout(
+        text: String,
+        voiceName: String,
+        rate: String,
+        pitch: String,
+        withVtt: Boolean
+    ): EdgeTtsSynthesisResult? {
+        val future = edgeExecutor.submit(
+            Callable {
+                synthesizeWithEdgeNeural(
+                    text = text,
+                    voiceName = voiceName,
+                    rate = rate,
+                    pitch = pitch,
+                    withVtt = withVtt
+                )
+            }
+        )
+        return try {
+            future.get(EDGE_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (_: Throwable) {
+            future.cancel(true)
+            null
+        }
+    }
+
+    private fun clampSafeRate(rawRate: String): String {
+        val parsed = rawRate.trim().removeSuffix("%").toIntOrNull() ?: return DEFAULT_VOICE_RATE
+        val safe = parsed.coerceIn(-25, 30)
+        return if (safe >= 0) "+$safe%" else "$safe%"
+    }
+
+    private fun sanitizeSafePitch(rawPitch: String): String {
+        val trimmed = rawPitch.trim()
+        return if (trimmed in setOf("", "0Hz", "+0Hz", "-0Hz")) "+1Hz" else trimmed
+    }
+
     private fun synthesizeWithEdgeNeural(
         text: String,
         voiceName: String,
@@ -110,6 +202,9 @@ class EdgeTtsApi @Inject constructor(
     ): EdgeTtsSynthesisResult {
         val voice = findEdgeVoice(voiceName)
             ?: throw IOException("Edge Neural voice not found: $voiceName")
+
+        val safeRate = clampSafeRate(rate)
+        val safePitch = sanitizeSafePitch(pitch)
 
         val tempDir = File(context.cacheDir, "edge-tts-${UUID.randomUUID()}")
         if (!tempDir.exists() && !tempDir.mkdirs()) {
@@ -123,8 +218,8 @@ class EdgeTtsApi @Inject constructor(
                 .storage(tempDir.absolutePath)
                 .fileName(fileBaseName)
                 .overwrite(true)
-                .voiceRate(rate)
-                .voicePitch(pitch)
+                .voiceRate(safeRate)
+                .voicePitch(safePitch)
 
             if (withVtt) {
                 builder.enableVttFile()
@@ -257,7 +352,7 @@ class EdgeTtsApi @Inject constructor(
             )
             .build()
 
-        okHttpClient.newCall(httpRequest).execute().use { response ->
+        ttsHttpClient.newCall(httpRequest).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("TTS HTTP ${response.code}: ${response.message}")
             }
@@ -343,8 +438,10 @@ class EdgeTtsApi @Inject constructor(
     private companion object {
         const val MAX_CHUNK_LENGTH = 160
         const val MAX_ATTEMPTS = 3
-        const val DEFAULT_VOICE_RATE = "+14%"
-        const val DEFAULT_VOICE_PITCH = "-2Hz"
+        const val EDGE_TTS_TIMEOUT_SECONDS = 8L
+        const val EDGE_COOLDOWN_MS = 60_000L
+        const val DEFAULT_VOICE_RATE = "+26%"
+        const val DEFAULT_VOICE_PITCH = "+1Hz"
     }
 }
 
