@@ -460,17 +460,18 @@ class VideoRenderEngine @Inject constructor(
             )
 
             progress(96, "Saving video & cover thumbnail…")
-            val actionUri = publishToMediaStore(finalFile, topic)
+            val exportTitle = script.youtube_title.ifBlank { topic }
+            val actionUri = publishToMediaStore(finalFile, exportTitle)
             val thumbnailUri = coverBaseImageFile?.let { baseImg ->
                 runCatching {
                     val thumbJpg = File(renderDirectory, "cover_thumb.jpg")
                     renderCoverThumbnailJpg(
                         baseImageFile = baseImg,
-                        headlineText = script.youtube_title.ifBlank { topic },
+                        headlineText = exportTitle,
                         isShorts = isShorts,
                         outputFile = thumbJpg
                     )
-                    publishThumbnailToMediaStore(thumbJpg, topic)
+                    publishThumbnailToMediaStore(thumbJpg, exportTitle)
                 }.getOrNull()
             }
 
@@ -559,8 +560,14 @@ class VideoRenderEngine @Inject constructor(
         if (primaryOk) return imageFile
 
         val retryOk = runCatching {
-            val safePrompt =
+            val is3dAnimated = listOf("3d", "pixar", "disney", "cartoon", "anime").any {
+                scenePrompt.contains(it, ignoreCase = true) || visualStyle.contains(it, ignoreCase = true)
+            }
+            val safePrompt = if (is3dAnimated) {
+                "3D Pixar Disney cartoon animation, vibrant sunny storybook forest meadow with glowing flowers and soft sunlight"
+            } else {
                 "dramatic packed Indian cinema theater, warm golden spotlights, action hero silhouette, bright colorful atmospheric lighting"
+            }
             videoRepository.generateImageForSlab(
                 prompt = safePrompt,
                 isShorts = isShorts,
@@ -839,7 +846,7 @@ class VideoRenderEngine @Inject constructor(
                 typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
                 textAlign = Paint.Align.CENTER
             }
-            canvas.drawText("@RSMoviesSpot", w / 2f, h * 0.66f, txt)
+            canvas.drawText("@RSMovieSpot", w / 2f, h * 0.66f, txt)
             outputFile.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
         } finally {
             bmp.recycle()
@@ -907,6 +914,22 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
+    private fun stripDecorativeEmojis(text: String): String {
+        val sb = StringBuilder(text.length)
+        var i = 0
+        while (i < text.length) {
+            val cp = Character.codePointAt(text, i)
+            val charCount = Character.charCount(cp)
+            val isEmoji = (cp in 0x1F000..0x1FAFF) ||
+                (cp in 0x2600..0x27BF) ||
+                cp == 0xFE0F ||
+                cp == 0x200D
+            if (!isEmoji) sb.appendCodePoint(cp)
+            i += charCount
+        }
+        return sb.toString().replace(Regex("\\s+"), " ").trim()
+    }
+
     private fun renderCoverThumbnailJpg(
         baseImageFile: File,
         headlineText: String,
@@ -925,23 +948,36 @@ class VideoRenderEngine @Inject constructor(
             )
             val scrim = Paint().apply {
                 shader = LinearGradient(
-                    0f, thumbH * 0.45f, 0f, thumbH.toFloat(),
-                    0x00000000, 0xDD000000.toInt(), Shader.TileMode.CLAMP
+                    0f, thumbH * 0.50f, 0f, thumbH.toFloat(),
+                    0x00000000, 0xEC000000.toInt(), Shader.TileMode.CLAMP
                 )
             }
-            canvas.drawRect(0f, thumbH * 0.45f, thumbW.toFloat(), thumbH.toFloat(), scrim)
+            canvas.drawRect(0f, thumbH * 0.50f, thumbW.toFloat(), thumbH.toFloat(), scrim)
 
-            val cleanTitle = headlineText.trim().take(58)
-            val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0xFFFFE135.toInt()
-                textSize = if (isShorts) 74f else 64f
-                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            val cleanTitle = stripDecorativeEmojis(headlineText)
+                .ifBlank { headlineText.trim() }
+                .take(56)
+            val maxW = (thumbW - 110).coerceAtLeast(300)
+            var fontSize = if (isShorts) 72f else 62f
+            lateinit var textPaint: TextPaint
+            lateinit var layout: StaticLayout
+
+            while (fontSize >= 46f) {
+                textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = 0xFFFFE135.toInt()
+                    textSize = fontSize
+                    typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+                }
+                layout = StaticLayout.Builder.obtain(cleanTitle, 0, cleanTitle.length, textPaint, maxW)
+                    .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                    .setLineSpacing(4f, 1.05f)
+                    .setMaxLines(2)
+                    .build()
+                if (layout.lineCount <= 2 && layout.getEllipsisCount(layout.lineCount - 1) == 0) {
+                    break
+                }
+                fontSize -= 4f
             }
-            val maxW = (thumbW - 120).coerceAtLeast(300)
-            val layout = StaticLayout.Builder.obtain(cleanTitle, 0, cleanTitle.length, textPaint, maxW)
-                .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                .setMaxLines(3)
-                .build()
 
             val strokePaint = TextPaint(textPaint).apply {
                 style = Paint.Style.STROKE
@@ -951,11 +987,13 @@ class VideoRenderEngine @Inject constructor(
             }
             val strokeLayout = StaticLayout.Builder.obtain(cleanTitle, 0, cleanTitle.length, strokePaint, maxW)
                 .setAlignment(Layout.Alignment.ALIGN_CENTER)
-                .setMaxLines(3)
+                .setLineSpacing(4f, 1.05f)
+                .setMaxLines(2)
                 .build()
 
+            val bottomMargin = if (isShorts) 105f else 56f
             canvas.save()
-            canvas.translate((thumbW - maxW) / 2f, (thumbH - layout.height - 140f).coerceAtLeast(80f))
+            canvas.translate((thumbW - maxW) / 2f, (thumbH - layout.height - bottomMargin).coerceAtLeast(80f))
             strokeLayout.draw(canvas)
             layout.draw(canvas)
             canvas.restore()
@@ -1230,17 +1268,17 @@ class VideoRenderEngine @Inject constructor(
                     "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay|stat badge|youtube shorts?|video_clip|meme_clip|split layout|act as|collage|photo grid|grid of|panels)\\b",
                     RegexOption.IGNORE_CASE
                 ),
-                "dramatic packed Indian cinema theater"
+                ""
             )
-            .replace(Regex("\\banimals?\\b", RegexOption.IGNORE_CASE), "intense Bollywood action film")
-            .replace(Regex("\\bspirits?\\b", RegexOption.IGNORE_CASE), "fierce police thriller")
-            .replace(Regex("\\bdark violence\\b|\\bbrutal violence\\b|\\bviolence\\b", RegexOption.IGNORE_CASE), "gritty dramatic action confrontation in moody night rain")
+            .replace(Regex("\\banimal\\s+(?:movie|film|teaser|trailer)\\b", RegexOption.IGNORE_CASE), "intense Bollywood action film")
+            .replace(Regex("\\bspirit\\s+(?:movie|film|teaser|trailer)\\b", RegexOption.IGNORE_CASE), "fierce police thriller")
+            .replace(Regex("\\bdark violence\\b|\\bbrutal violence\\b|\\bviolence\\b", RegexOption.IGNORE_CASE), "dramatic action confrontation in moody lighting")
             .replace(Regex("\\bblood rivers?\\b|\\brivers of blood\\b", RegexOption.IGNORE_CASE), "dramatic crimson-lit action showdown with flying sparks")
-            .replace(Regex("\\bbox[- ]?office\\b", RegexOption.IGNORE_CASE), "cheering packed Indian cinema hall")
-            .replace(Regex("\\bclose[- ]?up(?:\\s+of)?(?:\\s+a)?(?:\\s+woman'?s?)?\\s+eyes?\\b", RegexOption.IGNORE_CASE), "dramatic medium shot of intense Indian action hero")
-            .replace(Regex("\\bunreal engine(?:\\s*5)?\\b", RegexOption.IGNORE_CASE), "live-action 35mm cinema still")
-            .replace(Regex("\\babstract\\b", RegexOption.IGNORE_CASE), "realistic live-action")
-            .trim()
+            .replace(Regex("\\bbox[- ]?office\\b", RegexOption.IGNORE_CASE), "cheering packed cinema hall")
+            .replace(Regex("\\bunreal engine(?:\\s*5)?\\b", RegexOption.IGNORE_CASE), "cinema film still")
+            .replace(Regex("\\babstract\\b", RegexOption.IGNORE_CASE), "detailed scene")
+            .replace(Regex("\\s{2,}"), " ")
+            .trim(',', ' ', '.')
 
     private fun buildSceneImagePrompt(
         characterBible: String,
@@ -1255,7 +1293,7 @@ class VideoRenderEngine @Inject constructor(
         return buildString {
             append(cleanScene)
             if (hasCharacter && cleanBible.isNotBlank()) {
-                append(". Character appearance: ")
+                append(". Main character look: ")
                 append(cleanBible)
             }
             if (cleanStyle.isNotBlank()) {
@@ -1941,9 +1979,7 @@ class VideoRenderEngine @Inject constructor(
         )
         return buildString {
             if (sceneIndex == 0) {
-                append("fade=t=in:st=0:d=0.20,")
-            } else {
-                append("fade=t=in:st=0:d=0.12,")
+                append("fade=t=in:st=0:d=0.18,")
             }
             if (sceneIndex == totalScenes - 1) {
                 append("fade=t=out:st=$fadeOutStart:d=0.26,")
@@ -2163,14 +2199,14 @@ class VideoRenderEngine @Inject constructor(
             }
         }
 
-    private fun publishToMediaStore(sourceFile: File, topic: String): Uri {
+    private fun publishToMediaStore(sourceFile: File, titleOrTopic: String): Uri {
         require(sourceFile.exists() && sourceFile.length() > 1024L) {
             "Rendered video file is missing or empty (${sourceFile.length()} bytes)."
         }
 
         val nowMs = System.currentTimeMillis()
         val nowSec = nowMs / 1000L
-        val fileBase = "RSMovieSpot_${safeFileName(topic)}_$nowMs"
+        val fileBase = "RSMovieSpot_${safeFileName(titleOrTopic)}_$nowMs"
         val displayName = "$fileBase.mp4"
 
         val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
@@ -2258,10 +2294,10 @@ class VideoRenderEngine @Inject constructor(
         }.getOrDefault(galleryUri)
     }
 
-    private fun publishThumbnailToMediaStore(sourceFile: File, topic: String): Uri? {
+    private fun publishThumbnailToMediaStore(sourceFile: File, titleOrTopic: String): Uri? {
         if (!sourceFile.exists() || sourceFile.length() < 1024L) return null
         val nowMs = System.currentTimeMillis()
-        val displayName = "RSMovieSpot_Cover_${safeFileName(topic)}_$nowMs.jpg"
+        val displayName = "RSMovieSpot_Cover_${safeFileName(titleOrTopic)}_$nowMs.jpg"
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
@@ -2293,10 +2329,10 @@ class VideoRenderEngine @Inject constructor(
     }
 
     private fun safeFileName(value: String): String =
-        value.trim()
-            .replace(Regex("[^A-Za-z0-9._-]+"), "_")
+        stripDecorativeEmojis(value)
+            .replace(Regex("[^\\p{L}\\p{N}._-]+"), "_")
             .trim('_')
-            .take(50)
+            .take(45)
             .ifBlank { "Video" }
 
     private fun escapeConcatPath(path: String): String =
