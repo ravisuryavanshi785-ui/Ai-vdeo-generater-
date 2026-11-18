@@ -100,6 +100,9 @@ class VideoRepositoryImpl @Inject constructor(
         isLenient = true
     }
 
+    @Volatile
+    private var cachedChatModels: List<String>? = null
+
     private data class ScriptAttempt(
         val modelId: String,
         val useJsonMode: Boolean,
@@ -192,14 +195,24 @@ class VideoRepositoryImpl @Inject constructor(
             GroqMessage(role = "user", content = userPrompt)
         )
 
-        val attempts = listOf(
-            ScriptAttempt("llama-3.3-70b-versatile", useJsonMode = true, maxTokens = 6500),
-            ScriptAttempt("openai/gpt-oss-120b", useJsonMode = true, maxTokens = 8192),
-            ScriptAttempt("openai/gpt-oss-120b", useJsonMode = false, maxTokens = 8192),
-            ScriptAttempt("llama-3.1-8b-instant", useJsonMode = true, maxTokens = 6500),
-            ScriptAttempt("llama-3.3-70b-versatile", useJsonMode = false, maxTokens = 6500)
-        )
+        val candidateModels = resolveCandidateModels()
+        val attempts = buildList {
+            candidateModels.forEachIndexed { idx, modelId ->
+                val tokens = if (modelId.contains("gpt-oss", ignoreCase = true) ||
+                    modelId.contains("qwen", ignoreCase = true)
+                ) {
+                    16384
+                } else {
+                    8192
+                }
+                add(ScriptAttempt(modelId, useJsonMode = true, maxTokens = tokens))
+                if (idx == 0) {
+                    add(ScriptAttempt(modelId, useJsonMode = false, maxTokens = tokens))
+                }
+            }
+        }
 
+        val attemptErrors = mutableListOf<String>()
         var lastError: Throwable? = null
         for ((index, attempt) in attempts.withIndex()) {
             try {
@@ -230,18 +243,86 @@ class VideoRepositoryImpl @Inject constructor(
 
                 val generatedText = response.choices.firstOrNull()?.message?.content
                     ?.takeIf { it.isNotBlank() }
-                    ?: throw IllegalStateException("Groq returned empty result.")
+                    ?: throw IllegalStateException("Groq (${attempt.modelId}) returned empty result.")
 
                 return parseScriptResponse(generatedText, language, voiceGender)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
                 lastError = error
-                if (index == attempts.lastIndex) throw error
+                attemptErrors += "${attempt.modelId}(json=${attempt.useJsonMode}): ${error.message?.take(140) ?: error::class.java.simpleName}"
+                if (index == attempts.lastIndex) {
+                    throw IllegalStateException(attemptErrors.joinToString(" | "), error)
+                }
             }
         }
 
         throw lastError ?: IllegalStateException("Failed to generate script.")
+    }
+
+    private suspend fun resolveCandidateModels(): List<String> = withContext(Dispatchers.IO) {
+        cachedChatModels?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
+
+        val discovered = runCatching {
+            val request = Request.Builder()
+                .url("https://api.groq.com/openai/v1/models")
+                .header("Authorization", "Bearer ${BuildConfig.GROQ_API_KEY}")
+                .header("Accept", "application/json")
+                .build()
+            okHttpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@runCatching emptyList<String>()
+                val body = response.body?.string().orEmpty()
+                val root = json.parseToJsonElement(body) as? JsonObject ?: return@runCatching emptyList()
+                val data = root["data"] as? JsonArray ?: return@runCatching emptyList()
+                data.mapNotNull { item ->
+                    (item as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull?.trim()
+                }.filter { id ->
+                    val lower = id.lowercase()
+                    id.isNotBlank() &&
+                        !lower.contains("whisper") &&
+                        !lower.contains("tts") &&
+                        !lower.contains("orpheus") &&
+                        !lower.contains("guard") &&
+                        !lower.contains("embed") &&
+                        !lower.contains("compound")
+                }
+            }
+        }.getOrDefault(emptyList())
+
+        val preferredOrder = listOf(
+            "openai/gpt-oss-120b",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "qwen/qwen3-32b",
+            "openai/gpt-oss-20b",
+            "llama-3.1-8b-instant"
+        )
+
+        val finalModels = if (discovered.isNotEmpty()) {
+            val sorted = mutableListOf<String>()
+            for (pref in preferredOrder) {
+                discovered.firstOrNull { it.equals(pref, ignoreCase = true) }?.let { sorted += it }
+            }
+            for (id in discovered) {
+                val lower = id.lowercase()
+                if (id !in sorted && (lower.contains("qwen") || lower.contains("llama") || lower.contains("gpt-oss"))) {
+                    sorted += id
+                }
+            }
+            sorted.distinct().take(4).ifEmpty { discovered.take(3) }
+        } else {
+            listOf(
+                "openai/gpt-oss-120b",
+                "openai/gpt-oss-20b",
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                "llama-3.1-8b-instant"
+            )
+        }
+
+        if (discovered.isNotEmpty()) {
+            cachedChatModels = finalModels
+        }
+        finalModels
     }
 
     private fun isInstructionOrBriefPrompt(input: String, language: VideoLanguage): Boolean {
