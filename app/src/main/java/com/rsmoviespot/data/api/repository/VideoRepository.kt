@@ -184,6 +184,7 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("3) Match each scene's image_prompt to THAT SPECIFIC scene's action/character! If a scene focuses on a secondary character (e.g. laughing monkey, butterfly, rabbit and parrot, wide rainbow sky), put THAT character/scenery FIRST in image_prompt and set has_character=false so the main hero doesn't replace them. Keep hero outfit consistent with no random hats/accessories.")
                 appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) for rapid visual energy. Dynamically choose MORE THAN ONE 'video_clip' (3 to 7+ action/trailer/movie scenes depending on script need — each with a UNIQUE clean 2-3 word English query!) + 'meme_clip' (1 to 3 reaction scenes) + 'real_photo' + 'ai_generated' (unless user forbids video/real photos).")
                 appendLine(languageDirective)
+                appendLine("STRICT DEVANAGARI & CLAUSE RULE: When Hindi/Marathi is active (or Auto defaults to Hindi), write ALL voiceover_text ONLY in Devanagari script (e.g. 'दोस्तों, एक सेकंड...') — NEVER Roman Hinglish like 'Doston', 'ek second', 'agle'. Never split a verb phrase mid-way across two scenes (e.g. NEVER split 'लग | चुकी है').")
                 appendLine("Format guideline: $formatGuide")
                 appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
                 appendLine("Return ONLY ONE complete valid JSON object with properly closed 'slabs' array ']' and root object '}'. Avoid unescaped double quotes inside JSON string values; use single quotes if quoting dialogue.")
@@ -1089,12 +1090,12 @@ class VideoRepositoryImpl @Inject constructor(
     ): ByteArray {
         require(text.isNotBlank()) { "Voiceover text must not be blank." }
         val (rate, pitch) = when (emotion.lowercase().trim()) {
-            "hook" -> "+18%" to "+2Hz"
-            "suspense" -> "+6%" to "-6Hz"
-            "climax" -> "+21%" to "-1Hz"
-            "question" -> "+11%" to "+2Hz"
-            "excited", "roast" -> "+17%" to "+3Hz"
-            else -> "+14%" to "-2Hz"
+            "hook" -> "+40%" to "+1Hz"
+            "suspense" -> "+27%" to "-1Hz"
+            "climax" -> "+42%" to "+0Hz"
+            "question" -> "+33%" to "+1Hz"
+            "excited", "roast" -> "+40%" to "+1Hz"
+            else -> "+37%" to "+0Hz"
         }
         return edgeTtsApi.synthesizeSpeechClip(
             text = text,
@@ -1470,7 +1471,7 @@ class VideoRepositoryImpl @Inject constructor(
                 "- Create 13 to 16 ultra-crisp scenes (~7-10 words / ~2.5-3.2s each for Shorts; 14-18 scenes for 16:9 YouTube) with seamless spoken transitions so visuals change every ~3 seconds and NO single image sits static!\n" +
                 "- Put an explosive 2-second hook in Scene 1 with a bold number or shocking question.\n" +
                 "- Use natural spoken punctuation ('!', '?', '...') so TTS pitch rises and falls dramatically.\n" +
-                "- When writing in Hindi: use accurate Devanagari spelling (करोड़, बॉक्स ऑफिस, थिएटर, डूम्ज़-डे) and MANDATORY respectful plural pronouns (वे, उनकी, उनका, उन्हें) for deities and heroes — NEVER singular वह/उसकी/उसका.\n" +
+                "- When writing in Hindi: write 100% in pure Devanagari script (NEVER Roman Hinglish like 'Doston' or 'ek second'), use accurate spelling (करोड़, बॉक्स ऑफिस, थिएटर, डूम्ज़-डे), NEVER split mid-verb across scenes, and use MANDATORY respectful plural pronouns (वे, उनकी, उनका, उन्हें) for deities and heroes — NEVER singular वह/उसकी/उसका.\n" +
                 "- Never put unescaped double quotes inside JSON strings (use single quotes if needed) and always close both ']' and '}'.\n\n" +
                 IMAGE_PROMPT_RULES +
                 VOICE_AND_BGM_RULES +
