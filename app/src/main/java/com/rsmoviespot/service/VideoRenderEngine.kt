@@ -39,6 +39,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.IOException
@@ -46,6 +47,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -143,11 +145,12 @@ class VideoRenderEngine @Inject constructor(
             val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
                 .coerceAtLeast(1000)
 
-            progress(7, "Recording dynamic voiceover…")
+            progress(7, "Recording voice 1/${script.slabs.size}…")
             val trimmedVoiceWavs = synthesizeAndTrimVoiceClips(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
-                voiceName = activeVoiceName
+                voiceName = activeVoiceName,
+                progress = progress
             )
 
             val voiceListFile = File(renderDirectory, "voice_parts.txt")
@@ -155,6 +158,7 @@ class VideoRenderEngine @Inject constructor(
                 trimmedVoiceWavs.joinToString("\n") { "file '${escapeConcatPath(it.absolutePath)}'" } + "\n"
             )
             val fullVoiceFile = File(renderDirectory, "full_voice.wav")
+            progress(13, "Joining studio voiceover…")
             runFfmpeg(createConcatArguments(voiceListFile, fullVoiceFile))
 
             val sceneDurations = trimmedVoiceWavs.map { wavFile ->
@@ -1008,22 +1012,31 @@ class VideoRenderEngine @Inject constructor(
     private suspend fun synthesizeAndTrimVoiceClips(
         renderDirectory: File,
         slabs: List<VideoSlab>,
-        voiceName: String
+        voiceName: String,
+        progress: (Int, String) -> Unit
     ): List<File> = coroutineScope {
-        val semaphore = Semaphore(4)
+        val semaphore = Semaphore(2)
+        val total = slabs.size.coerceAtLeast(1)
+        val completedCount = AtomicInteger(0)
+
         val rawFiles = slabs.mapIndexed { index, slab ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     val rawMp3 = File(renderDirectory, "raw_voice_${index + 1}.mp3")
-                    val bytes = videoRepository.generateDynamicVoiceClip(
-                        text = slab.voiceover_text,
-                        voiceName = voiceName,
-                        emotion = slab.voice_emotion
-                    )
+                    val bytes = withTimeout(30_000L) {
+                        videoRepository.generateDynamicVoiceClip(
+                            text = slab.voiceover_text,
+                            voiceName = voiceName,
+                            emotion = slab.voice_emotion
+                        )
+                    }
                     rawMp3.writeBytes(bytes)
                     if (!rawMp3.exists() || rawMp3.length() == 0L) {
                         throw IOException("Voice generation returned empty audio for scene ${index + 1}.")
                     }
+                    val done = completedCount.incrementAndGet()
+                    val pct = (7 + (done * 4) / total).coerceIn(7, 11)
+                    progress(pct, "Recording voice $done/$total…")
                     rawMp3
                 }
             }
@@ -1031,40 +1044,49 @@ class VideoRenderEngine @Inject constructor(
 
         val wavFiles = mutableListOf<File>()
         rawFiles.forEachIndexed { index, rawMp3 ->
+            val pct = (11 + ((index + 1) * 2) / total).coerceIn(11, 13)
+            progress(pct, "Preparing voice ${index + 1}/$total…")
+
             val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
             val isLast = index == rawFiles.lastIndex
             val microBreath = if (isLast) 0.02 else 0.04
 
             val trimmedOk = runCatching {
-                runFfmpeg(
-                    arrayOf(
-                        "-y",
-                        "-i", rawMp3.absolutePath,
-                        "-af",
-                        "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
-                            "areverse," +
+                withTimeout(20_000L) {
+                    runFfmpeg(
+                        arrayOf(
+                            "-y",
+                            "-i", rawMp3.absolutePath,
+                            "-af",
                             "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
-                            "areverse," +
-                            "apad=pad_dur=$microBreath",
-                        "-ar", "44100",
-                        "-ac", "1",
-                        "-c:a", "pcm_s16le",
-                        trimmedWav.absolutePath
+                                "areverse," +
+                                "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
+                                "areverse," +
+                                "atempo=1.07," +
+                                "apad=pad_dur=$microBreath",
+                            "-ar", "44100",
+                            "-ac", "1",
+                            "-c:a", "pcm_s16le",
+                            trimmedWav.absolutePath
+                        )
                     )
-                )
+                }
             }.isSuccess
 
             if (!trimmedOk || !trimmedWav.exists() || trimmedWav.length() <= 44L) {
-                runFfmpeg(
-                    arrayOf(
-                        "-y",
-                        "-i", rawMp3.absolutePath,
-                        "-ar", "44100",
-                        "-ac", "1",
-                        "-c:a", "pcm_s16le",
-                        trimmedWav.absolutePath
+                withTimeout(20_000L) {
+                    runFfmpeg(
+                        arrayOf(
+                            "-y",
+                            "-i", rawMp3.absolutePath,
+                            "-af", "atempo=1.07,apad=pad_dur=$microBreath",
+                            "-ar", "44100",
+                            "-ac", "1",
+                            "-c:a", "pcm_s16le",
+                            trimmedWav.absolutePath
+                        )
                     )
-                )
+                }
             }
             wavFiles += trimmedWav
         }
