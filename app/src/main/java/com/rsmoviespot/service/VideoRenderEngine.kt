@@ -1033,7 +1033,7 @@ class VideoRenderEngine @Inject constructor(
         rawFiles.forEachIndexed { index, rawMp3 ->
             val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
             val isLast = index == rawFiles.lastIndex
-            val microBreath = if (isLast) 0.02 else 0.06
+            val microBreath = if (isLast) 0.02 else 0.04
 
             val trimmedOk = runCatching {
                 runFfmpeg(
@@ -1041,9 +1041,9 @@ class VideoRenderEngine @Inject constructor(
                         "-y",
                         "-i", rawMp3.absolutePath,
                         "-af",
-                        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB," +
+                        "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
                             "areverse," +
-                            "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB," +
+                            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
                             "areverse," +
                             "apad=pad_dur=$microBreath",
                         "-ar", "44100",
@@ -1599,8 +1599,8 @@ class VideoRenderEngine @Inject constructor(
                     var brass = 0.0
                     for (freq in chord) {
                         brass += sin(2.0 * PI * freq * t) * 0.14 +
-                            sin(2.0 * PI * freq * 2.0 * t) * 0.06 +
-                            sin(2.0 * PI * freq * 3.0 * t) * 0.03
+                            sin(2.0 * PI * freq * 2.0 * t) * 0.05 +
+                            sin(2.0 * PI * freq * 3.0 * t) * 0.012
                     }
                     brass *= chordEnv * (0.85 + 0.15 * sin(2.0 * PI * 0.6 * t))
                     val stepIdx = ((t / (beatDuration * 0.5)).toInt()) % arpOrder.size
@@ -1796,7 +1796,7 @@ class VideoRenderEngine @Inject constructor(
     ): File? {
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
 
-        // 1) Studio Mic EQ on single-input voice (no amix deadlock)
+        // 1) Rich Studio Bass & Broadcast Mic EQ on single-input voice (no amix deadlock)
         val eqVoiceFile = File(renderDirectory, "voice_eq.wav")
         val eqOk = runCatching {
             runFfmpeg(
@@ -1804,11 +1804,13 @@ class VideoRenderEngine @Inject constructor(
                     "-y",
                     "-i", fullVoiceFile.absolutePath,
                     "-af",
-                    "highpass=f=85," +
-                        "equalizer=f=180:t=o:w=1.2:g=3.5," +
-                        "equalizer=f=3200:t=o:w=1.5:g=3.0," +
-                        "acompressor=threshold=-16dB:ratio=3:attack=5:release=60," +
-                        "volume=1.15",
+                    "highpass=f=55," +
+                        "equalizer=f=105:t=q:w=0.85:g=6.0," +
+                        "equalizer=f=195:t=q:w=1.1:g=3.2," +
+                        "equalizer=f=450:t=q:w=1.5:g=-1.5," +
+                        "equalizer=f=3000:t=q:w=1.4:g=1.8," +
+                        "acompressor=threshold=-18dB:ratio=2.4:attack=8:release=85," +
+                        "volume=1.08",
                     "-ar", "44100",
                     "-ac", "1",
                     "-c:a", "pcm_s16le",
@@ -1857,7 +1859,7 @@ class VideoRenderEngine @Inject constructor(
 
             val windowSize = 1102 // ~25ms at 44100Hz
             val bgmGains = DoubleArray(totalSamples)
-            var smoothedGain = 0.22
+            var smoothedGain = 0.16
             var cursor = 0
             while (cursor < totalSamples) {
                 val end = minOf(cursor + windowSize, totalSamples)
@@ -1869,7 +1871,7 @@ class VideoRenderEngine @Inject constructor(
                     count++
                 }
                 val rms = if (count > 0) sqrt(sumSq / count) else 0.0
-                val targetGain = if (rms > 0.024) 0.14 else 0.36
+                val targetGain = if (rms > 0.024) 0.085 else 0.26
                 for (k in cursor until end) {
                     smoothedGain += (targetGain - smoothedGain) * 0.0022
                     bgmGains[k] = smoothedGain
