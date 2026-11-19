@@ -32,9 +32,7 @@ import com.rsmoviespot.domain.models.VideoSlab
 import com.rsmoviespot.domain.models.VoiceGender
 import com.rsmoviespot.domain.models.VoiceTone
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -42,7 +40,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.IOException
@@ -83,13 +81,15 @@ private data class PopCaptionChunk(
     val file: File,
     val stripHeight: Int,
     val startSeconds: Double,
-    val endSeconds: Double
+    val endSeconds: Double,
+    val isLastChunk: Boolean
 )
 
 private data class PreparedSceneVisual(
     val clipFile: File? = null,
     val imageFile1: File? = null,
-    val imageFile2: File? = null
+    val imageFile2: File? = null,
+    val layoutMode: String = "single"
 )
 
 private enum class BgmStyle {
@@ -114,8 +114,8 @@ class VideoRenderEngine @Inject constructor(
         preGeneratedScript: VideoScriptResponse? = null,
         language: VideoLanguage = VideoLanguage.AUTO,
         voiceGender: VoiceGender = VoiceGender.MALE,
-        voiceTone: VoiceTone = VoiceTone.AUTO,
         inputMode: InputMode = InputMode.AUTO,
+        voiceTone: VoiceTone = VoiceTone.AUTO,
         progress: (Int, String) -> Unit = { _, _ -> }
     ): VideoRenderResult = withContext(Dispatchers.IO) {
         require(topic.isNotBlank()) { "Topic must not be blank." }
@@ -157,13 +157,16 @@ class VideoRenderEngine @Inject constructor(
             val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
                 .coerceAtLeast(1000)
 
-            progress(7, "Recording dynamic voiceover…")
+            progress(7, "Recording studio voiceover…")
             val trimmedVoiceWavs = synthesizeAndTrimVoiceClips(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
                 voiceName = activeVoiceName,
                 voiceTone = voiceTone,
-                progress = progress
+                progressUpdate = { done, total ->
+                    val pct = 7 + (done * 13 / total.coerceAtLeast(1))
+                    progress(pct.coerceIn(7, 20), "Recording studio voice ($done/$total)…")
+                }
             )
 
             val voiceListFile = File(renderDirectory, "voice_parts.txt")
@@ -207,29 +210,29 @@ class VideoRenderEngine @Inject constructor(
             }
 
             val slabCount = script.slabs.size
-            progress(14, "Generating AI scenes & clips in parallel…")
+            progress(22, "Generating AI scenes & fetching clips (3x parallel)…")
             val preparedVisuals = prepareAllSceneVisuals(
                 renderDirectory = renderDirectory,
                 script = script,
                 isShorts = isShorts,
                 width = width,
                 height = height,
-                baseSeed = baseSeed,
-                progress = progress
-            )
+                baseSeed = baseSeed
+            ) { done, total ->
+                val pct = 22 + (done * 38 / total.coerceAtLeast(1))
+                progress(pct.coerceIn(22, 60), "Prepared visual $done of $total…")
+            }
 
             val videoSegmentFiles = mutableListOf<File>()
             var coverBaseImageFile: File? = null
 
             script.slabs.forEachIndexed { index, slab ->
-                val renderProgress = 48 + (index * 36 / slabCount)
-                progress(
-                    renderProgress.coerceIn(48, 84),
-                    "Editing scene ${index + 1} of $slabCount…"
-                )
+                val encodePct = 60 + (index * 24 / slabCount.coerceAtLeast(1))
+                progress(encodePct.coerceIn(60, 84), "Editing scene ${index + 1} of $slabCount…")
 
                 val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
                 val segmentExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
+                val visual = preparedVisuals[index]
 
                 val popCaptions = runCatching {
                     createPopCaptionOverlays(
@@ -260,17 +263,16 @@ class VideoRenderEngine @Inject constructor(
                     isShorts = isShorts
                 )
 
-                val visual = preparedVisuals[index]
                 var encodedClip = false
-                val preparedClipFile = visual.clipFile
-                if (preparedClipFile != null && preparedClipFile.exists() && preparedClipFile.length() > 2048L) {
+                val rawClipFile = visual.clipFile
+                if (rawClipFile != null && rawClipFile.exists() && rawClipFile.length() > 10_000L) {
                     if (index == 0 && coverBaseImageFile == null) {
                         val rawCover = File(renderDirectory, "cover_raw_clip.png")
                         val gotRawCover = runCatching {
                             runFfmpeg(
                                 arrayOf(
                                     "-y", "-ss", "0.35",
-                                    "-i", preparedClipFile.absolutePath,
+                                    "-i", rawClipFile.absolutePath,
                                     "-vframes", "1",
                                     rawCover.absolutePath
                                 )
@@ -283,7 +285,7 @@ class VideoRenderEngine @Inject constructor(
                     encodedClip = runCatching {
                         runFfmpeg(
                             createVideoClipSegmentArguments(
-                                clipFile = preparedClipFile,
+                                clipFile = rawClipFile,
                                 overlaySpecs = overlaySpecs,
                                 outputFile = videoSegmentFile,
                                 width = width,
@@ -295,41 +297,22 @@ class VideoRenderEngine @Inject constructor(
                         )
                         videoSegmentFile.exists() && videoSegmentFile.length() > 2048L
                     }.getOrDefault(false)
-                    preparedClipFile.delete()
+                    rawClipFile.delete()
                 }
 
                 if (!encodedClip) {
-                    val imageFile1 = visual.imageFile1?.takeIf { it.exists() && it.length() > 1024L }
-                        ?: resolveSceneImageFile(
-                            renderDirectory = renderDirectory,
-                            tag = "${index + 1}_1",
-                            visualSource = if (visual.clipFile != null) "real_photo" else slab.visual_source,
-                            realQuery = slab.real_photo_query,
-                            scenePrompt = slab.image_prompt,
-                            characterBible = script.character_bible,
-                            visualStyle = script.visual_style,
-                            hasCharacter = slab.has_character,
-                            isShorts = isShorts,
-                            width = width,
-                            height = height,
-                            seed = baseSeed + (index * 37),
-                            usedUrls = ConcurrentHashMap.newKeySet(),
-                            progressUpdate = { msg -> progress(renderProgress.coerceIn(48, 84), msg) },
-                            sceneIndex = index,
-                            slabCount = slabCount
-                        )
-
+                    val imageFile1 = visual.imageFile1 ?: File(renderDirectory, "fallback_${index + 1}.png").also {
+                        createFallbackCinemaFrame(it, width, height, index)
+                    }
                     if (index == 0 && coverBaseImageFile == null) {
                         coverBaseImageFile = File(renderDirectory, "cover_base.png").also {
                             imageFile1.copyTo(it, overwrite = true)
                         }
                     }
 
-                    val layoutMode = slab.layout_mode.lowercase().trim()
-                    val imageFile2 = visual.imageFile2?.takeIf { it.exists() && it.length() > 1024L }
-
-                    if ((layoutMode == "split" || layoutMode == "flip") && imageFile2 != null) {
-                        if (layoutMode == "split") {
+                    val imageFile2 = visual.imageFile2
+                    if ((visual.layoutMode == "split" || visual.layoutMode == "flip") && imageFile2 != null) {
+                        if (visual.layoutMode == "split") {
                             composeSplitFrame(imageFile1, imageFile2, imageFile1, width, height)
                             runFfmpeg(
                                 createVideoOnlySegmentArguments(
@@ -377,7 +360,7 @@ class VideoRenderEngine @Inject constructor(
                 videoSegmentFiles += videoSegmentFile
             }
 
-            progress(85, "Syncing scenes with voiceover…")
+            progress(86, "Syncing scenes with voiceover…")
             val concatList = File(renderDirectory, "segments.txt")
             concatList.writeText(
                 videoSegmentFiles.joinToString(separator = "\n") { file ->
@@ -393,7 +376,7 @@ class VideoRenderEngine @Inject constructor(
                 val extracted = runCatching {
                     runFfmpeg(
                         arrayOf(
-                            "-y", "-ss", "0.35",
+                            "-y", "-ss", "0.5",
                             "-i", silentVideoFile.absolutePath,
                             "-vframes", "1",
                             extractedCover.absolutePath
@@ -404,7 +387,7 @@ class VideoRenderEngine @Inject constructor(
                 if (extracted) coverBaseImageFile = extractedCover
             }
 
-            progress(90, "Polishing studio voice (${voiceTone.label}) & mixing BGM…")
+            progress(90, "Mastering studio voice, auto-ducked BGM & SFX…")
             val sfxTrackFile = synthesizeTimedSfxTrackWav(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
@@ -412,8 +395,8 @@ class VideoRenderEngine @Inject constructor(
                 totalDurationSeconds = exactVideoDuration
             )
 
-            val mixedAudioFile = File(renderDirectory, "mixed_audio.m4a")
-            val finalAudioTrack = mixAudioTrackSafely(
+            val mixedAudioFile = File(renderDirectory, "final_audio.m4a")
+            val finalAudioReady = mixAudioTrackSafely(
                 renderDirectory = renderDirectory,
                 fullVoiceFile = fullVoiceFile,
                 bgmBedFile = bgmBedFile,
@@ -423,25 +406,24 @@ class VideoRenderEngine @Inject constructor(
                 outputFile = mixedAudioFile
             )
 
-            progress(96, "Exporting final HD video…")
-            val exportTitle = script.youtube_title.ifBlank { topic }
-            val finalVideoFile = File(renderDirectory, "rs_movie_spot_final.mp4")
+            progress(94, "Finalizing video file…")
+            val finalFile = File(renderDirectory, "final_video.mp4")
             muxFinalVideo(
                 silentVideoFile = silentVideoFile,
-                mixedAudioFile = finalAudioTrack,
+                mixedAudioFile = finalAudioReady,
                 fallbackVoiceFile = fullVoiceFile,
                 totalDurationSeconds = exactVideoDuration,
-                outputFile = finalVideoFile
+                outputFile = finalFile
             )
 
-            progress(99, "Saving video & cover thumbnail to gallery…")
-            val actionUri = publishToMediaStore(finalVideoFile, exportTitle)
-
-            val thumbnailUri = coverBaseImageFile?.let { baseCover ->
+            progress(97, "Saving video & cover thumbnail…")
+            val exportTitle = script.youtube_title.ifBlank { topic }
+            val actionUri = publishToMediaStore(finalFile, exportTitle)
+            val thumbnailUri = coverBaseImageFile?.let { baseImg ->
                 runCatching {
                     val thumbJpg = File(renderDirectory, "cover_thumb.jpg")
                     renderCoverThumbnailJpg(
-                        baseImageFile = baseCover,
+                        baseImageFile = baseImg,
                         headlineText = exportTitle,
                         isShorts = isShorts,
                         outputFile = thumbJpg
@@ -472,118 +454,94 @@ class VideoRenderEngine @Inject constructor(
         width: Int,
         height: Int,
         baseSeed: Int,
-        progress: (Int, String) -> Unit
+        progressUpdate: (Int, Int) -> Unit
     ): List<PreparedSceneVisual> = coroutineScope {
-        val slabs = script.slabs
-        val slabCount = slabs.size
-        val visualSemaphore = Semaphore(3)
+        val semaphore = Semaphore(3)
+        val total = script.slabs.size
+        val completedCount = AtomicInteger(0)
         val usedRealPhotoUrls = ConcurrentHashMap.newKeySet<String>()
         val usedClipUrls = ConcurrentHashMap.newKeySet<String>()
-        val completedCount = AtomicInteger(0)
 
-        slabs.mapIndexed { index, slab ->
+        script.slabs.mapIndexed { index, slab ->
             async(Dispatchers.IO) {
-                visualSemaphore.withPermit {
+                semaphore.withPermit {
                     val isVideoClip = slab.visual_source.equals("video_clip", ignoreCase = true) ||
                         slab.visual_source.equals("meme_clip", ignoreCase = true)
 
-                    var preparedClip: File? = null
+                    var clipFile: File? = null
                     if (isVideoClip && slab.real_photo_query.isNotBlank()) {
-                        val rawClipFile = File(renderDirectory, "clip_raw_${index + 1}.mp4")
-                        val downloaded = try {
-                            withTimeout(25_000L) {
+                        val rawClip = File(renderDirectory, "clip_raw_${index + 1}.mp4")
+                        val downloaded = withTimeoutOrNull(45_000L) {
+                            runCatching {
                                 videoRepository.downloadInternetVideoClip(
                                     query = slab.real_photo_query,
                                     isMeme = slab.visual_source.equals("meme_clip", ignoreCase = true),
                                     usedUrls = usedClipUrls,
-                                    destinationFile = rawClipFile
+                                    destinationFile = rawClip
                                 )
-                            }
-                        } catch (timeout: TimeoutCancellationException) {
-                            false
-                        } catch (error: Throwable) {
-                            if (error is CancellationException) throw error
-                            false
-                        }
-                        if (downloaded && rawClipFile.exists() && rawClipFile.length() > 2048L) {
-                            preparedClip = rawClipFile
+                            }.getOrDefault(false)
+                        } ?: false
+                        if (downloaded && rawClip.exists() && rawClip.length() > 10_000L) {
+                            clipFile = rawClip
                         } else {
-                            rawClipFile.delete()
+                            rawClip.delete()
                         }
                     }
 
-                    if (preparedClip != null) {
-                        val done = completedCount.incrementAndGet()
-                        val pct = 14 + (done * 34 / slabCount)
-                        progress(pct.coerceIn(14, 48), "Prepared visual $done/$slabCount…")
-                        PreparedSceneVisual(clipFile = preparedClip)
+                    if (clipFile != null) {
+                        progressUpdate(completedCount.incrementAndGet(), total)
+                        return@withPermit PreparedSceneVisual(clipFile = clipFile, layoutMode = "single")
+                    }
+
+                    val layoutMode = slab.layout_mode.lowercase().trim()
+                    val imageFile1 = resolveSceneImageFile(
+                        renderDirectory = renderDirectory,
+                        tag = "${index + 1}_1",
+                        visualSource = if (isVideoClip) "real_photo" else slab.visual_source,
+                        realQuery = slab.real_photo_query,
+                        scenePrompt = slab.image_prompt,
+                        characterBible = script.character_bible,
+                        visualStyle = script.visual_style,
+                        hasCharacter = slab.has_character,
+                        isShorts = isShorts,
+                        width = width,
+                        height = height,
+                        seed = baseSeed + (index * 37),
+                        usedUrls = usedRealPhotoUrls,
+                        sceneIndex = index
+                    )
+
+                    val hasSecondPrompt = slab.image_prompt_2.isNotBlank() ||
+                        (slab.visual_source_2.equals("real_photo", ignoreCase = true) &&
+                            slab.real_photo_query_2.isNotBlank())
+
+                    val imageFile2 = if ((layoutMode == "split" || layoutMode == "flip") && hasSecondPrompt) {
+                        resolveSceneImageFile(
+                            renderDirectory = renderDirectory,
+                            tag = "${index + 1}_2",
+                            visualSource = slab.visual_source_2.ifBlank { "ai_generated" },
+                            realQuery = slab.real_photo_query_2,
+                            scenePrompt = slab.image_prompt_2.ifBlank { slab.image_prompt },
+                            characterBible = script.character_bible,
+                            visualStyle = script.visual_style,
+                            hasCharacter = slab.has_character,
+                            isShorts = isShorts,
+                            width = width,
+                            height = height,
+                            seed = baseSeed + (index * 37) + 19,
+                            usedUrls = usedRealPhotoUrls,
+                            sceneIndex = index
+                        )
                     } else {
-                        val img1 = try {
-                            withTimeout(30_000L) {
-                                resolveSceneImageFile(
-                                    renderDirectory = renderDirectory,
-                                    tag = "${index + 1}_1",
-                                    visualSource = if (isVideoClip) "real_photo" else slab.visual_source,
-                                    realQuery = slab.real_photo_query,
-                                    scenePrompt = slab.image_prompt,
-                                    characterBible = script.character_bible,
-                                    visualStyle = script.visual_style,
-                                    hasCharacter = slab.has_character,
-                                    isShorts = isShorts,
-                                    width = width,
-                                    height = height,
-                                    seed = baseSeed + (index * 37),
-                                    usedUrls = usedRealPhotoUrls,
-                                    progressUpdate = {},
-                                    sceneIndex = index,
-                                    slabCount = slabCount
-                                )
-                            }
-                        } catch (timeout: TimeoutCancellationException) {
-                            File(renderDirectory, "slab_${index + 1}_1.png").also {
-                                createFallbackCinemaFrame(it, width, height, index)
-                            }
-                        }
-
-                        val layoutMode = slab.layout_mode.lowercase().trim()
-                        val hasSecondPrompt = slab.image_prompt_2.isNotBlank() ||
-                            (slab.visual_source_2.equals("real_photo", ignoreCase = true) &&
-                                slab.real_photo_query_2.isNotBlank())
-
-                        val img2 = if ((layoutMode == "split" || layoutMode == "flip") && hasSecondPrompt) {
-                            try {
-                                withTimeout(30_000L) {
-                                    resolveSceneImageFile(
-                                        renderDirectory = renderDirectory,
-                                        tag = "${index + 1}_2",
-                                        visualSource = slab.visual_source_2.ifBlank { "ai_generated" },
-                                        realQuery = slab.real_photo_query_2,
-                                        scenePrompt = slab.image_prompt_2.ifBlank { slab.image_prompt },
-                                        characterBible = script.character_bible,
-                                        visualStyle = script.visual_style,
-                                        hasCharacter = slab.has_character,
-                                        isShorts = isShorts,
-                                        width = width,
-                                        height = height,
-                                        seed = baseSeed + (index * 37) + 19,
-                                        usedUrls = usedRealPhotoUrls,
-                                        progressUpdate = {},
-                                        sceneIndex = index,
-                                        slabCount = slabCount
-                                    )
-                                }
-                            } catch (timeout: TimeoutCancellationException) {
-                                null
-                            }
-                        } else {
-                            null
-                        }
-
-                        val done = completedCount.incrementAndGet()
-                        val pct = 14 + (done * 34 / slabCount)
-                        progress(pct.coerceIn(14, 48), "Generated visual $done/$slabCount…")
-                        PreparedSceneVisual(imageFile1 = img1, imageFile2 = img2)
+                        null
                     }
+
+                    progressUpdate(completedCount.incrementAndGet(), total)
+                    PreparedSceneVisual(
+                        imageFile1 = imageFile1,
+                        imageFile2 = imageFile2,
+                        layoutMode = if (imageFile2 != null) layoutMode else "single"
+                    )
                 }
             }
         }.awaitAll()
@@ -603,24 +561,23 @@ class VideoRenderEngine @Inject constructor(
         height: Int,
         seed: Int,
         usedUrls: MutableSet<String>,
-        progressUpdate: (String) -> Unit,
-        sceneIndex: Int,
-        slabCount: Int
+        sceneIndex: Int
     ): File {
         val imageFile = File(renderDirectory, "slab_$tag.png")
         val wantsRealPhoto = visualSource.equals("real_photo", ignoreCase = true) && realQuery.isNotBlank()
 
         if (wantsRealPhoto) {
-            progressUpdate("Fetching real photo ($realQuery)…")
             val rawRealFile = File(renderDirectory, "real_raw_$tag.img")
-            val downloaded = runCatching {
-                videoRepository.downloadRealPhoto(
-                    query = realQuery,
-                    usedUrls = usedUrls,
-                    destinationFile = rawRealFile,
-                    preferPortrait = isShorts
-                )
-            }.getOrDefault(false)
+            val downloaded = withTimeoutOrNull(25_000L) {
+                runCatching {
+                    videoRepository.downloadRealPhoto(
+                        query = realQuery,
+                        usedUrls = usedUrls,
+                        destinationFile = rawRealFile,
+                        preferPortrait = isShorts
+                    )
+                }.getOrDefault(false)
+            } ?: false
 
             val prepared = if (downloaded) {
                 runCatching {
@@ -634,7 +591,6 @@ class VideoRenderEngine @Inject constructor(
             if (prepared) return imageFile
         }
 
-        progressUpdate("Generating AI scene ${sceneIndex + 1} of $slabCount…")
         val primaryPrompt = buildSceneImagePrompt(
             characterBible = characterBible,
             visualStyle = visualStyle,
@@ -642,43 +598,47 @@ class VideoRenderEngine @Inject constructor(
             hasCharacter = hasCharacter
         )
 
-        val primaryOk = runCatching {
-            videoRepository.generateImageForSlab(
-                prompt = primaryPrompt,
-                isShorts = isShorts,
-                seed = seed
-            ).use { body ->
-                imageFile.outputStream().use { output ->
-                    body.byteStream().use { input -> input.copyTo(output) }
+        val primaryOk = withTimeoutOrNull(45_000L) {
+            runCatching {
+                videoRepository.generateImageForSlab(
+                    prompt = primaryPrompt,
+                    isShorts = isShorts,
+                    seed = seed
+                ).use { body ->
+                    imageFile.outputStream().use { output ->
+                        body.byteStream().use { input -> input.copyTo(output) }
+                    }
                 }
-            }
-            validateImageFile(imageFile, sceneIndex + 1)
-            !isMostlyBlackOrCorrupt(imageFile)
-        }.getOrDefault(false)
+                validateImageFile(imageFile, sceneIndex + 1)
+                !isMostlyBlackOrCorrupt(imageFile)
+            }.getOrDefault(false)
+        } ?: false
 
         if (primaryOk) return imageFile
 
-        val retryOk = runCatching {
-            val is3dAnimated = listOf("3d", "pixar", "disney", "cartoon", "anime").any {
-                scenePrompt.contains(it, ignoreCase = true) || visualStyle.contains(it, ignoreCase = true)
-            }
-            val safePrompt = if (is3dAnimated) {
-                "3D Pixar Disney cartoon animation, vibrant sunny storybook forest meadow with glowing flowers and soft sunlight"
-            } else {
-                "dramatic packed Indian cinema theater, warm golden spotlights, action hero silhouette, bright colorful atmospheric lighting"
-            }
-            videoRepository.generateImageForSlab(
-                prompt = safePrompt,
-                isShorts = isShorts,
-                seed = seed + 101
-            ).use { body ->
-                imageFile.outputStream().use { output ->
-                    body.byteStream().use { input -> input.copyTo(output) }
+        val retryOk = withTimeoutOrNull(45_000L) {
+            runCatching {
+                val is3dAnimated = listOf("3d", "pixar", "disney", "cartoon", "anime").any {
+                    scenePrompt.contains(it, ignoreCase = true) || visualStyle.contains(it, ignoreCase = true)
                 }
-            }
-            validateImageFile(imageFile, sceneIndex + 1)
-            !isMostlyBlackOrCorrupt(imageFile)
-        }.getOrDefault(false)
+                val safePrompt = if (is3dAnimated) {
+                    "3D Pixar Disney cartoon animation, vibrant sunny storybook forest meadow with glowing flowers and soft sunlight"
+                } else {
+                    "dramatic packed cinema auditorium, warm golden spotlights, heroic silhouette on screen, atmospheric lighting, no text"
+                }
+                videoRepository.generateImageForSlab(
+                    prompt = safePrompt,
+                    isShorts = isShorts,
+                    seed = seed + 101
+                ).use { body ->
+                    imageFile.outputStream().use { output ->
+                        body.byteStream().use { input -> input.copyTo(output) }
+                    }
+                }
+                validateImageFile(imageFile, sceneIndex + 1)
+                !isMostlyBlackOrCorrupt(imageFile)
+            }.getOrDefault(false)
+        } ?: false
 
         if (!retryOk) {
             createFallbackCinemaFrame(imageFile, width, height, sceneIndex)
@@ -892,11 +852,16 @@ class VideoRenderEngine @Inject constructor(
             }
             val st = String.format(Locale.US, "%.2f", chunk.startSeconds)
             val en = String.format(Locale.US, "%.2f", chunk.endSeconds)
+            val expr = if (chunk.isLastChunk) {
+                "gte(t,$st)"
+            } else {
+                "gte(t,$st)*lt(t,$en)"
+            }
             specs += OverlaySpec(
                 file = chunk.file,
                 xExpr = "0",
                 yExpr = overlayY.toString(),
-                enableExpr = "between(t,$st,$en)"
+                enableExpr = expr
             )
         }
 
@@ -1104,97 +1069,102 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
+    private fun isRequestedFemaleVoice(voiceName: String): Boolean {
+        val lower = voiceName.lowercase(Locale.US)
+        return listOf(
+            "swara", "neerja", "ava", "aarohi", "dhwani", "tanishaa",
+            "pallavi", "shruti", "sapna", "sobhana", "vaani", "gul",
+            "elvira", "denise", "nanami", "zariyah", "female"
+        ).any { lower.contains(it) }
+    }
+
     private suspend fun synthesizeAndTrimVoiceClips(
         renderDirectory: File,
         slabs: List<VideoSlab>,
         voiceName: String,
         voiceTone: VoiceTone,
-        progress: (Int, String) -> Unit
+        progressUpdate: (Int, Int) -> Unit
     ): List<File> = coroutineScope {
         val semaphore = Semaphore(2)
-        val total = slabs.size.coerceAtLeast(1)
-        val recordedCount = AtomicInteger(0)
+        val total = slabs.size
+        val doneCounter = AtomicInteger(0)
 
-        val rawFiles = slabs.mapIndexed { index, slab ->
+        val rawClips = slabs.mapIndexed { index, slab ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     val rawMp3 = File(renderDirectory, "raw_voice_${index + 1}.mp3")
-                    val bytes = try {
-                        withTimeout(30_000L) {
-                            videoRepository.generateDynamicVoiceClip(
-                                text = slab.voiceover_text,
-                                voiceName = voiceName,
-                                emotion = slab.voice_emotion,
-                                voiceTone = voiceTone
-                            )
-                        }
-                    } catch (timeout: TimeoutCancellationException) {
-                        throw IOException("Voice recording timed out on scene ${index + 1}.")
-                    }
-                    rawMp3.writeBytes(bytes)
+                    val clipResult = withTimeoutOrNull(40_000L) {
+                        videoRepository.generateDynamicVoiceClipWithMeta(
+                            text = slab.voiceover_text,
+                            voiceName = voiceName,
+                            emotion = slab.voice_emotion,
+                            voiceTone = voiceTone
+                        )
+                    } ?: throw IOException("Voice generation timed out for scene ${index + 1}.")
+
+                    rawMp3.writeBytes(clipResult.audioBytes)
                     if (!rawMp3.exists() || rawMp3.length() == 0L) {
                         throw IOException("Voice generation returned empty audio for scene ${index + 1}.")
                     }
-                    val done = recordedCount.incrementAndGet()
-                    val pct = 7 + (done * 4 / total)
-                    progress(pct.coerceIn(7, 11), "Recording voice $done/$total…")
-                    rawMp3
+                    progressUpdate(doneCounter.incrementAndGet(), total)
+                    rawMp3 to clipResult.usedFallback
                 }
             }
         }.awaitAll()
 
-        val toneTempo = when (voiceTone) {
-            VoiceTone.FUNNY -> "1.10"
-            VoiceTone.ENERGETIC -> "1.11"
-            VoiceTone.SERIOUS -> "1.04"
-            VoiceTone.NATURAL, VoiceTone.AUTO -> "1.07"
+        val wantsMaleVoice = !isRequestedFemaleVoice(voiceName)
+        val neuralTempo = when (voiceTone.name.uppercase()) {
+            "FUNNY", "COMIC", "ENERGETIC", "HYPE" -> "1.10"
+            "SERIOUS", "INTENSE" -> "1.05"
+            else -> "1.08"
         }
 
         val wavFiles = mutableListOf<File>()
-        rawFiles.forEachIndexed { index, rawMp3 ->
-            val trimPct = 11 + ((index + 1) * 2 / total)
-            progress(trimPct.coerceIn(11, 13), "Preparing voice ${index + 1}/$total…")
-
+        rawClips.forEachIndexed { index, (rawMp3, usedFallback) ->
             val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
-            val isLast = index == rawFiles.lastIndex
-            val microBreath = if (isLast) 0.02 else 0.04
+            val isLast = index == rawClips.lastIndex
+            val microBreath = if (isLast) 0.02 else 0.03
+
+            val tempoAndPitchFilter = when {
+                usedFallback && wantsMaleVoice ->
+                    "aresample=44100,asetrate=37485,aresample=44100,atempo=1.42,"
+                usedFallback ->
+                    "aresample=44100,atempo=1.24,"
+                else ->
+                    "atempo=$neuralTempo,"
+            }
 
             val trimmedOk = runCatching {
-                withTimeout(20_000L) {
-                    runFfmpeg(
-                        arrayOf(
-                            "-y",
-                            "-i", rawMp3.absolutePath,
-                            "-af",
+                runFfmpeg(
+                    arrayOf(
+                        "-y",
+                        "-i", rawMp3.absolutePath,
+                        "-af",
+                        tempoAndPitchFilter +
                             "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
-                                "areverse," +
-                                "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
-                                "areverse," +
-                                "atempo=$toneTempo," +
-                                "apad=pad_dur=$microBreath",
-                            "-ar", "44100",
-                            "-ac", "1",
-                            "-c:a", "pcm_s16le",
-                            trimmedWav.absolutePath
-                        )
+                            "areverse," +
+                            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
+                            "areverse," +
+                            "apad=pad_dur=$microBreath",
+                        "-ar", "44100",
+                        "-ac", "1",
+                        "-c:a", "pcm_s16le",
+                        trimmedWav.absolutePath
                     )
-                }
+                )
             }.isSuccess
 
             if (!trimmedOk || !trimmedWav.exists() || trimmedWav.length() <= 44L) {
-                withTimeout(20_000L) {
-                    runFfmpeg(
-                        arrayOf(
-                            "-y",
-                            "-i", rawMp3.absolutePath,
-                            "-af", "atempo=$toneTempo,apad=pad_dur=$microBreath",
-                            "-ar", "44100",
-                            "-ac", "1",
-                            "-c:a", "pcm_s16le",
-                            trimmedWav.absolutePath
-                        )
+                runFfmpeg(
+                    arrayOf(
+                        "-y",
+                        "-i", rawMp3.absolutePath,
+                        "-ar", "44100",
+                        "-ac", "1",
+                        "-c:a", "pcm_s16le",
+                        trimmedWav.absolutePath
                     )
-                }
+                )
             }
             wavFiles += trimmedWav
         }
@@ -1228,10 +1198,11 @@ class VideoRenderEngine @Inject constructor(
         chunksText.forEachIndexed { chunkIdx, chunkText ->
             val chunkDur = (weights[chunkIdx] / totalWeight) * sceneDurationSeconds
             val startTime = cursorTime
-            val endTime = if (chunkIdx == chunksText.lastIndex) {
+            val isLast = chunkIdx == chunksText.lastIndex
+            val endTime = if (isLast) {
                 sceneDurationSeconds + 0.05
             } else {
-                cursorTime + chunkDur
+                (cursorTime + chunkDur).coerceAtLeast(startTime + 0.05)
             }
             cursorTime += chunkDur
 
@@ -1247,7 +1218,8 @@ class VideoRenderEngine @Inject constructor(
                     file = pngFile,
                     stripHeight = stripHeight,
                     startSeconds = startTime,
-                    endSeconds = endTime
+                    endSeconds = endTime,
+                    isLastChunk = isLast
                 )
             }
         }
@@ -1395,11 +1367,15 @@ class VideoRenderEngine @Inject constructor(
         raw
             .replace(
                 Regex(
-                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay|stat badge|youtube shorts?|video_clip|meme_clip|split layout|act as|collage|photo grid|grid of|panels)\\b",
+                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay|stat badge|youtube shorts?|video_clip|meme_clip|split layout|act as|collage|photo grid|grid of|panels|neon sign|cinema marquee|billboard|signboard|marquee|logo|rs movie spot)\\b",
                     RegexOption.IGNORE_CASE
                 ),
                 ""
             )
+            .replace(Regex("\\bsecret wars\\b", RegexOption.IGNORE_CASE), "shattered cosmic multiverse battlefield")
+            .replace(Regex("\\bdoctor doom\\b", RegexOption.IGNORE_CASE), "armored ruler in dark emerald cloak and brushed steel mask")
+            .replace(Regex("\\bavengers\\s+doomsday\\b", RegexOption.IGNORE_CASE), "epic dark sci-fi superhero ensemble confrontation")
+            .replace(Regex("\\bholding (?:a )?microphone\\b|\\bmic in hand\\b", RegexOption.IGNORE_CASE), "seated cleanly behind desk boom condenser mic, hands relaxed out of frame")
             .replace(Regex("\\banimal\\s+(?:movie|film|teaser|trailer)\\b", RegexOption.IGNORE_CASE), "intense Bollywood action film")
             .replace(Regex("\\bspirit\\s+(?:movie|film|teaser|trailer)\\b", RegexOption.IGNORE_CASE), "fierce police thriller")
             .replace(Regex("\\bdark violence\\b|\\bbrutal violence\\b|\\bviolence\\b", RegexOption.IGNORE_CASE), "dramatic action confrontation in moody lighting")
@@ -1916,6 +1892,57 @@ class VideoRenderEngine @Inject constructor(
         return samples
     }
 
+    private fun buildStudioVoiceFilter(voiceTone: VoiceTone): String =
+        when (voiceTone.name.uppercase()) {
+            "NATURAL", "PODCAST", "HUMAN" ->
+                "highpass=f=60," +
+                    "equalizer=f=110:t=q:w=0.9:g=6.5," +
+                    "equalizer=f=210:t=q:w=1.1:g=3.2," +
+                    "equalizer=f=480:t=q:w=1.5:g=-2.6," +
+                    "equalizer=f=3100:t=q:w=1.3:g=2.6," +
+                    "highshelf=f=6800:g=-3.0," +
+                    "aecho=0.85:0.88:18:0.12," +
+                    "acompressor=threshold=-20dB:ratio=3.0:attack=6:release=75," +
+                    "alimiter=limit=0.95," +
+                    "volume=1.16"
+
+            "SERIOUS", "INTENSE" ->
+                "highpass=f=55," +
+                    "equalizer=f=95:t=q:w=0.85:g=7.0," +
+                    "equalizer=f=190:t=q:w=1.1:g=3.4," +
+                    "equalizer=f=460:t=q:w=1.5:g=-2.5," +
+                    "equalizer=f=2800:t=q:w=1.3:g=2.2," +
+                    "highshelf=f=6800:g=-3.2," +
+                    "aecho=0.84:0.86:24:0.14," +
+                    "acompressor=threshold=-20dB:ratio=3.2:attack=5:release=90," +
+                    "alimiter=limit=0.95," +
+                    "volume=1.16"
+
+            "FUNNY", "COMIC", "ENERGETIC", "HYPE" ->
+                "highpass=f=70," +
+                    "equalizer=f=120:t=q:w=0.95:g=5.2," +
+                    "equalizer=f=220:t=q:w=1.1:g=2.5," +
+                    "equalizer=f=490:t=q:w=1.5:g=-2.8," +
+                    "equalizer=f=3400:t=q:w=1.25:g=3.2," +
+                    "highshelf=f=7000:g=-2.6," +
+                    "aecho=0.86:0.88:14:0.09," +
+                    "acompressor=threshold=-19dB:ratio=2.8:attack=5:release=65," +
+                    "alimiter=limit=0.95," +
+                    "volume=1.18"
+
+            else ->
+                "highpass=f=60," +
+                    "equalizer=f=110:t=q:w=0.9:g=6.0," +
+                    "equalizer=f=210:t=q:w=1.1:g=3.0," +
+                    "equalizer=f=480:t=q:w=1.5:g=-2.4," +
+                    "equalizer=f=3100:t=q:w=1.3:g=2.4," +
+                    "highshelf=f=6800:g=-2.8," +
+                    "aecho=0.85:0.88:17:0.11," +
+                    "acompressor=threshold=-20dB:ratio=2.9:attack=6:release=75," +
+                    "alimiter=limit=0.95," +
+                    "volume=1.15"
+        }
+
     private suspend fun mixAudioTrackSafely(
         renderDirectory: File,
         fullVoiceFile: File,
@@ -1927,64 +1954,14 @@ class VideoRenderEngine @Inject constructor(
     ): File? {
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
 
-        // 1) Tone-Matched Studio Human Voice Mastering Chain (mic warmth, de-hiss, booth air, dynaudnorm)
-        val studioVoiceFilter = when (voiceTone) {
-            VoiceTone.SERIOUS ->
-                "highpass=f=55," +
-                    "equalizer=f=95:t=q:w=0.85:g=6.8," +
-                    "equalizer=f=185:t=q:w=1.1:g=3.5," +
-                    "equalizer=f=440:t=q:w=1.5:g=-2.0," +
-                    "equalizer=f=2800:t=q:w=1.4:g=1.4," +
-                    "highshelf=f=6500:g=-3.0," +
-                    "aecho=0.8:0.9:16:0.07," +
-                    "acompressor=threshold=-18dB:ratio=2.6:attack=8:release=95," +
-                    "dynaudnorm=f=150:g=11:p=0.92:m=6," +
-                    "volume=1.08"
-
-            VoiceTone.FUNNY ->
-                "highpass=f=65," +
-                    "equalizer=f=110:t=q:w=0.85:g=4.8," +
-                    "equalizer=f=210:t=q:w=1.1:g=2.4," +
-                    "equalizer=f=450:t=q:w=1.5:g=-1.8," +
-                    "equalizer=f=3200:t=q:w=1.35:g=2.6," +
-                    "highshelf=f=6800:g=-2.2," +
-                    "aecho=0.8:0.9:12:0.05," +
-                    "acompressor=threshold=-17dB:ratio=2.3:attack=6:release=75," +
-                    "dynaudnorm=f=140:g=11:p=0.92:m=6," +
-                    "volume=1.08"
-
-            VoiceTone.ENERGETIC ->
-                "highpass=f=60," +
-                    "equalizer=f=105:t=q:w=0.85:g=5.4," +
-                    "equalizer=f=200:t=q:w=1.1:g=2.8," +
-                    "equalizer=f=450:t=q:w=1.5:g=-1.6," +
-                    "equalizer=f=3100:t=q:w=1.35:g=2.4," +
-                    "highshelf=f=6800:g=-2.4," +
-                    "aecho=0.8:0.9:12:0.05," +
-                    "acompressor=threshold=-17dB:ratio=2.5:attack=6:release=75," +
-                    "dynaudnorm=f=140:g=11:p=0.92:m=6," +
-                    "volume=1.10"
-
-            VoiceTone.NATURAL, VoiceTone.AUTO ->
-                "highpass=f=55," +
-                    "equalizer=f=105:t=q:w=0.85:g=6.0," +
-                    "equalizer=f=195:t=q:w=1.1:g=3.2," +
-                    "equalizer=f=450:t=q:w=1.5:g=-1.6," +
-                    "equalizer=f=2950:t=q:w=1.4:g=1.8," +
-                    "highshelf=f=6500:g=-2.8," +
-                    "aecho=0.8:0.9:14:0.06," +
-                    "acompressor=threshold=-18dB:ratio=2.4:attack=8:release=85," +
-                    "dynaudnorm=f=150:g=11:p=0.92:m=6," +
-                    "volume=1.08"
-        }
-
+        // 1) Studio Condenser Polish (Warm Proximity Bass, De-Box, Presence, Room Air, Compression)
         val eqVoiceFile = File(renderDirectory, "voice_eq.wav")
         var eqOk = runCatching {
             runFfmpeg(
                 arrayOf(
                     "-y",
                     "-i", fullVoiceFile.absolutePath,
-                    "-af", studioVoiceFilter,
+                    "-af", buildStudioVoiceFilter(voiceTone),
                     "-ar", "44100",
                     "-ac", "1",
                     "-c:a", "pcm_s16le",
@@ -2000,11 +1977,13 @@ class VideoRenderEngine @Inject constructor(
                         "-y",
                         "-i", fullVoiceFile.absolutePath,
                         "-af",
-                        "highpass=f=55," +
-                            "equalizer=f=105:t=q:w=0.85:g=5.8," +
-                            "equalizer=f=450:t=q:w=1.5:g=-1.5," +
-                            "acompressor=threshold=-18dB:ratio=2.4:attack=8:release=85," +
-                            "volume=1.08",
+                        "highpass=f=60," +
+                            "equalizer=f=110:t=q:w=0.9:g=6.0," +
+                            "equalizer=f=210:t=q:w=1.1:g=3.0," +
+                            "equalizer=f=480:t=q:w=1.5:g=-2.4," +
+                            "equalizer=f=3100:t=q:w=1.3:g=2.4," +
+                            "acompressor=threshold=-20dB:ratio=2.8:attack=6:release=75," +
+                            "volume=1.12",
                         "-ar", "44100",
                         "-ac", "1",
                         "-c:a", "pcm_s16le",
@@ -2053,9 +2032,9 @@ class VideoRenderEngine @Inject constructor(
             val sfxSamples = sfxTrackFile?.let { readMono16BitWavSamples(it) } ?: ShortArray(0)
             val totalSamples = (totalDurationSeconds * 44100.0).roundToInt().coerceAtLeast(44100)
 
-            val windowSize = 1102 // ~25ms at 44100Hz
+            val windowSize = 1102
             val bgmGains = DoubleArray(totalSamples)
-            var smoothedGain = 0.16
+            var smoothedGain = 0.14
             var cursor = 0
             while (cursor < totalSamples) {
                 val end = minOf(cursor + windowSize, totalSamples)
@@ -2067,7 +2046,7 @@ class VideoRenderEngine @Inject constructor(
                     count++
                 }
                 val rms = if (count > 0) sqrt(sumSq / count) else 0.0
-                val targetGain = if (rms > 0.024) 0.085 else 0.26
+                val targetGain = if (rms > 0.022) 0.075 else 0.24
                 for (k in cursor until end) {
                     smoothedGain += (targetGain - smoothedGain) * 0.0022
                     bgmGains[k] = smoothedGain
@@ -2082,7 +2061,7 @@ class VideoRenderEngine @Inject constructor(
                 } else {
                     0.0
                 }
-                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.35 else 0.0
+                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.34 else 0.0
                 (v + b + s).coerceIn(-0.96, 0.96)
             }
             mixedWavFile.exists() && mixedWavFile.length() > 44L
@@ -2327,7 +2306,7 @@ class VideoRenderEngine @Inject constructor(
         val edgeFades = buildEdgeFades(sceneIndex, totalScenes, safeFrames)
 
         val safeCrop =
-            "crop='if(gt(iw,ih),trunc(iw*0.92/2)*2,trunc(iw*0.96/2)*2)':'if(gt(iw,ih),trunc(ih*0.88/2)*2,trunc(ih*0.94/2)*2)':'iw*0.02':'ih*0.02'"
+            "crop='if(gt(iw,ih),trunc(iw*0.84/2)*2,trunc(iw*0.88/2)*2)':'if(gt(iw,ih),trunc(ih*0.76/2)*2,trunc(ih*0.84/2)*2)':'iw*0.04':'ih*0.04'"
 
         val args = mutableListOf("-y", "-stream_loop", "-1", "-i", clipFile.absolutePath)
         val filterBuilder = StringBuilder(
