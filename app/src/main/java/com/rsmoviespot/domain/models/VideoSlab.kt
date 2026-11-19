@@ -13,6 +13,32 @@ enum class VoiceGender(val label: String) {
     FEMALE("Female")
 }
 
+enum class VoiceTone(
+    val label: String,
+    val promptInstruction: String
+) {
+    AUTO(
+        label = "Auto (Smart)",
+        promptInstruction = ""
+    ),
+    NATURAL(
+        label = "Podcast / Human",
+        promptInstruction = "VOICE TONE — REAL HUMAN PODCASTER: Write natural conversational spoken narration like a charismatic friend talking into a studio mic, using expressive pauses ('...'), natural phrasing, and warm human flow — never sound like a stiff newsreader."
+    ),
+    FUNNY(
+        label = "Funny / Comic",
+        promptInstruction = "VOICE TONE — FUNNY / COMIC ROAST: Write witty, humorous, playful storytelling with clever punchlines, lighthearted sarcasm, funny reactions ('!'), and snappy comic-timing pauses ('...')."
+    ),
+    SERIOUS(
+        label = "Serious / Intense",
+        promptInstruction = "VOICE TONE — SERIOUS / CINEMATIC THRILLER: Write gripping, intense, dramatic storytelling with high stakes, emotional weight, and suspenseful pauses ('...')."
+    ),
+    ENERGETIC(
+        label = "Energetic / Hype",
+        promptInstruction = "VOICE TONE — HIGH-ENERGY HYPE: Write fast, electrifying YouTube storyteller lines with bold exclamations ('!') and unstoppable momentum."
+    )
+}
+
 enum class VideoLanguage(
     val label: String,
     val languageInstruction: String,
