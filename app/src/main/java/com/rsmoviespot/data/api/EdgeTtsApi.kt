@@ -2,9 +2,7 @@ package com.rsmoviespot.data.api
 
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
-import io.github.whitemagic2014.tts.TTS
-import io.github.whitemagic2014.tts.TTSVoice
-import io.github.whitemagic2014.tts.bean.Voice
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
@@ -15,16 +13,26 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
-import java.util.concurrent.Callable
-import java.util.concurrent.Executors
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -33,27 +41,29 @@ data class EdgeTtsSynthesisResult(
     val vttContent: String?
 )
 
+data class EdgeTtsClipResult(
+    val audioBytes: ByteArray,
+    val usedFallback: Boolean
+)
+
 @Singleton
 class EdgeTtsApi @Inject constructor(
     private val okHttpClient: OkHttpClient,
     @ApplicationContext private val context: Context
 ) {
-    private val edgeConcurrencyGate = Semaphore(2)
-    private val edgeExecutor = Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "edge-tts-worker").apply { isDaemon = true }
-    }
-    private val consecutiveEdgeFailures = AtomicInteger(0)
-
-    @Volatile
-    private var edgeCooldownUntilMs: Long = 0L
-
     private val ttsHttpClient: OkHttpClient by lazy {
         okHttpClient.newBuilder()
-            .connectTimeout(15, TimeUnit.SECONDS)
+            .connectTimeout(12, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
             .callTimeout(25, TimeUnit.SECONDS)
             .build()
     }
+
+    private val edgeConcurrencyGate = Semaphore(2)
+    private val consecutiveEdgeFailures = AtomicInteger(0)
+    private val edgeDisabledUntilMs = AtomicLong(0L)
+    private val clockSkewSeconds = AtomicLong(0L)
 
     suspend fun synthesize(request: EdgeTtsRequest): ResponseBody {
         val result = synthesizeWithSubtitles(request.text, request.voice)
@@ -65,27 +75,64 @@ class EdgeTtsApi @Inject constructor(
         voice: String,
         rate: String = DEFAULT_VOICE_RATE,
         pitch: String = DEFAULT_VOICE_PITCH
-    ): ByteArray = withContext(Dispatchers.IO) {
+    ): ByteArray = synthesizeSpeechClipWithMeta(
+        text = text,
+        voice = voice,
+        rate = rate,
+        pitch = pitch
+    ).audioBytes
+
+    suspend fun synthesizeSpeechClipWithMeta(
+        text: String,
+        voice: String,
+        rate: String = DEFAULT_VOICE_RATE,
+        pitch: String = DEFAULT_VOICE_PITCH
+    ): EdgeTtsClipResult = withContext(Dispatchers.IO) {
         val cleanText = text.trim()
         require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
 
-        val edgeResult = tryEdgeWithCircuitBreaker(
-            text = cleanText,
-            voice = voice,
-            rate = rate,
-            pitch = pitch,
-            withVtt = false
-        )
+        val safeRate = clampSafeRate(rate)
+        val safePitch = sanitizeSafePitch(pitch)
+        val targetVoice = resolveEdgeVoiceShortName(voice)
 
-        if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
-            return@withContext edgeResult.audioBytes
+        if (System.currentTimeMillis() >= edgeDisabledUntilMs.get()) {
+            val edgeBytes = try {
+                edgeConcurrencyGate.withPermit {
+                    synthesizeViaDirectEdgeWebSocketWithRetry(
+                        text = cleanText,
+                        voiceName = targetVoice,
+                        rate = safeRate,
+                        pitch = safePitch
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                null
+            }
+
+            if (edgeBytes != null && edgeBytes.isNotEmpty()) {
+                consecutiveEdgeFailures.set(0)
+                return@withContext EdgeTtsClipResult(
+                    audioBytes = edgeBytes,
+                    usedFallback = false
+                )
+            }
+
+            val failures = consecutiveEdgeFailures.incrementAndGet()
+            if (failures >= 3) {
+                edgeDisabledUntilMs.set(System.currentTimeMillis() + EDGE_COOLDOWN_MS)
+            }
         }
 
-        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, voice)
+        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, targetVoice)
         if (fallbackBytes.isEmpty()) {
             throw IOException("TTS produced empty audio output.")
         }
-        fallbackBytes
+        EdgeTtsClipResult(
+            audioBytes = fallbackBytes,
+            usedFallback = true
+        )
     }
 
     suspend fun synthesizeWithSubtitles(
@@ -94,204 +141,234 @@ class EdgeTtsApi @Inject constructor(
         rate: String = DEFAULT_VOICE_RATE,
         pitch: String = DEFAULT_VOICE_PITCH
     ): EdgeTtsSynthesisResult = withContext(Dispatchers.IO) {
-        val cleanText = text.trim()
-        require(cleanText.isNotEmpty()) { "Voiceover text must not be blank." }
-
-        val edgeResult = tryEdgeWithCircuitBreaker(
-            text = cleanText,
+        val clip = synthesizeSpeechClipWithMeta(
+            text = text,
             voice = voice,
             rate = rate,
-            pitch = pitch,
-            withVtt = true
+            pitch = pitch
         )
-
-        if (edgeResult != null && edgeResult.audioBytes.isNotEmpty()) {
-            return@withContext edgeResult
-        }
-
-        val fallbackBytes = synthesizeWithGoogleFallback(cleanText, voice)
-        if (fallbackBytes.isEmpty()) {
-            throw IOException("TTS produced empty audio output.")
-        }
-
         EdgeTtsSynthesisResult(
-            audioBytes = fallbackBytes,
+            audioBytes = clip.audioBytes,
             vttContent = null
         )
     }
 
-    private suspend fun tryEdgeWithCircuitBreaker(
-        text: String,
-        voice: String,
-        rate: String,
-        pitch: String,
-        withVtt: Boolean
-    ): EdgeTtsSynthesisResult? {
-        if (System.currentTimeMillis() < edgeCooldownUntilMs) {
-            return null
-        }
-
-        return edgeConcurrencyGate.withPermit {
-            if (System.currentTimeMillis() < edgeCooldownUntilMs) {
-                return@withPermit null
-            }
-
-            val result = runEdgeNeuralWithTimeout(
-                text = text,
-                voiceName = voice,
-                rate = rate,
-                pitch = pitch,
-                withVtt = withVtt
-            )
-
-            if (result != null && result.audioBytes.isNotEmpty()) {
-                consecutiveEdgeFailures.set(0)
-                result
-            } else {
-                if (consecutiveEdgeFailures.incrementAndGet() >= 2) {
-                    edgeCooldownUntilMs = System.currentTimeMillis() + EDGE_COOLDOWN_MS
-                }
-                null
-            }
-        }
-    }
-
-    private fun runEdgeNeuralWithTimeout(
+    private fun synthesizeViaDirectEdgeWebSocketWithRetry(
         text: String,
         voiceName: String,
         rate: String,
-        pitch: String,
-        withVtt: Boolean
-    ): EdgeTtsSynthesisResult? {
-        val future = edgeExecutor.submit(
-            Callable {
-                synthesizeWithEdgeNeural(
+        pitch: String
+    ): ByteArray {
+        var lastError: Throwable? = null
+        repeat(2) { attempt ->
+            try {
+                return executeEdgeWebSocket(
                     text = text,
                     voiceName = voiceName,
                     rate = rate,
-                    pitch = pitch,
-                    withVtt = withVtt
+                    pitch = pitch
                 )
+            } catch (err: Throwable) {
+                lastError = err
+                if (attempt == 0 && err.message?.contains("403") == true) {
+                    syncClockSkewFromBing()
+                }
             }
-        )
-        return try {
-            future.get(EDGE_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        } catch (_: Throwable) {
-            future.cancel(true)
-            null
         }
+        throw lastError ?: IOException("Edge TTS WebSocket synthesis failed.")
     }
 
-    private fun clampSafeRate(rawRate: String): String {
-        val parsed = rawRate.trim().removeSuffix("%").toIntOrNull() ?: return DEFAULT_VOICE_RATE
-        val safe = parsed.coerceIn(-25, 30)
-        return if (safe >= 0) "+$safe%" else "$safe%"
-    }
-
-    private fun sanitizeSafePitch(rawPitch: String): String {
-        val trimmed = rawPitch.trim()
-        return if (trimmed in setOf("", "0Hz", "+0Hz", "-0Hz")) "+1Hz" else trimmed
-    }
-
-    private fun synthesizeWithEdgeNeural(
+    private fun executeEdgeWebSocket(
         text: String,
         voiceName: String,
         rate: String,
-        pitch: String,
-        withVtt: Boolean
-    ): EdgeTtsSynthesisResult {
-        val voice = findEdgeVoice(voiceName)
-            ?: throw IOException("Edge Neural voice not found: $voiceName")
+        pitch: String
+    ): ByteArray {
+        val connectionId = UUID.randomUUID().toString().replace("-", "")
+        val requestId = UUID.randomUUID().toString().replace("-", "")
+        val secMsGec = generateSecMsGec(clockSkewSeconds.get())
 
-        val safeRate = clampSafeRate(rate)
-        val safePitch = sanitizeSafePitch(pitch)
+        val wsUrl = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+            .toHttpUrl()
+            .newBuilder()
+            .addQueryParameter("TrustedClientToken", TRUSTED_CLIENT_TOKEN)
+            .addQueryParameter("Sec-MS-GEC", secMsGec)
+            .addQueryParameter("Sec-MS-GEC-Version", SEC_MS_GEC_VERSION)
+            .addQueryParameter("ConnectionId", connectionId)
+            .build()
+            .toString()
+            .replaceFirst("https://", "wss://")
 
-        val tempDir = File(context.cacheDir, "edge-tts-${UUID.randomUUID()}")
-        if (!tempDir.exists() && !tempDir.mkdirs()) {
-            throw IOException("Could not create Edge TTS temp directory.")
-        }
+        val request = Request.Builder()
+            .url(wsUrl)
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache")
+            .header("Origin", EDGE_ORIGIN)
+            .header("User-Agent", EDGE_USER_AGENT)
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .build()
 
-        try {
-            val fileBaseName = "voice"
-            val builder = TTS(voice, text)
-                .findHeadHook()
-                .storage(tempDir.absolutePath)
-                .fileName(fileBaseName)
-                .overwrite(true)
-                .voiceRate(safeRate)
-                .voicePitch(safePitch)
+        val future = CompletableFuture<ByteArray>()
+        val audioStream = ByteArrayOutputStream(32768)
+        val finished = AtomicBoolean(false)
 
-            if (withVtt) {
-                builder.enableVttFile()
-            }
+        val locale = voiceName.split('-').take(2).joinToString("-").ifBlank { "en-US" }
+        val escapedText = escapeXml(text)
+        val timestamp = edgeTimestamp()
 
-            val resultName = builder
-                .formatMp3()
-                .trans()
+        val speechConfigMsg = "X-Timestamp:$timestamp\r\n" +
+            "Content-Type:application/json; charset=utf-8\r\n" +
+            "Path:speech.config\r\n\r\n" +
+            """{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}"""
 
-            val directFile = resultName?.takeIf { it.isNotBlank() }?.let { name ->
-                val candidate = File(name)
-                when {
-                    candidate.isAbsolute && candidate.exists() -> candidate
-                    File(tempDir, name).exists() -> File(tempDir, name)
-                    File(tempDir, "$name.mp3").exists() -> File(tempDir, "$name.mp3")
-                    else -> null
+        val ssmlBody = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='$locale'>" +
+            "<voice name='$voiceName'>" +
+            "<prosody pitch='$pitch' rate='$rate' volume='+0%'>$escapedText</prosody>" +
+            "</voice></speak>"
+
+        val ssmlMsg = "X-RequestId:$requestId\r\n" +
+            "Content-Type:application/ssml+xml\r\n" +
+            "X-Timestamp:$timestamp\r\n" +
+            "Path:ssml\r\n\r\n$ssmlBody"
+
+        val socket = ttsHttpClient.newWebSocket(
+            request,
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send(speechConfigMsg)
+                    webSocket.send(ssmlMsg)
                 }
-            }
 
-            val outputFile = directFile
-                ?: File(tempDir, "$fileBaseName.mp3").takeIf { it.exists() }
-                ?: tempDir.listFiles()?.firstOrNull {
-                    it.isFile && it.length() > 0L && !it.extension.equals("vtt", ignoreCase = true)
-                }
-                ?: throw IOException("Edge TTS output file was not created.")
-
-            val bytes = outputFile.readBytes()
-            if (bytes.isEmpty()) {
-                throw IOException("Edge TTS output file is empty.")
-            }
-
-            val vttText = if (withVtt) {
-                val vttFile = File(tempDir, "${outputFile.nameWithoutExtension}.vtt").takeIf { it.exists() }
-                    ?: File(tempDir, "$fileBaseName.vtt").takeIf { it.exists() }
-                    ?: tempDir.listFiles()?.firstOrNull {
-                        it.isFile && it.extension.equals("vtt", ignoreCase = true) && it.length() > 0L
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    val arr = bytes.toByteArray()
+                    if (arr.size < 2) return
+                    val headerLen = ((arr[0].toInt() and 0xFF) shl 8) or (arr[1].toInt() and 0xFF)
+                    val dataOffset = 2 + headerLen
+                    if (headerLen > 0 && dataOffset <= arr.size) {
+                        val header = String(arr, 2, headerLen, Charsets.US_ASCII)
+                        if (header.contains("Path:audio", ignoreCase = true) && dataOffset < arr.size) {
+                            synchronized(audioStream) {
+                                audioStream.write(arr, dataOffset, arr.size - dataOffset)
+                            }
+                        }
                     }
-                vttFile?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
-                    ?.takeIf { it.isNotBlank() }
-            } else {
-                null
-            }
+                }
 
-            return EdgeTtsSynthesisResult(
-                audioBytes = bytes,
-                vttContent = vttText
-            )
-        } finally {
-            tempDir.deleteRecursively()
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (text.contains("Path:turn.end", ignoreCase = true) && finished.compareAndSet(false, true)) {
+                        val bytes = synchronized(audioStream) { audioStream.toByteArray() }
+                        webSocket.close(1000, "done")
+                        if (bytes.isNotEmpty()) {
+                            future.complete(bytes)
+                        } else {
+                            future.completeExceptionally(IOException("Edge TTS returned empty audio stream."))
+                        }
+                    }
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(1000, null)
+                    if (finished.compareAndSet(false, true)) {
+                        val bytes = synchronized(audioStream) { audioStream.toByteArray() }
+                        if (bytes.isNotEmpty()) {
+                            future.complete(bytes)
+                        } else {
+                            future.completeExceptionally(IOException("Edge TTS closed ($code): $reason"))
+                        }
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    response?.header("Date")?.let { updateClockSkewFromDateHeader(it) }
+                    if (finished.compareAndSet(false, true)) {
+                        val status = response?.code
+                        val msg = if (status != null) "HTTP $status ${t.message.orEmpty()}" else (t.message ?: "WebSocket failure")
+                        future.completeExceptionally(IOException("Edge TTS failed: $msg", t))
+                    }
+                }
+            }
+        )
+
+        return try {
+            future.get(EDGE_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (timeout: TimeoutException) {
+            socket.cancel()
+            throw IOException("Edge TTS timed out after ${EDGE_TTS_TIMEOUT_SECONDS}s", timeout)
+        } catch (error: Throwable) {
+            socket.cancel()
+            throw IOException("Edge TTS error: ${error.cause?.message ?: error.message}", error)
         }
     }
 
-    private fun findEdgeVoice(requestedVoice: String): Voice? {
-        val voices = TTSVoice.provides()
-        val exact = voices.firstOrNull { it.shortName.equals(requestedVoice, ignoreCase = true) }
-        if (exact != null) return exact
+    private fun generateSecMsGec(skewSec: Long): String {
+        val unixSeconds = (System.currentTimeMillis() / 1000L) + skewSec
+        val windowsSeconds = unixSeconds + 11_644_473_600L
+        val roundedSeconds = windowsSeconds - (windowsSeconds % 300L)
+        val fileTimeTicks = roundedSeconds * 10_000_000L
+        val raw = "$fileTimeTicks$TRUSTED_CLIENT_TOKEN"
+        val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.US_ASCII))
+        return digest.joinToString("") { "%02X".format(it) }
+    }
 
-        val locale = requestedVoice.split('-').take(2).joinToString("-")
-        val langPrefix = requestedVoice.substringBefore('-').trim()
-
-        if (locale.isNotBlank()) {
-            val localeMatch = voices.firstOrNull { it.locale.equals(locale, ignoreCase = true) }
-            if (localeMatch != null) return localeMatch
+    private fun syncClockSkewFromBing() {
+        runCatching {
+            val req = Request.Builder()
+                .url("https://speech.platform.bing.com/")
+                .head()
+                .header("User-Agent", EDGE_USER_AGENT)
+                .build()
+            ttsHttpClient.newCall(req).execute().use { resp ->
+                resp.header("Date")?.let { updateClockSkewFromDateHeader(it) }
+            }
         }
-        if (langPrefix.length in 2..3) {
-            val langMatch = voices.firstOrNull { it.locale.startsWith(langPrefix, ignoreCase = true) }
-            if (langMatch != null) return langMatch
-        }
+    }
 
-        return voices.firstOrNull { it.shortName.equals("hi-IN-MadhurNeural", ignoreCase = true) }
-            ?: voices.firstOrNull { it.shortName.equals("hi-IN-SwaraNeural", ignoreCase = true) }
-            ?: voices.firstOrNull { it.locale.startsWith("hi", ignoreCase = true) }
+    private fun updateClockSkewFromDateHeader(dateHeader: String) {
+        runCatching {
+            val parser = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US)
+            val serverDate = parser.parse(dateHeader) ?: return
+            val serverSec = serverDate.time / 1000L
+            val localSec = System.currentTimeMillis() / 1000L
+            clockSkewSeconds.set(serverSec - localSec)
+        }
+    }
+
+    private fun edgeTimestamp(): String {
+        val fmt = SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        return "${fmt.format(Date())} GMT+0000 (Coordinated Universal Time)"
+    }
+
+    private fun escapeXml(input: String): String =
+        input
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&apos;")
+
+    private fun resolveEdgeVoiceShortName(requestedVoice: String): String {
+        val trimmed = requestedVoice.trim()
+        if (trimmed.contains("Neural", ignoreCase = true) && trimmed.count { it == '-' } >= 2) {
+            return trimmed
+        }
+        return "hi-IN-MadhurNeural"
+    }
+
+    private fun clampSafeRate(rawRate: String): String {
+        val match = Regex("""([+-]?\d+)%""").find(rawRate.trim()) ?: return DEFAULT_VOICE_RATE
+        val value = match.groupValues[1].toIntOrNull()?.coerceIn(-25, 35) ?: 22
+        return if (value >= 0) "+$value%" else "$value%"
+    }
+
+    private fun sanitizeSafePitch(rawPitch: String): String {
+        val match = Regex("""([+-]?\d+)Hz""", RegexOption.IGNORE_CASE).find(rawPitch.trim())
+            ?: return DEFAULT_VOICE_PITCH
+        val value = match.groupValues[1].toIntOrNull()?.coerceIn(-12, 12) ?: 1
+        val nonZero = if (value == 0) 1 else value
+        return if (nonZero > 0) "+${nonZero}Hz" else "${nonZero}Hz"
     }
 
     private suspend fun synthesizeWithGoogleFallback(
@@ -325,7 +402,7 @@ class EdgeTtsApi @Inject constructor(
             } catch (e: Exception) {
                 lastError = e
                 if (attempt < MAX_ATTEMPTS - 1) {
-                    delay(500L * (attempt + 1))
+                    delay(450L * (attempt + 1))
                 }
             }
         }
@@ -438,10 +515,16 @@ class EdgeTtsApi @Inject constructor(
     private companion object {
         const val MAX_CHUNK_LENGTH = 160
         const val MAX_ATTEMPTS = 3
-        const val EDGE_TTS_TIMEOUT_SECONDS = 8L
-        const val EDGE_COOLDOWN_MS = 60_000L
-        const val DEFAULT_VOICE_RATE = "+26%"
+        const val DEFAULT_VOICE_RATE = "+24%"
         const val DEFAULT_VOICE_PITCH = "+1Hz"
+        const val EDGE_TTS_TIMEOUT_SECONDS = 12L
+        const val EDGE_COOLDOWN_MS = 60_000L
+
+        const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+        const val SEC_MS_GEC_VERSION = "1-130.0.2849.68"
+        const val EDGE_ORIGIN = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
+        const val EDGE_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
     }
 }
 
