@@ -53,6 +53,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VoiceGender
+import com.rsmoviespot.domain.models.VoiceTone
 
 private val NeonGreen = Color(0xFF39FF14)
 private val DarkBg = Color(0xFF0A0E0B)
@@ -280,6 +281,31 @@ fun MainScreen(
                     onClick = { viewModel.onGenderSelected(gender) },
                     enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
                     label = { Text("${gender.label} Voice") },
+                    colors = chipColors,
+                    border = chipBorder
+                )
+            }
+        }
+
+        Text(
+            text = "Voice Tone & Studio Polish",
+            color = Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            VoiceTone.entries.forEach { tone ->
+                FilterChip(
+                    selected = uiState.selectedVoiceTone == tone,
+                    onClick = { viewModel.onVoiceToneSelected(tone) },
+                    enabled = !uiState.isGenerating && !uiState.isPreviewingScript,
+                    label = { Text(tone.label, fontSize = 12.sp) },
                     colors = chipColors,
                     border = chipBorder
                 )
