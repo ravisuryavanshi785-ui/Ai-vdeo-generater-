@@ -460,6 +460,25 @@ class VideoRepositoryImpl @Inject constructor(
         val negativePrompt = buildNegativePrompt(promptLower)
 
         return try {
+            callWithHttpUrl(maxAttempts = 3) {
+                cloudflareApi.generateImage(
+                    authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
+                    accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
+                    model = "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+                    request = CloudflareImageRequest(
+                        prompt = finalPrompt,
+                        width = imageWidth,
+                        height = imageHeight,
+                        negativePrompt = negativePrompt,
+                        seed = seed,
+                        numSteps = 18,
+                        guidance = 7.5
+                    )
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
             callWithHttpUrl(maxAttempts = 2) {
                 cloudflareApi.generateImage(
                     authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
@@ -471,27 +490,8 @@ class VideoRepositoryImpl @Inject constructor(
                         height = imageHeight,
                         negativePrompt = negativePrompt,
                         seed = seed,
-                        numSteps = 8,
+                        numSteps = 6,
                         guidance = 2.0
-                    )
-                )
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Throwable) {
-            callWithHttpUrl {
-                cloudflareApi.generateImage(
-                    authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
-                    accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
-                    model = "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-                    request = CloudflareImageRequest(
-                        prompt = finalPrompt,
-                        width = imageWidth,
-                        height = imageHeight,
-                        negativePrompt = negativePrompt,
-                        seed = seed,
-                        numSteps = 12,
-                        guidance = 7.0
                     )
                 )
             }
@@ -1552,10 +1552,10 @@ class VideoRepositoryImpl @Inject constructor(
         const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-        const val SHORTS_IMAGE_WIDTH = 576
-        const val SHORTS_IMAGE_HEIGHT = 1024
-        const val LANDSCAPE_IMAGE_WIDTH = 1024
-        const val LANDSCAPE_IMAGE_HEIGHT = 576
+        const val SHORTS_IMAGE_WIDTH = 768
+        const val SHORTS_IMAGE_HEIGHT = 1344
+        const val LANDSCAPE_IMAGE_WIDTH = 1344
+        const val LANDSCAPE_IMAGE_HEIGHT = 768
 
         const val IMAGE_PROMPT_RULES =
             "PRIORITY 0 — USER-DESCRIBED SCENES & VISUALS ALWAYS WIN (HIGHEST PRIORITY):\n" +
