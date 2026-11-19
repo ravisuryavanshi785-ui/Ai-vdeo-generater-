@@ -18,6 +18,7 @@ import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VoiceGender
+import com.rsmoviespot.domain.models.VoiceTone
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -81,6 +82,9 @@ class VideoRenderService : Service() {
                 val voiceGender = intent.getStringExtra(EXTRA_VOICE_GENDER)
                     ?.let { name -> runCatching { VoiceGender.valueOf(name) }.getOrNull() }
                     ?: VoiceGender.MALE
+                val voiceTone = intent.getStringExtra(EXTRA_VOICE_TONE)
+                    ?.let { name -> runCatching { VoiceTone.valueOf(name) }.getOrNull() }
+                    ?: VoiceTone.AUTO
                 val inputMode = intent.getStringExtra(EXTRA_INPUT_MODE)
                     ?.let { name -> runCatching { InputMode.valueOf(name) }.getOrNull() }
                     ?: InputMode.AUTO
@@ -108,6 +112,7 @@ class VideoRenderService : Service() {
                     preGeneratedScript = preGeneratedScript,
                     language = language,
                     voiceGender = voiceGender,
+                    voiceTone = voiceTone,
                     inputMode = inputMode
                 )
             }
@@ -142,6 +147,7 @@ class VideoRenderService : Service() {
         preGeneratedScript: VideoScriptResponse?,
         language: VideoLanguage,
         voiceGender: VoiceGender,
+        voiceTone: VoiceTone,
         inputMode: InputMode
     ) {
         if (renderJob?.isActive == true) return
@@ -175,6 +181,7 @@ class VideoRenderService : Service() {
                     preGeneratedScript = preGeneratedScript,
                     language = language,
                     voiceGender = voiceGender,
+                    voiceTone = voiceTone,
                     inputMode = inputMode
                 ) { rawPercent, message ->
                     val percent = rawPercent.coerceIn(0, 100)
@@ -308,6 +315,7 @@ class VideoRenderService : Service() {
         const val EXTRA_SCRIPT_JSON = "extra_script_json"
         const val EXTRA_LANGUAGE = "extra_language"
         const val EXTRA_VOICE_GENDER = "extra_voice_gender"
+        const val EXTRA_VOICE_TONE = "extra_voice_tone"
         const val EXTRA_INPUT_MODE = "extra_input_mode"
 
         private const val CHANNEL_ID = "video_render_channel"
@@ -326,6 +334,7 @@ class VideoRenderService : Service() {
             preGeneratedScript: VideoScriptResponse? = null,
             language: VideoLanguage = VideoLanguage.AUTO,
             voiceGender: VoiceGender = VoiceGender.MALE,
+            voiceTone: VoiceTone = VoiceTone.AUTO,
             inputMode: InputMode = InputMode.AUTO
         ) {
             val scriptJson = preGeneratedScript?.let {
@@ -339,6 +348,7 @@ class VideoRenderService : Service() {
                 .putExtra(EXTRA_SCRIPT_JSON, scriptJson)
                 .putExtra(EXTRA_LANGUAGE, language.name)
                 .putExtra(EXTRA_VOICE_GENDER, voiceGender.name)
+                .putExtra(EXTRA_VOICE_TONE, voiceTone.name)
                 .putExtra(EXTRA_INPUT_MODE, inputMode.name)
             ContextCompat.startForegroundService(context, intent)
         }
