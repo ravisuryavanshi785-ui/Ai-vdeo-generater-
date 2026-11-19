@@ -10,6 +10,7 @@ import com.rsmoviespot.domain.models.InputMode
 import com.rsmoviespot.domain.models.VideoLanguage
 import com.rsmoviespot.domain.models.VideoScriptResponse
 import com.rsmoviespot.domain.models.VoiceGender
+import com.rsmoviespot.domain.models.VoiceTone
 import com.rsmoviespot.service.VideoRenderService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -27,6 +28,7 @@ data class VideoUiState(
     val isShorts: Boolean = true,
     val selectedLanguage: VideoLanguage = VideoLanguage.AUTO,
     val selectedGender: VoiceGender = VoiceGender.MALE,
+    val selectedVoiceTone: VoiceTone = VoiceTone.AUTO,
     val selectedBgmUri: Uri? = null,
     val selectedBgmName: String = "Built-in Cinematic BGM",
     val isLoadingTrending: Boolean = false,
@@ -130,6 +132,10 @@ class VideoViewModel @Inject constructor(
         _uiState.update { it.copy(selectedGender = gender, draftScript = null) }
     }
 
+    fun onVoiceToneSelected(tone: VoiceTone) {
+        _uiState.update { it.copy(selectedVoiceTone = tone, draftScript = null) }
+    }
+
     fun onBgmSelected(uri: Uri?) {
         if (uri == null) return
         val fileName = resolveDisplayName(uri) ?: "Custom Audio"
@@ -176,7 +182,8 @@ class VideoViewModel @Inject constructor(
                     isShorts = currentState.isShorts,
                     language = currentState.selectedLanguage,
                     voiceGender = currentState.selectedGender,
-                    inputMode = currentState.inputMode
+                    inputMode = currentState.inputMode,
+                    voiceTone = currentState.selectedVoiceTone
                 )
                 _uiState.update {
                     it.copy(
@@ -291,6 +298,7 @@ class VideoViewModel @Inject constructor(
             preGeneratedScript = currentState.draftScript,
             language = currentState.selectedLanguage,
             voiceGender = currentState.selectedGender,
+            voiceTone = currentState.selectedVoiceTone,
             inputMode = currentState.inputMode
         )
     }
