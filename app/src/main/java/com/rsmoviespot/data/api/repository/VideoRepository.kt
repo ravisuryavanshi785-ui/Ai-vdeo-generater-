@@ -1,9 +1,9 @@
 package com.rsmoviespot.data.repository
 
 import android.graphics.BitmapFactory
+import android.util.Base64
 import com.rsmoviespot.BuildConfig
 import com.rsmoviespot.data.api.CloudflareApi
-import com.rsmoviespot.data.api.CloudflareImageRequest
 import com.rsmoviespot.data.api.EdgeTtsApi
 import com.rsmoviespot.data.api.EdgeTtsClipResult
 import com.rsmoviespot.data.api.EdgeTtsRequest
@@ -33,13 +33,20 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import retrofit2.HttpException
 import java.io.File
 import java.io.IOException
@@ -64,6 +71,13 @@ interface VideoRepository {
     ): ResponseBody
 
     suspend fun downloadRealPhoto(
+        query: String,
+        usedUrls: MutableSet<String>,
+        destinationFile: File,
+        preferPortrait: Boolean = true
+    ): Boolean
+
+    suspend fun downloadStockPhotoFallback(
         query: String,
         usedUrls: MutableSet<String>,
         destinationFile: File,
@@ -101,6 +115,7 @@ interface VideoRepository {
 @Singleton
 class VideoRepositoryImpl @Inject constructor(
     private val groqApi: GroqApi,
+    @Suppress("unused")
     private val cloudflareApi: CloudflareApi,
     private val edgeTtsApi: EdgeTtsApi,
     private val okHttpClient: OkHttpClient
@@ -163,7 +178,7 @@ class VideoRepositoryImpl @Inject constructor(
         val targetGenderLabel = voiceGender.label
         val toneDirective = buildVoiceToneDirective(voiceTone)
         val languageDirective = if (language == VideoLanguage.AUTO) {
-            "Language: Auto-detect from user request. Default to spoken Hindi (Devanagari) with voice_name '${VideoLanguage.HINDI.resolveVoice(voiceGender)}', UNLESS the user explicitly requested another language (e.g. English, Marathi, Gujarati, Bengali, Tamil, Telugu, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, Japanese, Arabic), in which case write in THAT language and strictly use the $targetGenderLabel Edge TTS voice_name."
+            "Language: Auto-detect from user request. Default to spoken Hindi (Devanagari) with voice_name '${VideoLanguage.HINDI.resolveVoice(voiceGender)}', UNLESS the user explicitly requested another language (e.g. English, Marathi, Gujarati, Bengali, Tamil, Telugu, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, Japanese, Arabic), in which case write in THAT language and pick the matching $targetGenderLabel Edge TTS voice_name."
         } else {
             "Language MANDATORY: Write ALL voiceover_text strictly in ${language.languageInstruction} and set voice_name to '${language.resolveVoice(voiceGender)}'."
         }
@@ -173,11 +188,10 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("MODE: FULL USER SCRIPT ($inputWordCount words).")
                 appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user text intact and split sequentially into 12 to 18 natural spoken scenes (~6-11 words / ~2.3-3.5s each).")
                 appendLine("CRITICAL SPLIT RULE: NEVER split inside a person's full name (e.g., NEVER 'Pedro' | 'Pascal' or 'Robert' | 'Downey Jr' or 'Russo' | 'Brothers'), NEVER split numbers/currency ('₹2000' | 'Crore'), and NEVER cross a sentence period (e.g., NEVER 'hai. Pedro' in one slab and 'Pascal' in the next)! Always break at full stops (. ! ? ।) or clean comma/conjunction clauses.")
-                appendLine("VISUAL SOURCE RULE: Match visual_source strictly to the topic! ONLY use 'video_clip' or 'meme_clip' if this script is actually about movies, trailers, actors, pop-culture, or comedy roasts with a concrete movie/character/meme query. For cooking/recipes, food, facts, tech, motivation, devotional, or educational scripts, use visual_source='ai_generated' so every scene shows clean custom visuals (no random unrelated clips or Pikachu/cinema halls!).")
-                appendLine("Whenever a real director or actor is named (e.g., 'Russo Brothers', 'Pedro Pascal', 'Robert Downey Jr'), prefer visual_source='real_photo' with ONLY their clean English name.")
+                appendLine("Only use 'video_clip' or 'meme_clip' if the script is about movies, entertainment, or pop-culture comedy with concrete movie/character/meme English queries — NEVER query abstract phrases like '4 out of 5 stars', 'rating', 'review', 'ending', 'multiverse', and NEVER add memes to recipes, tutorials, facts, or serious stories.")
+                appendLine("Whenever a real director, celebrity, or historical figure is named, prefer visual_source='real_photo' with ONLY their clean English name — NEVER draw deformed wax AI faces for real people.")
                 appendLine("For ai_generated scenes, match the exact subject/action of THAT scene in crisp visual words (no movie titles, channel names, neon text, or holding-microphone hand closeups that cause deformed fingers/gibberish text).")
-                appendLine("Set voice_name strictly matching the script's language AND $targetGenderLabel gender (e.g., Hindi $targetGenderLabel: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN $targetGenderLabel: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US $targetGenderLabel: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi $targetGenderLabel: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
-                appendLine("Set per-scene voice_emotion dynamically ('hook', 'excited', 'climax', 'suspense', 'sad', 'roast', 'question', 'warm', 'normal') matching the exact emotional beat of each line — do NOT leave every scene as 'normal'.")
+                appendLine("Set voice_name matching the script's language and $targetGenderLabel gender (e.g., Hindi: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
                 appendLine("Voice delivery style: $toneDirective")
                 appendLine("Return ONLY ONE complete valid JSON object with properly closed 'slabs' array ']' and root object '}'. Avoid unescaped double quotes inside JSON strings.")
                 appendLine()
@@ -198,13 +212,12 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("CRITICAL DIRECTOR PROMPT RULES:")
                 appendLine("1) NEVER speak or copy meta-instructions ('Act as...', 'Create a fast 9:16...', 'Write a script...', 'Include...', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Put ONLY natural spoken storytelling narration in voiceover_text.")
                 appendLine("2) Whenever the user describes visuals, scenes, camera shots, character appearance/costume, lighting, props, or style (in English, Hindi, or Hinglish), put those EXACT visual details right at the BEGINNING of image_prompt (in crisp English) with visual_source='ai_generated' — NEVER replace described visuals with generic crowds or unrelated real_photo.")
-                appendLine("3) Match each scene's image_prompt to THAT SPECIFIC scene's action/subject! If a scene focuses on food, cooking ingredients, scenery, or a secondary character, put THAT subject FIRST in image_prompt and set has_character=false. NEVER include gibberish-prone text, logos, cinema marquees, or hands gripping microphones.")
-                appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) and NEVER split names across scenes. Only pick 'video_clip' / 'meme_clip' / 'real_photo' when the topic genuinely involves movies, actors, celebrities, or fitting reactions — NEVER force movie/meme clips into cooking, facts, tutorials, or story topics.")
+                appendLine("3) Match each scene's image_prompt to THAT SPECIFIC scene's action/subject! If a scene focuses on food/ingredients, scenery, or a secondary character, put THAT subject FIRST in image_prompt and set has_character=false. NEVER include gibberish-prone text, logos, cinema marquees, or hands gripping microphones.")
+                appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) and NEVER split names across scenes. Only use 'video_clip'/'meme_clip' for movie/celebrity/roast topics where real trailer or meme clips fit; for cooking recipes, tutorials, devotional, history, or pure story prompts use 'ai_generated' (and 'real_photo' only for real people/places).")
                 appendLine(languageDirective)
                 appendLine("Voice delivery & writing tone: $toneDirective")
-                appendLine("Assign dynamic per-scene voice_emotion ('hook', 'excited', 'climax', 'suspense', 'sad', 'roast', 'question', 'warm', 'normal') across scenes so vocal tone shifts naturally with story tension and payoff.")
                 appendLine("Format guideline: $formatGuide")
-                appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
+                appendLine("Write ONE continuous, expressive storytelling monologue with varied per-scene voice_emotion ('hook', 'excited', 'climax', 'suspense', 'sad', 'roast', 'question', 'warm', 'normal'), exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
                 appendLine("Return ONLY ONE complete valid JSON object with properly closed 'slabs' array ']' and root object '}'. Avoid unescaped double quotes inside JSON string values; use single quotes if quoting dialogue.")
             }
         }
@@ -449,7 +462,7 @@ class VideoRepositoryImpl @Inject constructor(
         prompt: String,
         isShorts: Boolean,
         seed: Int
-    ): ResponseBody {
+    ): ResponseBody = withContext(Dispatchers.IO) {
         require(prompt.isNotBlank()) { "Image prompt must not be blank." }
         require(BuildConfig.CLOUDFLARE_ACCOUNT_ID.isNotBlank()) { "CLOUDFLARE_ACCOUNT_ID is empty." }
         require(BuildConfig.CLOUDFLARE_API_TOKEN.isNotBlank()) { "CLOUDFLARE_API_TOKEN is empty." }
@@ -459,44 +472,217 @@ class VideoRepositoryImpl @Inject constructor(
         val cleanPrompt = prompt.trim().trimEnd(',', '.')
         val promptLower = cleanPrompt.lowercase()
         val finalPrompt = cleanPrompt + buildImageSuffix(promptLower, isShorts)
-        val negativePrompt = buildNegativePrompt(promptLower)
 
-        return try {
-            callWithHttpUrl(maxAttempts = 2, retryDelayMs = 1000L) {
-                cloudflareApi.generateImage(
-                    authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
-                    accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
-                    model = "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-                    request = CloudflareImageRequest(
-                        prompt = finalPrompt,
-                        width = imageWidth,
-                        height = imageHeight,
-                        negativePrompt = negativePrompt,
-                        seed = seed,
-                        numSteps = 14,
-                        guidance = 7.5
-                    )
+        val attemptErrors = mutableListOf<String>()
+
+        // 1) Primary active Cloudflare model: FLUX.2 [klein] 9B (requires multipart/form-data)
+        try {
+            return@withContext executeCloudflareImageWithRetry(maxAttempts = 2) {
+                requestFluxKlein9b(
+                    prompt = finalPrompt,
+                    width = imageWidth,
+                    height = imageHeight
                 )
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Throwable) {
-            callWithHttpUrl(maxAttempts = 2, retryDelayMs = 900L) {
-                cloudflareApi.generateImage(
-                    authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
-                    accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
-                    model = "@cf/bytedance/stable-diffusion-xl-lightning",
-                    request = CloudflareImageRequest(
-                        prompt = finalPrompt,
-                        width = imageWidth,
-                        height = imageHeight,
-                        negativePrompt = negativePrompt,
-                        seed = seed,
-                        numSteps = 8,
-                        guidance = 2.0
-                    )
+        } catch (err: Throwable) {
+            attemptErrors += "flux-2-klein-9b: ${err.message?.take(120) ?: err::class.java.simpleName}"
+        }
+
+        // 2) Secondary active Cloudflare model: Leonardo Lucid Origin (JSON body)
+        try {
+            return@withContext executeCloudflareImageWithRetry(maxAttempts = 2) {
+                requestLucidOrigin(
+                    prompt = finalPrompt,
+                    width = imageWidth,
+                    height = imageHeight,
+                    seed = seed
                 )
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (err: Throwable) {
+            attemptErrors += "lucid-origin: ${err.message?.take(120) ?: err::class.java.simpleName}"
+        }
+
+        // 3) Fast fallback Cloudflare model: FLUX.1 schnell (JSON body, 4 steps)
+        try {
+            return@withContext executeCloudflareImageWithRetry(maxAttempts = 2) {
+                requestFluxSchnell(
+                    prompt = finalPrompt,
+                    seed = seed
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (err: Throwable) {
+            attemptErrors += "flux-1-schnell: ${err.message?.take(120) ?: err::class.java.simpleName}"
+        }
+
+        throw IOException("Cloudflare image generation failed: ${attemptErrors.joinToString(" | ")}")
+    }
+
+    private suspend fun executeCloudflareImageWithRetry(
+        maxAttempts: Int = 2,
+        callBlock: () -> ResponseBody
+    ): ResponseBody {
+        var lastError: Throwable? = null
+        repeat(maxAttempts) { attempt ->
+            try {
+                return callBlock()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (err: CloudflareHttpException) {
+                lastError = err
+                if ((err.code == 429 || err.code in 500..599) && attempt < maxAttempts - 1) {
+                    delay(900L * (attempt + 1))
+                } else {
+                    throw err
+                }
+            } catch (err: IOException) {
+                lastError = err
+                if (attempt < maxAttempts - 1) {
+                    delay(800L * (attempt + 1))
+                } else {
+                    throw err
+                }
+            }
+        }
+        throw lastError ?: IOException("Cloudflare image request failed.")
+    }
+
+    private class CloudflareHttpException(
+        val code: Int,
+        message: String
+    ) : IOException(message)
+
+    private fun requestFluxKlein9b(
+        prompt: String,
+        width: Int,
+        height: Int
+    ): ResponseBody {
+        val url =
+            "https://api.cloudflare.com/client/v4/accounts/${BuildConfig.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-2-klein-9b"
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("prompt", prompt)
+            .addFormDataPart("width", width.toString())
+            .addFormDataPart("height", height.toString())
+            .build()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}")
+            .post(body)
+            .build()
+
+        return executeCloudflareImageCall(request)
+    }
+
+    private fun requestLucidOrigin(
+        prompt: String,
+        width: Int,
+        height: Int,
+        seed: Int
+    ): ResponseBody {
+        val url =
+            "https://api.cloudflare.com/client/v4/accounts/${BuildConfig.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/leonardo/lucid-origin"
+        val payload = buildJsonObject {
+            put("prompt", prompt)
+            put("width", width)
+            put("height", height)
+            put("guidance", 4.5)
+            put("seed", seed)
+        }.toString()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}")
+            .header("Accept", "application/json")
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        return executeCloudflareImageCall(request)
+    }
+
+    private fun requestFluxSchnell(
+        prompt: String,
+        seed: Int
+    ): ResponseBody {
+        val url =
+            "https://api.cloudflare.com/client/v4/accounts/${BuildConfig.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+        val payload = buildJsonObject {
+            put("prompt", prompt)
+            put("steps", 4)
+            put("seed", seed)
+        }.toString()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}")
+            .header("Accept", "application/json")
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        return executeCloudflareImageCall(request)
+    }
+
+    private fun executeCloudflareImageCall(request: Request): ResponseBody {
+        okHttpClient.newCall(request).execute().use { response ->
+            val rawBytes = response.body?.bytes() ?: ByteArray(0)
+            val contentType = response.header("Content-Type").orEmpty().lowercase()
+
+            if (!response.isSuccessful) {
+                val errPreview = runCatching { String(rawBytes, Charsets.UTF_8).take(260) }.getOrDefault("")
+                throw CloudflareHttpException(
+                    code = response.code,
+                    message = "HTTP ${response.code} at ${request.url}: $errPreview"
+                )
+            }
+
+            if (rawBytes.isEmpty()) {
+                throw IOException("Cloudflare returned an empty body.")
+            }
+
+            if (contentType.startsWith("image/")) {
+                if (rawBytes.size < 1024) {
+                    throw IOException("Cloudflare binary image is too small (${rawBytes.size} bytes).")
+                }
+                return rawBytes.toResponseBody(contentType.toMediaType())
+            }
+
+            val bodyText = String(rawBytes, Charsets.UTF_8).trim()
+            if (bodyText.startsWith("{")) {
+                val root = json.parseToJsonElement(bodyText) as? JsonObject
+                    ?: throw IOException("Invalid JSON response from Cloudflare.")
+                val resultEl = root["result"]
+                val b64Image = when (resultEl) {
+                    is JsonObject -> resultEl["image"]?.jsonPrimitive?.contentOrNull
+                        ?: resultEl["b64_json"]?.jsonPrimitive?.contentOrNull
+                    is JsonPrimitive -> resultEl.contentOrNull
+                    else -> null
+                } ?: root["image"]?.jsonPrimitive?.contentOrNull
+
+                val cleanB64 = b64Image
+                    ?.substringAfter("base64,", b64Image)
+                    ?.replace("\\s+".toRegex(), "")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: throw IOException("Cloudflare JSON missing result.image: ${bodyText.take(220)}")
+
+                val decoded = runCatching { Base64.decode(cleanB64, Base64.DEFAULT) }
+                    .getOrElse { throw IOException("Failed to decode Cloudflare base64 image.", it) }
+
+                if (decoded.size < 1024) {
+                    throw IOException("Decoded Cloudflare image is too small (${decoded.size} bytes).")
+                }
+                return decoded.toResponseBody("image/png".toMediaType())
+            }
+
+            if (rawBytes.size < 1024) {
+                throw IOException("Unexpected short non-image Cloudflare payload (${rawBytes.size} bytes).")
+            }
+            return rawBytes.toResponseBody("image/png".toMediaType())
         }
     }
 
@@ -509,53 +695,86 @@ class VideoRepositoryImpl @Inject constructor(
 
         return when {
             is3dAnimated ->
-                ", ONE single unified 3D animated Pixar feature film frame, $aspect, cinematic depth of field, rich 3D environment, soft volumetric sunlight, single cohesive story shot, sharp crisp textures, no repeating pattern, no wallpaper, no sticker sheet, no collage, no grid, no text, no watermark"
+                ", ONE single unified 3D animated Pixar feature film frame, $aspect, cinematic depth of field, rich outdoor 3D environment, soft volumetric sunlight, single cohesive story shot, no repeating pattern, no wallpaper, no sticker sheet, no collage, no grid, no text, no watermark"
             isStylized ->
                 ", ONE single unified $aspect, ultra-detailed art direction, sharp focus, dramatic atmospheric lighting, no repeating pattern, no wallpaper, no collage, no grid, no split frames, no text, no watermark, no UI, no logos"
             else ->
-                ", raw 35mm DSLR photograph, ONE single unified $aspect, crisp natural lighting, realistic fine details and textures, shallow depth of field, high clarity focus, clean unlabelled background, no collage, no grid, no multiple panels, no text, no words, no signs, no watermark, no UI, no logos"
+                ", raw 35mm DSLR live-action movie set photograph, ONE single unified $aspect, candid film still, realistic natural skin pores and authentic textures, shallow depth of field, cinema lighting, clean unlabelled background, no collage, no grid, no multiple panels, no text, no words, no signs, no watermark, no UI, no logos"
         }
     }
 
-    private fun buildNegativePrompt(promptLower: String): String {
-        val base = mutableListOf(
-            "filmstrip", "multi-panel", "multiple panels", "multiple frames", "2x2", "3x3", "4x4",
-            "photo grid", "picture grid", "triptych", "diptych", "quadrant", "contact sheet",
-            "stacked frames", "comic panels", "grid", "storyboard", "collage", "photo collage",
-            "split screen", "split frame", "montage", "mosaic", "tiled", "frames", "borders",
-            "wallpaper", "repeating pattern", "seamless pattern", "sticker sheet", "clipart",
-            "doodle pattern", "multiple copies", "clones", "duplicate character", "crowd of clones",
-            "abstract", "geometric shapes", "cubes", "blocks", "colorful squares",
-            "disembodied eye", "close-up single eye",
-            "text", "watermark", "signature", "logo", "letters", "words", "caption", "subtitle",
-            "gibberish text", "gibberish letters", "warped text", "random letters", "misspelled words",
-            "neon sign text", "cinema marquee text", "billboard text", "pedestal text", "plaque",
-            "signboard", "typography", "banner text",
-            "ui", "interface", "comment box", "subscribe button", "social media", "website",
-            "blurry", "out of focus", "soft focus", "low quality", "jpeg artifacts",
-            "distorted", "deformed", "mutated anatomy",
-            "deformed hands", "extra fingers", "twisted fingers", "fused fingers", "ugly hands",
-            "creepy hand", "holding microphone badly",
-            "extra limbs", "extra arms", "extra legs", "extra tail",
-            "extra ears", "extra eyes", "extra trunk", "double trunk", "two trunks"
-        )
-        if (!promptLower.contains("poster") && !promptLower.contains("title card")) {
-            base += listOf("poster", "title card")
+    override suspend fun downloadStockPhotoFallback(
+        query: String,
+        usedUrls: MutableSet<String>,
+        destinationFile: File,
+        preferPortrait: Boolean
+    ): Boolean = withContext(Dispatchers.IO) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return@withContext false
+
+        val candidates = linkedMapOf<String, PhotoCandidate>()
+        runCatching { collectOpenversePhotoCandidates(cleanQuery, candidates) }
+
+        val coreWords = extractCoreQueryWords(cleanQuery)
+        if (candidates.isEmpty() && coreWords.isNotEmpty()) {
+            val tightQuery = coreWords.take(4).joinToString(" ")
+            runCatching { collectOpenversePhotoCandidates(tightQuery, candidates) }
+            if (candidates.isEmpty()) {
+                runCatching { collectWikimediaCommonsCandidates(tightQuery, candidates) }
+            }
+        } else if (candidates.size < 3 && coreWords.isNotEmpty()) {
+            runCatching { collectWikimediaCommonsCandidates(coreWords.take(3).joinToString(" "), candidates) }
         }
-        val stylizedTokens = listOf(
-            "anime", "cartoon", "3d", "pixar", "disney", "dreamworks", "cgi", "comic",
-            "illustration", "painting", "drawing", "sketch"
+
+        val ordered = candidates.values.sortedWith(
+            compareByDescending<PhotoCandidate> { it.priority }
+                .thenByDescending { if (preferPortrait && it.isPortraitOrSquare) 1 else 0 }
         )
-        if (stylizedTokens.none { promptLower.contains(it) }) {
-            base += listOf(
-                "cartoon", "anime", "3d render", "cgi", "illustration",
-                "digital art", "digital painting", "concept art", "comic art", "comic book",
-                "vector art", "cel shaded", "smooth shading", "airbrushed", "unreal engine",
-                "painting", "drawing", "sketch", "plastic skin", "wax figure", "wax face",
-                "plastic eyes", "uncanny valley", "cosplay", "toy", "action figure"
+
+        for (candidate in ordered) {
+            if (candidate.url in usedUrls) continue
+            val downloaded = runCatching {
+                downloadAndValidateImageUrl(candidate.url, destinationFile)
+            }.getOrDefault(false)
+
+            if (downloaded) {
+                usedUrls.add(candidate.url)
+                return@withContext true
+            }
+        }
+        false
+    }
+
+    private fun collectOpenversePhotoCandidates(
+        searchQuery: String,
+        outMap: MutableMap<String, PhotoCandidate>
+    ) {
+        val encoded = URLEncoder.encode(searchQuery, "UTF-8")
+        val url =
+            "https://api.openverse.org/v1/images/?q=$encoded&category=photograph&extension=jpg,png&page_size=12"
+        val bodyText = fetchJsonString(url) ?: return
+        val root = runCatching { json.parseToJsonElement(bodyText) as? JsonObject }.getOrNull() ?: return
+        val results = root["results"] as? JsonArray ?: return
+
+        for (item in results) {
+            val obj = item as? JsonObject ?: continue
+            val imgUrl = obj["url"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+            val width = obj["width"]?.jsonPrimitive?.intOrNull ?: 0
+            val height = obj["height"]?.jsonPrimitive?.intOrNull ?: 0
+            if (!imgUrl.startsWith("http")) continue
+            if ((width in 1..399) || (height in 1..399)) continue
+            if (!isCleanPhotoUrl(imgUrl)) continue
+
+            outMap.putIfAbsent(
+                imgUrl,
+                PhotoCandidate(
+                    url = imgUrl,
+                    width = width,
+                    height = height,
+                    priority = 4
+                )
             )
         }
-        return base.joinToString(", ")
     }
 
     override suspend fun downloadInternetVideoClip(
@@ -613,16 +832,14 @@ class VideoRepositoryImpl @Inject constructor(
         val lower = rawQuery.lowercase()
         val forbiddenFragments = listOf(
             "out of 5", "stars", "rating", "review", "subscribe", "comment",
-            "ending", "part 1", "part 2", "box office", "multiverse", "cigar",
-            "recipe", "biryani", "cooking", "ingredients", "spices", "simmer"
+            "ending", "part 1", "part 2", "box office", "multiverse", "cigar"
         )
         if (forbiddenFragments.any { lower.contains(it) }) return true
 
         val genericWords = setOf(
             "out", "five", "four", "three", "two", "one", "stars", "star",
             "rating", "review", "best", "worst", "good", "bad", "top", "epic",
-            "awesome", "amazing", "cinema", "theater", "theatre", "audience",
-            "cooking", "kitchen", "food", "dish", "rice", "water", "boil"
+            "awesome", "amazing", "cinema", "theater", "theatre", "audience"
         )
         val substantiveWords = coreWords.filter { it !in genericWords && !it.all(Char::isDigit) }
         return if (isMeme) {
@@ -637,7 +854,8 @@ class VideoRepositoryImpl @Inject constructor(
             "the", "a", "an", "of", "in", "on", "at", "to", "and", "or", "for", "with", "from",
             "out", "movie", "film", "cinema", "scene", "trailer", "teaser", "clip", "video",
             "meme", "funny", "reaction", "official", "hd", "4k", "whatsapp", "status",
-            "shorts", "bollywood", "hollywood", "indian"
+            "shorts", "bollywood", "hollywood", "indian", "raw", "35mm", "dslr", "shot",
+            "close", "wide", "medium", "vertical", "horizontal", "cinematic", "lighting"
         )
         return query.lowercase()
             .replace(Regex("[^a-z0-9\\s]"), " ")
@@ -667,7 +885,7 @@ class VideoRepositoryImpl @Inject constructor(
             "valorant", "pubg", "freefire", "mannequin", "asmr", "amv",
             "tiktok", "reels", "selfie", "bathroom", "mirror", "shirtless",
             "gym", "dance", "twerk", "couple", "kiss", "fanedit",
-            "velocity", "phonk", "anime edit", "sigma edit", "pikachu", "pokemon"
+            "velocity", "phonk", "anime edit", "sigma edit"
         )
 
         for (item in coubs) {
@@ -692,7 +910,7 @@ class VideoRepositoryImpl @Inject constructor(
                 Regex("""\b${Regex.escape(word)}\b""").containsMatchIn(title.lowercase())
             }
             val likes = obj["likes_count"]?.jsonPrimitive?.intOrNull ?: 0
-            if (titleHits == 0 && likes < 20) continue
+            if (titleHits == 0 && likes < 15) continue
 
             val videoObj = ((obj["file_versions"] as? JsonObject)
                 ?.get("html5") as? JsonObject)
@@ -721,7 +939,7 @@ class VideoRepositoryImpl @Inject constructor(
         val html = fetchTextString("https://tenor.com/search/$slug-gifs", BROWSER_USER_AGENT) ?: return
         val mp4Regex = Regex("""https://media\.tenor\.com/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\.mp4""")
         val matches = mp4Regex.findAll(html).map { it.value }.distinct().toList()
-        val requiredSlugHits = if (coreWords.size >= 2) 2 else 1
+        val requiredSlugHits = 1
 
         for (mp4Url in matches) {
             val fileSlug = mp4Url.substringAfterLast('/').lowercase()
@@ -919,6 +1137,7 @@ class VideoRepositoryImpl @Inject constructor(
                 qLabel.contains("feature") ||
                 qLabel.contains("series")
             val isPerson = id.startsWith("nm")
+
             if (!allowPeople && isPerson) continue
 
             val matchesName = queryWords.isEmpty() || queryWords.any { label.contains(it) }
@@ -1212,10 +1431,10 @@ class VideoRepositoryImpl @Inject constructor(
 
         val (rate, pitch) = resolveProsody(emotion = emotion, voiceTone = voiceTone)
         return edgeTtsApi.synthesizeSpeechClipWithMeta(
-            cleanSpokenText,
-            voiceName.ifBlank { VideoLanguage.HINDI.maleVoice },
-            rate,
-            pitch
+            text = cleanSpokenText,
+            voice = voiceName.ifBlank { VideoLanguage.HINDI.maleVoice },
+            rate = rate,
+            pitch = pitch
         )
     }
 
@@ -1230,92 +1449,95 @@ class VideoRepositoryImpl @Inject constructor(
         val emo = emotion.lowercase().trim()
         return when (voiceTone.name.uppercase()) {
             "NATURAL", "PODCAST", "HUMAN" -> when (emo) {
-                "hook" -> "+25%" to "+3Hz"
-                "excited" -> "+28%" to "+4Hz"
-                "climax" -> "+27%" to "+2Hz"
-                "roast" -> "+26%" to "+3Hz"
-                "question" -> "+21%" to "+4Hz"
-                "suspense" -> "+14%" to "-5Hz"
-                "sad", "emotional" -> "+11%" to "-6Hz"
-                "warm" -> "+20%" to "-1Hz"
-                else -> "+22%" to "-2Hz"
+                "hook" -> "+24%" to "+2Hz"
+                "excited" -> "+26%" to "+3Hz"
+                "climax" -> "+25%" to "+1Hz"
+                "suspense" -> "+12%" to "-5Hz"
+                "sad" -> "+8%" to "-6Hz"
+                "roast" -> "+23%" to "+2Hz"
+                "question" -> "+18%" to "+3Hz"
+                "warm" -> "+14%" to "-1Hz"
+                else -> "+20%" to "-1Hz"
             }
 
             "FUNNY", "COMIC" -> when (emo) {
-                "hook" -> "+29%" to "+5Hz"
-                "excited" -> "+31%" to "+6Hz"
-                "climax" -> "+30%" to "+4Hz"
-                "roast" -> "+30%" to "+5Hz"
-                "question" -> "+24%" to "+6Hz"
-                "suspense" -> "+18%" to "-2Hz"
-                "sad", "emotional" -> "+15%" to "-3Hz"
-                "warm" -> "+24%" to "+2Hz"
-                else -> "+26%" to "+2Hz"
+                "hook" -> "+28%" to "+4Hz"
+                "excited" -> "+30%" to "+5Hz"
+                "climax" -> "+29%" to "+4Hz"
+                "suspense" -> "+15%" to "-3Hz"
+                "sad" -> "+10%" to "-4Hz"
+                "roast" -> "+27%" to "+4Hz"
+                "question" -> "+22%" to "+5Hz"
+                "warm" -> "+18%" to "+1Hz"
+                else -> "+24%" to "+2Hz"
             }
 
             "SERIOUS", "INTENSE" -> when (emo) {
-                "hook" -> "+20%" to "-3Hz"
-                "excited" -> "+22%" to "-1Hz"
-                "climax" -> "+23%" to "-4Hz"
-                "roast" -> "+21%" to "-2Hz"
-                "question" -> "+16%" to "-1Hz"
+                "hook" -> "+18%" to "-3Hz"
+                "excited" -> "+21%" to "-2Hz"
+                "climax" -> "+22%" to "-4Hz"
                 "suspense" -> "+10%" to "-8Hz"
-                "sad", "emotional" -> "+9%" to "-7Hz"
-                "warm" -> "+15%" to "-5Hz"
-                else -> "+16%" to "-5Hz"
+                "sad" -> "+6%" to "-8Hz"
+                "roast" -> "+18%" to "-3Hz"
+                "question" -> "+14%" to "-1Hz"
+                "warm" -> "+12%" to "-4Hz"
+                else -> "+15%" to "-5Hz"
             }
 
             "ENERGETIC", "HYPE" -> when (emo) {
-                "hook" -> "+31%" to "+4Hz"
-                "excited" -> "+34%" to "+5Hz"
-                "climax" -> "+33%" to "+3Hz"
-                "roast" -> "+32%" to "+4Hz"
-                "question" -> "+26%" to "+5Hz"
-                "suspense" -> "+20%" to "-3Hz"
-                "sad", "emotional" -> "+16%" to "-4Hz"
-                "warm" -> "+26%" to "+1Hz"
-                else -> "+28%" to "+1Hz"
+                "hook" -> "+30%" to "+3Hz"
+                "excited" -> "+32%" to "+4Hz"
+                "climax" -> "+31%" to "+2Hz"
+                "suspense" -> "+18%" to "-3Hz"
+                "sad" -> "+12%" to "-4Hz"
+                "roast" -> "+29%" to "+3Hz"
+                "question" -> "+24%" to "+4Hz"
+                "warm" -> "+20%" to "0Hz"
+                else -> "+26%" to "+1Hz"
             }
 
             else -> when (emo) {
-                "hook" -> "+26%" to "+3Hz"
-                "excited" -> "+29%" to "+4Hz"
-                "climax" -> "+28%" to "+2Hz"
-                "roast" -> "+27%" to "+3Hz"
-                "question" -> "+21%" to "+4Hz"
-                "suspense" -> "+14%" to "-5Hz"
-                "sad", "emotional" -> "+11%" to "-6Hz"
-                "warm" -> "+20%" to "-1Hz"
-                else -> "+22%" to "-2Hz"
+                "hook" -> "+24%" to "+2Hz"
+                "excited" -> "+27%" to "+4Hz"
+                "climax" -> "+26%" to "+1Hz"
+                "suspense" -> "+12%" to "-6Hz"
+                "sad" -> "+8%" to "-7Hz"
+                "roast" -> "+25%" to "+3Hz"
+                "question" -> "+18%" to "+3Hz"
+                "warm" -> "+14%" to "-2Hz"
+                else -> "+20%" to "-2Hz"
             }
         }
     }
 
-    private fun enforceVoiceGender(rawVoiceName: String, requestedGender: VoiceGender): String {
-        val candidate = rawVoiceName.trim()
-        if (candidate.isBlank()) return VideoLanguage.HINDI.resolveVoice(requestedGender)
-
-        val matchedLang = VideoLanguage.values().firstOrNull { lang ->
-            lang != VideoLanguage.AUTO && (
-                lang.maleVoice.equals(candidate, ignoreCase = true) ||
-                    lang.femaleVoice.equals(candidate, ignoreCase = true)
-                )
-        }
-        if (matchedLang != null) {
-            return matchedLang.resolveVoice(requestedGender)
-        }
-
-        val localePrefix = candidate.split('-').take(2).joinToString("-")
-        if (localePrefix.isNotBlank()) {
-            val langByPrefix = VideoLanguage.values().firstOrNull { lang ->
+    private fun enforceVoiceGender(
+        voiceName: String,
+        requestedGender: VoiceGender
+    ): String {
+        val clean = voiceName.trim()
+        if (clean.isNotBlank()) {
+            VideoLanguage.values().firstOrNull { lang ->
                 lang != VideoLanguage.AUTO &&
-                    lang.maleVoice.startsWith("$localePrefix-", ignoreCase = true)
+                    (lang.maleVoice.equals(clean, ignoreCase = true) ||
+                        lang.femaleVoice.equals(clean, ignoreCase = true))
+            }?.let { return it.resolveVoice(requestedGender) }
+
+            val localePrefix = clean.split('-').take(2).joinToString("-").lowercase()
+            if (localePrefix.isNotBlank()) {
+                VideoLanguage.values().firstOrNull { lang ->
+                    lang != VideoLanguage.AUTO &&
+                        lang.maleVoice.lowercase().startsWith(localePrefix)
+                }?.let { return it.resolveVoice(requestedGender) }
             }
-            if (langByPrefix != null) {
-                return langByPrefix.resolveVoice(requestedGender)
+
+            val langCode = clean.substringBefore('-').lowercase()
+            if (langCode.length >= 2) {
+                VideoLanguage.values().firstOrNull { lang ->
+                    lang != VideoLanguage.AUTO &&
+                        lang.maleVoice.lowercase().startsWith("$langCode-")
+                }?.let { return it.resolveVoice(requestedGender) }
             }
         }
-
         return VideoLanguage.HINDI.resolveVoice(requestedGender)
     }
 
@@ -1359,12 +1581,16 @@ class VideoRepositoryImpl @Inject constructor(
         }
 
         val allowedSources = setOf("ai_generated", "real_photo", "video_clip", "meme_clip")
+        val allowedEmotions = setOf(
+            "hook", "excited", "climax", "suspense", "sad", "roast", "question", "warm", "normal"
+        )
         val slabs = slabElements.mapIndexedNotNull { index, element ->
             val dto = json.decodeFromJsonElement<GeneratedSlabDto>(element)
             val voiceover = dto.voiceoverText.trim()
             val prompt = dto.imagePrompt.trim()
             val sfxCue = dto.sfxCue?.trim()?.lowercase()?.ifBlank { "whoosh" } ?: "whoosh"
-            val emotion = normalizeEmotion(dto.voiceEmotion, voiceover, index, slabElements.size)
+            val rawEmotion = dto.voiceEmotion?.trim()?.lowercase().orEmpty()
+            val emotion = if (rawEmotion in allowedEmotions) rawEmotion else "normal"
 
             val rawQuery = dto.realPhotoQuery?.trim().orEmpty()
             val realQuery = if (rawQuery.lowercase() in setOf("none", "null", "n/a", "-")) "" else rawQuery
@@ -1436,29 +1662,6 @@ class VideoRepositoryImpl @Inject constructor(
             pinned_comment = pinnedComment,
             slabs = slabs
         )
-    }
-
-    private fun normalizeEmotion(
-        rawEmotion: String?,
-        voiceoverText: String,
-        sceneIndex: Int,
-        totalScenes: Int
-    ): String {
-        val cleaned = rawEmotion?.trim()?.lowercase().orEmpty()
-        val allowed = setOf("hook", "excited", "climax", "suspense", "sad", "emotional", "roast", "question", "warm", "normal")
-        if (cleaned in allowed && cleaned != "normal") {
-            return if (cleaned == "emotional") "sad" else cleaned
-        }
-
-        val text = voiceoverText.trim()
-        return when {
-            sceneIndex == 0 -> if (text.contains("?")) "question" else "hook"
-            text.contains("?") -> "question"
-            text.contains("!") -> if (sceneIndex >= totalScenes - 2) "climax" else "excited"
-            text.contains("...") -> "suspense"
-            sceneIndex == totalScenes - 1 -> "warm"
-            else -> if (cleaned == "emotional") "sad" else "normal"
-        }
     }
 
     private fun extractJsonPayload(rawText: String): String {
@@ -1572,7 +1775,6 @@ class VideoRepositoryImpl @Inject constructor(
 
     private suspend fun <T> callWithHttpUrl(
         maxAttempts: Int = MAX_API_ATTEMPTS,
-        retryDelayMs: Long = 1500L,
         request: suspend () -> T
     ): T {
         var lastError: Throwable? = null
@@ -1588,13 +1790,13 @@ class VideoRepositoryImpl @Inject constructor(
                 val wrapped = IllegalStateException("HTTP $code Error at URL: $url. Body: $body", error)
                 lastError = wrapped
                 if ((code == 429 || code in 500..599) && attempt < maxAttempts - 1) {
-                    delay(retryDelayMs * (attempt + 1))
+                    delay(1500L * (attempt + 1))
                 } else {
                     throw wrapped
                 }
             } catch (error: IOException) {
                 lastError = error
-                if (attempt < maxAttempts - 1) delay(retryDelayMs * (attempt + 1)) else throw error
+                if (attempt < maxAttempts - 1) delay(1500L * (attempt + 1)) else throw error
             }
         }
         throw lastError ?: IllegalStateException("API request failed.")
@@ -1624,67 +1826,54 @@ class VideoRepositoryImpl @Inject constructor(
         const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-        const val SHORTS_IMAGE_WIDTH = 768
-        const val SHORTS_IMAGE_HEIGHT = 1344
-        const val LANDSCAPE_IMAGE_WIDTH = 1344
-        const val LANDSCAPE_IMAGE_HEIGHT = 768
+        const val SHORTS_IMAGE_WIDTH = 576
+        const val SHORTS_IMAGE_HEIGHT = 1024
+        const val LANDSCAPE_IMAGE_WIDTH = 1024
+        const val LANDSCAPE_IMAGE_HEIGHT = 576
 
         const val IMAGE_PROMPT_RULES =
-            "PRIORITY 0 — USER-DESCRIBED SCENES & VISUALS ALWAYS WIN (HIGHEST PRIORITY):\n" +
+            "PRIORITY 0 — USER-DESCRIBED SCENES & TOPIC APPROPRIATENESS ALWAYS WIN (HIGHEST PRIORITY):\n" +
                 "- Whenever the user's prompt or script explicitly describes a specific visual scene, character appearance, outfit, location, lighting, style, camera shot, or action (whether in Hindi, Hinglish, or English, e.g., 'pehle scene me...', 'Scene 1:', '[Visual: ...]'), YOU MUST generate that EXACT visual in image_prompt and set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- Front-load the exact described subject, costume/outfit, action, setting, props, and lighting in the FIRST 25-35 words of image_prompt so the image generator prioritizes them!\n" +
                 "- If the user asks for a specific style (e.g., anime, 3D Pixar, noir, cyberpunk) or forbids posters/comics/real_photo, strictly honor that style across every scene.\n" +
-                "- SCENE-BY-SCENE CHARACTER & ACTION MATCHING: NEVER put the main hero alone in every scene! If a scene talks about a monkey, butterfly, food, spices, cooking pot, crowd, mud splash, rainbow sky, or water spray, describe THAT EXACT subject and action in the first 15 words of image_prompt, and set has_character=false whenever the scene is focused on objects, food, scenery, or secondary characters!\n\n" +
-                "TOPIC-FIT VIDEO CLIPS, MEMES, 2-PHOTO SPLITS & STAT BADGES:\n" +
-                "- ONLY use 'video_clip' (2-5 scenes) and 'meme_clip' (1-2 scenes) when the topic actually involves MOVIES, TRAILERS, ACTORS, POP-CULTURE, or COMEDY ROASTS where real footage/memes genuinely belong! For cooking/recipes, food, facts, tech, tutorials, devotional, motivation, or general stories, keep visual_source='ai_generated' (no unrelated Coub clips or Pikachu memes!).\n" +
-                "- When 'video_clip' fits: give EACH clip a DIFFERENT concrete 2-3 word recognizable English movie/character/action query (e.g., 'Avengers Endgame', 'Robert Downey Jr', 'Thanos snap', 'Doctor Strange portal'). NEVER repeat queries, and NEVER use abstract phrases like '4 out of 5 stars', 'rating', 'review', 'multiverse', 'subscribe', or 'ending'.\n" +
-                "- When 'meme_clip' fits: set real_photo_query to a named, well-known meme template (e.g., 'Hera Pheri paisa', 'mind blown', 'Leonardo DiCaprio toast', 'spiderman pointing').\n" +
-                "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, before-after, or vs scenes, set layout_mode='split' (or 'flip') and fill BOTH primary AND secondary visual fields!\n" +
-                "- STAT BADGES: Whenever a scene announces a HUGE number, time limit, budget, box office record, or release date (e.g. '60 SEC CHALLENGE', '$150M PRE-SALES', '₹2000 CR BUDGET'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
-                "REAL PHOTO / POSTER vs REALISTIC SCENE AI IMAGE RULES (When scene is not video_clip/meme_clip and user did NOT specify a custom/animated style):\n" +
-                "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR / FILMMAKER named in the scene (e.g., Russo Brothers, Christopher Nolan, Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr, Pedro Pascal, Chris Evans):\n" +
-                "     ALWAYS set visual_source='real_photo' and real_photo_query to ONLY their clean English name — NEVER generate distorted AI faces for real directors or actors!\n" +
-                "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene:\n" +
-                "     Set visual_source='real_photo' and real_photo_query to '<Exact Clean English Title> movie poster'.\n" +
-                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN:\n" +
-                "     * 1 or 2 iconic character reveals: visual_source='real_photo' and real_photo_query='<Clean English Character Name> character'.\n" +
-                "     * ALL STORY / ACTION / DIALOGUE scenes: visual_source='ai_generated' with raw LIVE-ACTION FILM PHOTOGRAPH image_prompt.\n" +
-                "  4) ALL OTHER SCENES (including cooking, food, lifestyle, science, kids, business): set visual_source='ai_generated' and real_photo_query=''.\n" +
-                "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab.\n\n" +
+                "- SCENE-BY-SCENE SUBJECT & ACTION MATCHING: Match EVERY image_prompt 100% to THAT slab's voiceover! For food/cooking recipes show steamy handi, saffron rice, spices, sizzling tadka, ingredients; for history/mythology show period palaces, warriors, landscapes; NEVER put a random person or cinema theater in non-movie scenes! Set has_character=false whenever a scene focuses on food, scenery, props, or secondary subjects.\n\n" +
+                "DYNAMIC CLIPS, MEMES, 2-PHOTO SPLITS & STAT BADGES (USE ONLY WHEN TOPIC FITS):\n" +
+                "- 'video_clip' (ONLY for movie reviews, trailer breakdowns, celebrity news, or pop-culture roasts — USE 0 video_clips for cooking recipes, tutorials, kids stories, devotional/history explainers, or pure AI animation): Set visual_source='video_clip', layout_mode='single', and give EACH clip a DIFFERENT, concrete 2-3 word recognizable English movie/character/action query (e.g., 'Avengers Endgame', 'Robert Downey Jr', 'Thanos snap'). NEVER repeat queries and NEVER query abstract words like 'rating', 'review', 'stars', 'ending', or 'multiverse'.\n" +
+                "- 'meme_clip' (ONLY 1-2 scenes in funny roasts/movie gossip; USE 0 meme_clips in recipes, tutorials, serious/sad, devotional, or educational topics!): Set visual_source='meme_clip', layout_mode='single', and real_photo_query to a named meme template.\n" +
+                "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, or vs scenes, set layout_mode='split' (or 'flip') with visual_source in {'real_photo','ai_generated'} and fill visual_source_2, real_photo_query_2, image_prompt_2.\n" +
+                "- STAT BADGES: Whenever a scene announces a HUGE number, key temperature/timer, budget, or release date (e.g. '₹2000 CR BUDGET', '15 MIN DUM'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
+                "REAL PHOTO / POSTER vs AI IMAGE RULES (When scene is not video_clip/meme_clip and user did NOT specify an animated style):\n" +
+                "  1) REAL-WORLD ACTOR / DIRECTOR / PUBLIC FIGURE named in the scene (e.g., Russo Brothers, Christopher Nolan, Prabhas, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr, Pedro Pascal): set visual_source='real_photo' and real_photo_query to ONLY their clean English name.\n" +
+                "  2) SPECIFIC MOVIE / WEB SERIES highlighted in the scene: set visual_source='real_photo' and real_photo_query to '<Exact Clean English Title> movie poster'.\n" +
+                "  3) FICTIONAL CHARACTER / SUPERHERO reveal: 1-2 iconic reveals may use visual_source='real_photo' with '<Clean English Character Name> character'; action/story beats use visual_source='ai_generated'.\n" +
+                "  4) COOKING, RECIPES, STORYTELLING, SCIENCE, DEVOTIONAL & ALL OTHER SCENES: set visual_source='ai_generated' and real_photo_query=''.\n" +
+                "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab (even video_clip/meme_clip/real_photo scenes).\n\n" +
                 "IMAGE PROMPT RULES (SINGLE UNIFIED SCENE — ZERO TEXT / ZERO GIBBERISH / ZERO BAD HANDS):\n" +
                 "- Every image_prompt MUST describe ONE SINGLE CONTINUOUS CAMERA SHOT of the exact scene (never collages, grids, wallpapers, sticker patterns, or multiple panels).\n" +
-                "- NEVER write movie titles, channel names, signs, logos, neon letters, cinema marquees, or words inside image_prompt (no 'Secret Wars', 'RS Movie Spot', 'neon sign', 'billboard', or 'poster' inside ai_generated prompts).\n" +
-                "- NEVER prompt hands holding objects close to camera (NEVER write 'holding microphone' or 'holding phone' — use 'podcast host seated cleanly behind desk studio condenser mic on boom arm, relaxed natural posture').\n" +
-                "- Match visual medium to the topic: if it's a cooking/food video, describe steaming dishes, spices, kitchen lighting, macro food photography; if it's a movie/action story, describe 35mm cinema set photography with realistic lighting — NEVER force 'cinema theater' into non-movie prompts!\n" +
-                "- Vary camera framing across scenes (wide shot, medium shot, macro close-up, over-the-shoulder, low-angle).\n\n"
+                "- NEVER write movie titles, channel names, signs, logos, neon letters, cinema marquees, or words inside image_prompt.\n" +
+                "- NEVER prompt hands gripping microphones or phones close to camera.\n" +
+                "- Unless user specifies animation/3D/anime/cartoon, write every image_prompt as a REAL LIVE-ACTION 35mm DSLR PHOTOGRAPH (natural textures, steam, warm lighting, shallow depth of field).\n" +
+                "- NEVER write 'box office', 'records', 'close-up eyes', 'comment box', 'subscribe', 'UI', 'poster', or 'text' inside image_prompt.\n" +
+                "- Vary camera framing across scenes (overhead food shot, wide shot, medium shot, close-up macro, low-angle).\n\n"
 
         const val VOICE_AND_BGM_RULES =
             "VOICE EMOTION, BGM & YOUTUBE METADATA RULES:\n" +
                 "- Pick bgm_mood: 'comedy_roast', 'epic_action', 'suspense_thriller', 'emotional_sad', 'devotional', 'sci_fi_tech', 'motivational', or 'horror_dark'.\n" +
-                "- For EACH scene, pick the most fitting voice_emotion so audio pacing & tone shift dynamically:\n" +
-                "  * 'hook' = bold energetic opening grab\n" +
-                "  * 'excited' = high-energy hype, joy, delicious/wow reveal\n" +
-                "  * 'climax' = dramatic peak impact / finale\n" +
-                "  * 'suspense' = tense, secret, slow build-up\n" +
-                "  * 'sad' = heartfelt, nostalgic, emotional drop\n" +
-                "  * 'roast' = playful, witty, sarcastic punchline\n" +
-                "  * 'question' = curious rising intonation\n" +
-                "  * 'warm' = friendly, comforting explanation\n" +
-                "  * 'normal' = neutral transition\n" +
-                "- Pick valid Edge TTS voice_name matching the requested language AND gender (e.g. hi-IN-MadhurNeural, hi-IN-SwaraNeural, en-IN-PrabhatNeural, en-IN-NeerjaNeural, en-US-AndrewNeural, en-US-AvaNeural).\n" +
-                "- Also generate youtube_title (catchy <75 chars viral title with 1 emoji), youtube_description (2-3 crisp SEO lines for RS Movie Spot), youtube_hashtags ('#shorts ...'), and pinned_comment (a debate/question to spark viewer comments).\n\n"
+                "- For each scene, match voice_emotion dynamically from: 'hook', 'excited', 'climax', 'suspense', 'sad', 'roast', 'question', 'warm', or 'normal' (avoid repeating 'normal' on every line!).\n" +
+                "- Pick valid Edge TTS voice_name (e.g. hi-IN-MadhurNeural, hi-IN-SwaraNeural, en-IN-PrabhatNeural, en-IN-NeerjaNeural, en-US-AndrewNeural, en-US-AvaNeural, etc.).\n" +
+                "- Also generate youtube_title (catchy <75 chars viral title with 1 emoji), youtube_description (2-3 crisp SEO lines), youtube_hashtags ('#shorts ...'), and pinned_comment (a question to spark viewer comments).\n\n"
 
         const val JSON_SCHEMA_SPEC =
             "Return ONLY ONE valid JSON object (no markdown fences, no commentary) matching this schema:\n" +
                 "{\n" +
-                "  \"character_bible\": \"Fixed simple visual look of main character in English (no random hats/outfits unless needed)\",\n" +
-                "  \"visual_style\": \"Visual medium matching user request (e.g. Raw 35mm DSLR photography, Culinary macro film, or 3D Pixar animation)\",\n" +
+                "  \"character_bible\": \"Fixed simple visual look of main character or visual theme in English\",\n" +
+                "  \"visual_style\": \"Visual medium matching user request (e.g. Raw live-action 35mm film photography or 3D Pixar animation)\",\n" +
                 "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
-                "  \"voice_name\": \"Edge TTS voice shortName strictly matching requested language and gender\",\n" +
+                "  \"voice_name\": \"Edge TTS voice shortName matching language and gender\",\n" +
                 "  \"youtube_title\": \"Catchy viral YouTube title under 75 chars\",\n" +
-                "  \"youtube_description\": \"2-3 line SEO YouTube description mentioning RS Movie Spot\",\n" +
-                "  \"youtube_hashtags\": \"#shorts #viral #rsmoviespot\",\n" +
-                "  \"pinned_comment\": \"Debate question to boost comments on this video\",\n" +
+                "  \"youtube_description\": \"2-3 line SEO YouTube description\",\n" +
+                "  \"youtube_hashtags\": \"#shorts #viral #storytelling\",\n" +
+                "  \"pinned_comment\": \"Engaging question to boost comments on this video\",\n" +
                 "  \"slabs\": [\n" +
                 "    {\n" +
                 "      \"voiceover_text\": \"Natural complete clause of 6-11 words (NEVER cut mid-name or across period)\",\n" +
@@ -1695,7 +1884,7 @@ class VideoRepositoryImpl @Inject constructor(
                 "      \"visual_source_2\": \"real_photo | ai_generated | ''\",\n" +
                 "      \"real_photo_query_2\": \"2nd photo query if split/flip and real_photo, else ''\",\n" +
                 "      \"image_prompt_2\": \"2nd scene English prompt if split/flip, else ''\",\n" +
-                "      \"stat_badge\": \"Optional 2-4 word uppercase stat headline (e.g. '60 SEC RECIPE!') or ''\",\n" +
+                "      \"stat_badge\": \"Optional 2-4 word uppercase stat headline or ''\",\n" +
                 "      \"has_character\": false,\n" +
                 "      \"image_prompt\": \"Front-loaded crisp English prompt matching THAT scene's exact visual shot (no text/words/logos)\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
@@ -1704,7 +1893,7 @@ class VideoRepositoryImpl @Inject constructor(
                 "}"
 
         const val FULL_SCRIPT_SYSTEM_PROMPT =
-            "You are a film director splitting an existing user-written script into fast visual scenes for RS Movie Spot.\n" +
+            "You are a film director splitting an existing user-written script into fast visual scenes.\n" +
                 "CRITICAL FULL SCRIPT RULES:\n" +
                 "- DO NOT rewrite, paraphrase, translate, summarize, add, drop, or change EVEN A SINGLE WORD of the user's spoken input.\n" +
                 "- Keep exact user words intact and split sequentially into 12 to 18 natural spoken scenes (~6-11 words / ~2.3-3.5s each).\n" +
@@ -1716,14 +1905,14 @@ class VideoRepositoryImpl @Inject constructor(
                 JSON_SCHEMA_SPEC
 
         const val TOPIC_SYSTEM_PROMPT =
-            "You are an elite YouTube storyteller, scriptwriter, and film director for RS Movie Spot.\n" +
+            "You are an elite YouTube storyteller, scriptwriter, and film director.\n" +
                 "Think like ONE continuous spoken storyteller where every scene's voiceover_text is the NEXT flowing phrase of the same unbroken story!\n\n" +
                 "RULE 1 — CONTINUOUS HIGH-RETENTION FAST-PACED SCRIPT (13 TO 16 SCENES):\n" +
                 "- Create 13 to 16 ultra-crisp scenes (~7-10 words / ~2.4-3.2s each for Shorts; 14-18 scenes for 16:9 YouTube) with seamless spoken transitions so visuals change every ~3 seconds and NO single image sits static!\n" +
                 "- NEVER split a full name or sentence awkwardly mid-name across slabs.\n" +
                 "- Put an explosive 2-second hook in Scene 1 with a bold number or shocking question.\n" +
                 "- Use natural spoken punctuation ('!', '?', '...') so TTS pitch rises and falls dramatically.\n" +
-                "- When writing in Hindi: use accurate Devanagari spelling (करोड़, बॉक्स ऑफिस, थिएटर, डूम्ज़-डे) and MANDATORY respectful plural pronouns (वे, उनकी, उनका, उन्हें) for deities and heroes — NEVER singular वह/उसकी/उसका.\n" +
+                "- When writing in Hindi: use accurate Devanagari spelling (करोड़, बॉक्स ऑफिस, थिएटर, डूम्ज़-डे) and MANDATORY respectful plural pronouns (वे, उनकी, उनका, उन्हें) for deities and elders.\n" +
                 "- Never put unescaped double quotes inside JSON strings (use single quotes if needed) and always close both ']' and '}'.\n\n" +
                 IMAGE_PROMPT_RULES +
                 VOICE_AND_BGM_RULES +
