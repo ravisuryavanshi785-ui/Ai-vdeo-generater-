@@ -81,15 +81,15 @@ private data class PopCaptionChunk(
     val file: File,
     val stripHeight: Int,
     val startSeconds: Double,
-    val endSeconds: Double,
-    val isLastChunk: Boolean
+    val endSeconds: Double
 )
 
 private data class PreparedSceneVisual(
-    val clipFile: File? = null,
+    val rawClipFile: File? = null,
     val imageFile1: File? = null,
     val imageFile2: File? = null,
-    val layoutMode: String = "single"
+    val transitionFrameFile: File? = null,
+    val isLiveVisual: Boolean = false
 )
 
 private enum class BgmStyle {
@@ -151,22 +151,21 @@ class VideoRenderEngine @Inject constructor(
             val activeVoiceName = if (language != VideoLanguage.AUTO) {
                 language.resolveVoice(voiceGender)
             } else {
-                script.voice_name.ifBlank { VideoLanguage.HINDI.resolveVoice(voiceGender) }
+                enforceVoiceGender(script.voice_name, voiceGender)
             }
+            val wantsMaleVoice = voiceGender == VoiceGender.MALE
 
             val baseSeed = (topic.trim().lowercase().hashCode() and 0x7FFFFFFF)
                 .coerceAtLeast(1000)
 
-            progress(7, "Recording studio voiceover…")
+            progress(7, "Recording expressive voiceover…")
             val trimmedVoiceWavs = synthesizeAndTrimVoiceClips(
                 renderDirectory = renderDirectory,
                 slabs = script.slabs,
                 voiceName = activeVoiceName,
+                wantsMaleVoice = wantsMaleVoice,
                 voiceTone = voiceTone,
-                progressUpdate = { done, total ->
-                    val pct = 7 + (done * 13 / total.coerceAtLeast(1))
-                    progress(pct.coerceIn(7, 20), "Recording studio voice ($done/$total)…")
-                }
+                progress = progress
             )
 
             val voiceListFile = File(renderDirectory, "voice_parts.txt")
@@ -202,33 +201,34 @@ class VideoRenderEngine @Inject constructor(
                 renderSubscribeEndCardPng(it, isShorts)
             }
 
-            val slabCount = script.slabs.size
-            progress(22, "Generating HD AI scenes & fetching clips (3x parallel)…")
+            progress(18, "Fetching HD visuals & clips…")
             val preparedVisuals = prepareAllSceneVisuals(
                 renderDirectory = renderDirectory,
-                script = script,
+                slabs = script.slabs,
+                characterBible = script.character_bible,
+                visualStyle = script.visual_style,
                 isShorts = isShorts,
                 width = width,
                 height = height,
-                baseSeed = baseSeed
-            ) { done, total ->
-                val pct = 22 + (done * 38 / total.coerceAtLeast(1))
-                progress(pct.coerceIn(22, 60), "Prepared visual $done of $total…")
-            }
+                baseSeed = baseSeed,
+                progress = progress
+            )
 
             val videoSegmentFiles = mutableListOf<File>()
+            val slabCount = script.slabs.size
             var coverBaseImageFile: File? = null
-            var prevTransitionVisual: File? = null
+            var prevTransitionFile: File? = null
 
             script.slabs.forEachIndexed { index, slab ->
-                val encodePct = 60 + (index * 24 / slabCount.coerceAtLeast(1))
-                progress(encodePct.coerceIn(60, 84), "Editing scene ${index + 1} of $slabCount…")
+                val encodeProgress = 48 + (index * 36 / slabCount)
+                progress(
+                    encodeProgress.coerceIn(48, 84),
+                    "Rendering smooth scene ${index + 1} of $slabCount…"
+                )
 
                 val videoSegmentFile = File(renderDirectory, "vseg_${index + 1}.mp4")
                 val segmentExactDuration = sceneFramesList[index].toDouble() / FRAME_RATE
                 val visual = preparedVisuals[index]
-                val incomingPrevVisual = prevTransitionVisual?.takeIf { it.exists() && it.length() > 1024L }
-                var nextTransitionVisual: File? = null
 
                 val popCaptions = runCatching {
                     createPopCaptionOverlays(
@@ -260,8 +260,8 @@ class VideoRenderEngine @Inject constructor(
                 )
 
                 var encodedClip = false
-                val rawClipFile = visual.clipFile
-                if (rawClipFile != null && rawClipFile.exists() && rawClipFile.length() > 10_000L) {
+                val rawClipFile = visual.rawClipFile
+                if (rawClipFile != null && rawClipFile.exists()) {
                     if (index == 0 && coverBaseImageFile == null) {
                         val rawCover = File(renderDirectory, "cover_raw_clip.png")
                         val gotRawCover = runCatching {
@@ -282,7 +282,7 @@ class VideoRenderEngine @Inject constructor(
                         runFfmpeg(
                             createVideoClipSegmentArguments(
                                 clipFile = rawClipFile,
-                                prevTransitionFile = incomingPrevVisual,
+                                prevTransitionFile = prevTransitionFile,
                                 overlaySpecs = overlaySpecs,
                                 outputFile = videoSegmentFile,
                                 width = width,
@@ -295,30 +295,29 @@ class VideoRenderEngine @Inject constructor(
                         videoSegmentFile.exists() && videoSegmentFile.length() > 2048L
                     }.getOrDefault(false)
 
-                    if (encodedClip && index < slabCount - 1) {
-                        val clipTailRaw = File(renderDirectory, "clip_tail_raw_${index + 1}.png")
-                        val clipTailStudio = File(renderDirectory, "clip_tail_studio_${index + 1}.png")
-                        val tailOk = runCatching {
+                    if (encodedClip) {
+                        val tailRaw = File(renderDirectory, "clip_tail_raw_${index + 1}.png")
+                        val tailReady = File(renderDirectory, "clip_tail_${index + 1}.png")
+                        val gotTail = runCatching {
                             runFfmpeg(
                                 arrayOf(
-                                    "-y", "-ss", "0.40",
+                                    "-y", "-sseof", "-0.15",
                                     "-i", rawClipFile.absolutePath,
                                     "-vframes", "1",
-                                    clipTailRaw.absolutePath
+                                    tailRaw.absolutePath
                                 )
                             )
-                            clipTailRaw.exists() &&
-                                composeStudioFrameFromRealPhoto(clipTailRaw, clipTailStudio, width, height) &&
-                                clipTailStudio.exists()
+                            tailRaw.exists() &&
+                                composeStudioFrameFromRealPhoto(tailRaw, tailReady, width, height)
                         }.getOrDefault(false)
-                        clipTailRaw.delete()
-                        if (tailOk) nextTransitionVisual = clipTailStudio
+                        tailRaw.delete()
+                        prevTransitionFile = if (gotTail) tailReady else visual.transitionFrameFile
                     }
                     rawClipFile.delete()
                 }
 
                 if (!encodedClip) {
-                    val imageFile1 = visual.imageFile1 ?: File(renderDirectory, "fallback_${index + 1}.png").also {
+                    val imageFile1 = visual.imageFile1 ?: File(renderDirectory, "fb_emerg_${index + 1}.png").also {
                         createFallbackCinemaFrame(it, width, height, index)
                     }
                     if (index == 0 && coverBaseImageFile == null) {
@@ -327,16 +326,18 @@ class VideoRenderEngine @Inject constructor(
                         }
                     }
 
+                    val layoutMode = slab.layout_mode.lowercase().trim()
                     val imageFile2 = visual.imageFile2
-                    if ((visual.layoutMode == "split" || visual.layoutMode == "flip") && imageFile2 != null) {
-                        if (visual.layoutMode == "split") {
+
+                    if ((layoutMode == "split" || layoutMode == "flip") && imageFile2 != null && imageFile2.exists()) {
+                        if (layoutMode == "split") {
                             composeSplitFrame(imageFile1, imageFile2, imageFile1, width, height)
                             runFfmpeg(
                                 createVideoOnlySegmentArguments(
                                     sceneIndex = index,
                                     totalScenes = slabCount,
                                     imageFile = imageFile1,
-                                    prevTransitionFile = incomingPrevVisual,
+                                    prevTransitionFile = prevTransitionFile,
                                     overlaySpecs = overlaySpecs,
                                     outputFile = videoSegmentFile,
                                     width = width,
@@ -344,7 +345,7 @@ class VideoRenderEngine @Inject constructor(
                                     segmentFrames = sceneFramesList[index]
                                 )
                             )
-                            nextTransitionVisual = imageFile1
+                            prevTransitionFile = imageFile1
                         } else {
                             runFfmpeg(
                                 createFlipVideoSegmentArguments(
@@ -352,7 +353,7 @@ class VideoRenderEngine @Inject constructor(
                                     totalScenes = slabCount,
                                     imageFile1 = imageFile1,
                                     imageFile2 = imageFile2,
-                                    prevTransitionFile = incomingPrevVisual,
+                                    prevTransitionFile = prevTransitionFile,
                                     overlaySpecs = overlaySpecs,
                                     outputFile = videoSegmentFile,
                                     width = width,
@@ -360,7 +361,7 @@ class VideoRenderEngine @Inject constructor(
                                     segmentFrames = sceneFramesList[index]
                                 )
                             )
-                            nextTransitionVisual = imageFile2
+                            prevTransitionFile = imageFile2
                         }
                     } else {
                         runFfmpeg(
@@ -368,7 +369,7 @@ class VideoRenderEngine @Inject constructor(
                                 sceneIndex = index,
                                 totalScenes = slabCount,
                                 imageFile = imageFile1,
-                                prevTransitionFile = incomingPrevVisual,
+                                prevTransitionFile = prevTransitionFile,
                                 overlaySpecs = overlaySpecs,
                                 outputFile = videoSegmentFile,
                                 width = width,
@@ -376,11 +377,10 @@ class VideoRenderEngine @Inject constructor(
                                 segmentFrames = sceneFramesList[index]
                             )
                         )
-                        nextTransitionVisual = imageFile1
+                        prevTransitionFile = imageFile1
                     }
                 }
 
-                prevTransitionVisual = nextTransitionVisual
                 videoSegmentFiles += videoSegmentFile
             }
 
@@ -411,7 +411,7 @@ class VideoRenderEngine @Inject constructor(
                 if (extracted) coverBaseImageFile = extractedCover
             }
 
-            progress(90, "Mastering studio voice & auto-ducked BGM…")
+            progress(90, "Mastering emotional voice & studio BGM…")
             val mixedAudioFile = File(renderDirectory, "final_audio.m4a")
             val finalAudioReady = mixAudioTrackSafely(
                 renderDirectory = renderDirectory,
@@ -423,7 +423,7 @@ class VideoRenderEngine @Inject constructor(
                 outputFile = mixedAudioFile
             )
 
-            progress(94, "Finalizing video file…")
+            progress(93, "Finalizing video file…")
             val finalFile = File(renderDirectory, "final_video.mp4")
             muxFinalVideo(
                 silentVideoFile = silentVideoFile,
@@ -433,7 +433,7 @@ class VideoRenderEngine @Inject constructor(
                 outputFile = finalFile
             )
 
-            progress(97, "Saving video & cover thumbnail…")
+            progress(96, "Saving video & cover thumbnail…")
             val exportTitle = script.youtube_title.ifBlank { topic }
             val actionUri = publishToMediaStore(finalFile, exportTitle)
             val thumbnailUri = coverBaseImageFile?.let { baseImg ->
@@ -464,107 +464,175 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
+    private fun enforceVoiceGender(rawVoiceName: String, requestedGender: VoiceGender): String {
+        val candidate = rawVoiceName.trim()
+        if (candidate.isBlank()) return VideoLanguage.HINDI.resolveVoice(requestedGender)
+
+        val matchedLang = VideoLanguage.values().firstOrNull { lang ->
+            lang != VideoLanguage.AUTO && (
+                lang.maleVoice.equals(candidate, ignoreCase = true) ||
+                    lang.femaleVoice.equals(candidate, ignoreCase = true)
+                )
+        }
+        if (matchedLang != null) {
+            return matchedLang.resolveVoice(requestedGender)
+        }
+
+        val localePrefix = candidate.split('-').take(2).joinToString("-")
+        if (localePrefix.isNotBlank()) {
+            val langByPrefix = VideoLanguage.values().firstOrNull { lang ->
+                lang != VideoLanguage.AUTO &&
+                    lang.maleVoice.startsWith("$localePrefix-", ignoreCase = true)
+            }
+            if (langByPrefix != null) {
+                return langByPrefix.resolveVoice(requestedGender)
+            }
+        }
+
+        return VideoLanguage.HINDI.resolveVoice(requestedGender)
+    }
+
     private suspend fun prepareAllSceneVisuals(
         renderDirectory: File,
-        script: VideoScriptResponse,
+        slabs: List<VideoSlab>,
+        characterBible: String,
+        visualStyle: String,
         isShorts: Boolean,
         width: Int,
         height: Int,
         baseSeed: Int,
-        progressUpdate: (Int, Int) -> Unit
+        progress: (Int, String) -> Unit
     ): List<PreparedSceneVisual> = coroutineScope {
-        val semaphore = Semaphore(3)
-        val total = script.slabs.size
+        val total = slabs.size.coerceAtLeast(1)
         val completedCount = AtomicInteger(0)
+        val semaphore = Semaphore(2)
         val usedRealPhotoUrls = ConcurrentHashMap.newKeySet<String>()
         val usedClipUrls = ConcurrentHashMap.newKeySet<String>()
 
-        script.slabs.mapIndexed { index, slab ->
+        val initialResults = slabs.mapIndexed { index, slab ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
-                    val isVideoClip = slab.visual_source.equals("video_clip", ignoreCase = true) ||
-                        slab.visual_source.equals("meme_clip", ignoreCase = true)
+                    val prepared = withTimeoutOrNull(95_000L) {
+                        val isVideoClip = slab.visual_source.equals("video_clip", ignoreCase = true) ||
+                            slab.visual_source.equals("meme_clip", ignoreCase = true)
 
-                    var clipFile: File? = null
-                    if (isVideoClip && slab.real_photo_query.isNotBlank()) {
-                        val rawClip = File(renderDirectory, "clip_raw_${index + 1}.mp4")
-                        val downloaded = withTimeoutOrNull(45_000L) {
-                            runCatching {
+                        var rawClip: File? = null
+                        if (isVideoClip && slab.real_photo_query.isNotBlank()) {
+                            val candidateClip = File(renderDirectory, "clip_raw_${index + 1}.mp4")
+                            val downloaded = runCatching {
                                 videoRepository.downloadInternetVideoClip(
                                     query = slab.real_photo_query,
                                     isMeme = slab.visual_source.equals("meme_clip", ignoreCase = true),
                                     usedUrls = usedClipUrls,
-                                    destinationFile = rawClip
+                                    destinationFile = candidateClip
                                 )
                             }.getOrDefault(false)
-                        } ?: false
-                        if (downloaded && rawClip.exists() && rawClip.length() > 10_000L) {
-                            clipFile = rawClip
-                        } else {
-                            rawClip.delete()
+                            if (downloaded) rawClip = candidateClip else candidateClip.delete()
                         }
-                    }
 
-                    if (clipFile != null) {
-                        progressUpdate(completedCount.incrementAndGet(), total)
-                        return@withPermit PreparedSceneVisual(clipFile = clipFile, layoutMode = "single")
-                    }
+                        if (rawClip != null) {
+                            PreparedSceneVisual(rawClipFile = rawClip, isLiveVisual = true)
+                        } else {
+                            val layoutMode = slab.layout_mode.lowercase().trim()
+                            val primaryPair = resolveSceneImageFileOrNull(
+                                renderDirectory = renderDirectory,
+                                tag = "${index + 1}_1",
+                                visualSource = if (isVideoClip) "real_photo" else slab.visual_source,
+                                realQuery = slab.real_photo_query,
+                                scenePrompt = slab.image_prompt,
+                                characterBible = characterBible,
+                                visualStyle = visualStyle,
+                                hasCharacter = slab.has_character,
+                                isShorts = isShorts,
+                                width = width,
+                                height = height,
+                                seed = baseSeed + (index * 37),
+                                usedUrls = usedRealPhotoUrls,
+                                sceneIndex = index
+                            )
 
-                    val layoutMode = slab.layout_mode.lowercase().trim()
-                    val imageFile1 = resolveSceneImageFile(
-                        renderDirectory = renderDirectory,
-                        tag = "${index + 1}_1",
-                        visualSource = if (isVideoClip) "real_photo" else slab.visual_source,
-                        realQuery = slab.real_photo_query,
-                        scenePrompt = slab.image_prompt,
-                        characterBible = script.character_bible,
-                        visualStyle = script.visual_style,
-                        hasCharacter = slab.has_character,
-                        isShorts = isShorts,
-                        width = width,
-                        height = height,
-                        seed = baseSeed + (index * 37),
-                        usedUrls = usedRealPhotoUrls,
-                        sceneIndex = index
-                    )
+                            val hasSecondPrompt = slab.image_prompt_2.isNotBlank() ||
+                                (slab.visual_source_2.equals("real_photo", ignoreCase = true) &&
+                                    slab.real_photo_query_2.isNotBlank())
 
-                    val hasSecondPrompt = slab.image_prompt_2.isNotBlank() ||
-                        (slab.visual_source_2.equals("real_photo", ignoreCase = true) &&
-                            slab.real_photo_query_2.isNotBlank())
+                            val img2 = if ((layoutMode == "split" || layoutMode == "flip") && hasSecondPrompt) {
+                                resolveSceneImageFileOrNull(
+                                    renderDirectory = renderDirectory,
+                                    tag = "${index + 1}_2",
+                                    visualSource = slab.visual_source_2.ifBlank { "ai_generated" },
+                                    realQuery = slab.real_photo_query_2,
+                                    scenePrompt = slab.image_prompt_2.ifBlank { slab.image_prompt },
+                                    characterBible = characterBible,
+                                    visualStyle = visualStyle,
+                                    hasCharacter = slab.has_character,
+                                    isShorts = isShorts,
+                                    width = width,
+                                    height = height,
+                                    seed = baseSeed + (index * 37) + 19,
+                                    usedUrls = usedRealPhotoUrls,
+                                    sceneIndex = index
+                                )?.first
+                            } else {
+                                null
+                            }
 
-                    val imageFile2 = if ((layoutMode == "split" || layoutMode == "flip") && hasSecondPrompt) {
-                        resolveSceneImageFile(
-                            renderDirectory = renderDirectory,
-                            tag = "${index + 1}_2",
-                            visualSource = slab.visual_source_2.ifBlank { "ai_generated" },
-                            realQuery = slab.real_photo_query_2,
-                            scenePrompt = slab.image_prompt_2.ifBlank { slab.image_prompt },
-                            characterBible = script.character_bible,
-                            visualStyle = script.visual_style,
-                            hasCharacter = slab.has_character,
-                            isShorts = isShorts,
-                            width = width,
-                            height = height,
-                            seed = baseSeed + (index * 37) + 19,
-                            usedUrls = usedRealPhotoUrls,
-                            sceneIndex = index
-                        )
-                    } else {
-                        null
-                    }
+                            if (primaryPair != null) {
+                                PreparedSceneVisual(
+                                    imageFile1 = primaryPair.first,
+                                    imageFile2 = img2,
+                                    transitionFrameFile = img2 ?: primaryPair.first,
+                                    isLiveVisual = true
+                                )
+                            } else {
+                                PreparedSceneVisual(isLiveVisual = false)
+                            }
+                        }
+                    } ?: PreparedSceneVisual(isLiveVisual = false)
 
-                    progressUpdate(completedCount.incrementAndGet(), total)
-                    PreparedSceneVisual(
-                        imageFile1 = imageFile1,
-                        imageFile2 = imageFile2,
-                        layoutMode = if (imageFile2 != null) layoutMode else "single"
-                    )
+                    val done = completedCount.incrementAndGet()
+                    val pct = 18 + (done * 28 / total)
+                    progress(pct.coerceIn(18, 46), "Prepared visual $done of $total…")
+                    prepared
                 }
             }
-        }.awaitAll()
+        }.awaitAll().toMutableList()
+
+        val validImagePool = initialResults.mapNotNull { it.imageFile1?.takeIf { f -> f.exists() && f.length() > 2048L } }
+        var globalFallbackImg: File? = null
+
+        for (i in initialResults.indices) {
+            if (initialResults[i].isLiveVisual) continue
+
+            val reusedSource = if (validImagePool.isNotEmpty()) {
+                val neighborOffset = listOf(1, -1, 2, -2, 3, -3)
+                    .mapNotNull { delta -> initialResults.getOrNull(i + delta)?.imageFile1 }
+                    .firstOrNull { it.exists() && it.length() > 2048L }
+                neighborOffset ?: validImagePool[i % validImagePool.size]
+            } else {
+                null
+            }
+
+            val cloneTarget = File(renderDirectory, "slab_${i + 1}_reuse.png")
+            if (reusedSource != null && reusedSource.exists()) {
+                reusedSource.copyTo(cloneTarget, overwrite = true)
+            } else {
+                val baseFallback = globalFallbackImg ?: File(renderDirectory, "slab_fb_master.png").also {
+                    createFallbackCinemaFrame(it, width, height, i)
+                    globalFallbackImg = it
+                }
+                baseFallback.copyTo(cloneTarget, overwrite = true)
+            }
+            initialResults[i] = PreparedSceneVisual(
+                imageFile1 = cloneTarget,
+                transitionFrameFile = cloneTarget,
+                isLiveVisual = false
+            )
+        }
+
+        initialResults
     }
 
-    private suspend fun resolveSceneImageFile(
+    private suspend fun resolveSceneImageFileOrNull(
         renderDirectory: File,
         tag: String,
         visualSource: String,
@@ -579,22 +647,20 @@ class VideoRenderEngine @Inject constructor(
         seed: Int,
         usedUrls: MutableSet<String>,
         sceneIndex: Int
-    ): File {
+    ): Pair<File, Boolean>? {
         val imageFile = File(renderDirectory, "slab_$tag.png")
         val wantsRealPhoto = visualSource.equals("real_photo", ignoreCase = true) && realQuery.isNotBlank()
 
         if (wantsRealPhoto) {
             val rawRealFile = File(renderDirectory, "real_raw_$tag.img")
-            val downloaded = withTimeoutOrNull(25_000L) {
-                runCatching {
-                    videoRepository.downloadRealPhoto(
-                        query = realQuery,
-                        usedUrls = usedUrls,
-                        destinationFile = rawRealFile,
-                        preferPortrait = isShorts
-                    )
-                }.getOrDefault(false)
-            } ?: false
+            val downloaded = runCatching {
+                videoRepository.downloadRealPhoto(
+                    query = realQuery,
+                    usedUrls = usedUrls,
+                    destinationFile = rawRealFile,
+                    preferPortrait = isShorts
+                )
+            }.getOrDefault(false)
 
             val prepared = if (downloaded) {
                 runCatching {
@@ -605,7 +671,7 @@ class VideoRenderEngine @Inject constructor(
                 false
             }
             rawRealFile.delete()
-            if (prepared) return imageFile
+            if (prepared) return imageFile to true
         }
 
         val primaryPrompt = buildSceneImagePrompt(
@@ -615,52 +681,58 @@ class VideoRenderEngine @Inject constructor(
             hasCharacter = hasCharacter
         )
 
-        val primaryOk = withTimeoutOrNull(45_000L) {
-            runCatching {
-                videoRepository.generateImageForSlab(
-                    prompt = primaryPrompt,
-                    isShorts = isShorts,
-                    seed = seed
-                ).use { body ->
-                    imageFile.outputStream().use { output ->
-                        body.byteStream().use { input -> input.copyTo(output) }
-                    }
+        val primaryOk = runCatching {
+            videoRepository.generateImageForSlab(
+                prompt = primaryPrompt,
+                isShorts = isShorts,
+                seed = seed
+            ).use { body ->
+                imageFile.outputStream().use { output ->
+                    body.byteStream().use { input -> input.copyTo(output) }
                 }
-                validateImageFile(imageFile, sceneIndex + 1)
-                !isMostlyBlackOrCorrupt(imageFile)
-            }.getOrDefault(false)
-        } ?: false
+            }
+            validateImageFile(imageFile, sceneIndex + 1)
+            !isMostlyBlackOrCorrupt(imageFile)
+        }.getOrDefault(false)
 
-        if (primaryOk) return imageFile
+        if (primaryOk) return imageFile to true
 
-        val retryOk = withTimeoutOrNull(45_000L) {
-            runCatching {
-                val is3dAnimated = listOf("3d", "pixar", "disney", "cartoon", "anime").any {
-                    scenePrompt.contains(it, ignoreCase = true) || visualStyle.contains(it, ignoreCase = true)
+        val retryOk = runCatching {
+            val safePrompt = buildTopicSafeRetryPrompt(scenePrompt, visualStyle)
+            videoRepository.generateImageForSlab(
+                prompt = safePrompt,
+                isShorts = isShorts,
+                seed = seed + 101
+            ).use { body ->
+                imageFile.outputStream().use { output ->
+                    body.byteStream().use { input -> input.copyTo(output) }
                 }
-                val safePrompt = if (is3dAnimated) {
-                    "3D Pixar Disney cartoon animation, vibrant sunny storybook forest meadow with glowing flowers and soft sunlight"
-                } else {
-                    "dramatic packed cinema auditorium, warm golden spotlights, heroic silhouette on screen, atmospheric lighting, no text"
-                }
-                videoRepository.generateImageForSlab(
-                    prompt = safePrompt,
-                    isShorts = isShorts,
-                    seed = seed + 101
-                ).use { body ->
-                    imageFile.outputStream().use { output ->
-                        body.byteStream().use { input -> input.copyTo(output) }
-                    }
-                }
-                validateImageFile(imageFile, sceneIndex + 1)
-                !isMostlyBlackOrCorrupt(imageFile)
-            }.getOrDefault(false)
-        } ?: false
+            }
+            validateImageFile(imageFile, sceneIndex + 1)
+            !isMostlyBlackOrCorrupt(imageFile)
+        }.getOrDefault(false)
 
-        if (!retryOk) {
-            createFallbackCinemaFrame(imageFile, width, height, sceneIndex)
-        }
-        return imageFile
+        if (retryOk) return imageFile to true
+
+        imageFile.delete()
+        return null
+    }
+
+    private fun buildTopicSafeRetryPrompt(scenePrompt: String, visualStyle: String): String {
+        val coreWords = sanitizePromptText(scenePrompt)
+            .split(Regex("\\s+"))
+            .filter { it.length >= 3 }
+            .take(12)
+            .joinToString(" ")
+            .ifBlank { "dramatic scenic storytelling moment" }
+
+        val styleHint = sanitizePromptText(visualStyle)
+            .split(Regex("\\s+"))
+            .take(6)
+            .joinToString(" ")
+            .ifBlank { "raw 35mm DSLR photograph" }
+
+        return "$coreWords, clean crisp lighting, shallow depth of field, $styleHint"
     }
 
     private fun isMostlyBlackOrCorrupt(imageFile: File): Boolean {
@@ -860,16 +932,17 @@ class VideoRenderEngine @Inject constructor(
         isShorts: Boolean
     ): List<OverlaySpec> {
         val specs = mutableListOf<OverlaySpec>()
+        val lastIdx = popCaptions.lastIndex
 
-        popCaptions.forEach { chunk ->
+        popCaptions.forEachIndexed { idx, chunk ->
             val overlayY = if (isShorts) {
                 (videoHeight - chunk.stripHeight - 360).coerceAtLeast(0)
             } else {
                 (videoHeight - chunk.stripHeight - 55).coerceAtLeast(0)
             }
-            val st = String.format(Locale.US, "%.2f", chunk.startSeconds)
-            val en = String.format(Locale.US, "%.2f", chunk.endSeconds)
-            val expr = if (chunk.isLastChunk) {
+            val st = String.format(Locale.US, "%.3f", chunk.startSeconds)
+            val en = String.format(Locale.US, "%.3f", chunk.endSeconds)
+            val enableRule = if (idx == lastIdx) {
                 "gte(t,$st)"
             } else {
                 "gte(t,$st)*lt(t,$en)"
@@ -878,7 +951,7 @@ class VideoRenderEngine @Inject constructor(
                 file = chunk.file,
                 xExpr = "0",
                 yExpr = overlayY.toString(),
-                enableExpr = expr
+                enableExpr = enableRule
             )
         }
 
@@ -1086,31 +1159,23 @@ class VideoRenderEngine @Inject constructor(
         }
     }
 
-    private fun isRequestedFemaleVoice(voiceName: String): Boolean {
-        val lower = voiceName.lowercase(Locale.US)
-        return listOf(
-            "swara", "neerja", "ava", "aarohi", "dhwani", "tanishaa",
-            "pallavi", "shruti", "sapna", "sobhana", "vaani", "gul",
-            "elvira", "denise", "nanami", "zariyah", "female"
-        ).any { lower.contains(it) }
-    }
-
     private suspend fun synthesizeAndTrimVoiceClips(
         renderDirectory: File,
         slabs: List<VideoSlab>,
         voiceName: String,
+        wantsMaleVoice: Boolean,
         voiceTone: VoiceTone,
-        progressUpdate: (Int, Int) -> Unit
+        progress: (Int, String) -> Unit
     ): List<File> = coroutineScope {
+        val total = slabs.size.coerceAtLeast(1)
+        val doneCount = AtomicInteger(0)
         val semaphore = Semaphore(2)
-        val total = slabs.size
-        val doneCounter = AtomicInteger(0)
 
-        val rawClips = slabs.mapIndexed { index, slab ->
+        val rawItems = slabs.mapIndexed { index, slab ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     val rawMp3 = File(renderDirectory, "raw_voice_${index + 1}.mp3")
-                    val clipResult = withTimeoutOrNull(40_000L) {
+                    val clipMeta = withTimeoutOrNull(45_000L) {
                         videoRepository.generateDynamicVoiceClipWithMeta(
                             text = slab.voiceover_text,
                             voiceName = voiceName,
@@ -1119,59 +1184,44 @@ class VideoRenderEngine @Inject constructor(
                         )
                     } ?: throw IOException("Voice generation timed out for scene ${index + 1}.")
 
-                    rawMp3.writeBytes(clipResult.audioBytes)
+                    rawMp3.writeBytes(clipMeta.audioBytes)
                     if (!rawMp3.exists() || rawMp3.length() == 0L) {
                         throw IOException("Voice generation returned empty audio for scene ${index + 1}.")
                     }
-                    progressUpdate(doneCounter.incrementAndGet(), total)
-                    rawMp3 to clipResult.usedFallback
+                    val done = doneCount.incrementAndGet()
+                    val pct = 7 + (done * 10 / total)
+                    progress(pct.coerceIn(7, 17), "Recording emotional voice $done of $total…")
+                    rawMp3 to clipMeta.usedFallback
                 }
             }
         }.awaitAll()
 
-        val wantsMaleVoice = !isRequestedFemaleVoice(voiceName)
-        val neuralTempo = when (voiceTone.name.uppercase()) {
-            "FUNNY", "COMIC", "ENERGETIC", "HYPE" -> "1.10"
-            "SERIOUS", "INTENSE" -> "1.05"
-            else -> "1.08"
-        }
-
         val wavFiles = mutableListOf<File>()
-        rawClips.forEachIndexed { index, (rawMp3, usedFallback) ->
-            val trimmedWav = File(renderDirectory, "voice_part_${index + 1}.wav")
-            val isLast = index == rawClips.lastIndex
-            val microBreath = if (isLast) 0.02 else 0.03
-
-            val tempoAndPitchFilter = when {
-                usedFallback && wantsMaleVoice ->
-                    "aresample=44100,asetrate=37485,aresample=44100,atempo=1.42,"
-                usedFallback ->
-                    "aresample=44100,atempo=1.24,"
-                else ->
-                    "atempo=$neuralTempo,"
-            }
-
-            val trimmedOk = runCatching {
+        rawItems.forEachIndexed { index, (rawMp3, usedFallback) ->
+            val trimmedWav = File(renderDirectory, "trimmed_voice_${index + 1}.wav")
+            val emotion = slabs[index].voice_emotion
+            val voiceFilter = buildVoiceNormalizeFilter(
+                usedFallback = usedFallback,
+                wantsMaleVoice = wantsMaleVoice,
+                emotion = emotion,
+                voiceTone = voiceTone
+            )
+            val normOk = runCatching {
                 runFfmpeg(
                     arrayOf(
                         "-y",
                         "-i", rawMp3.absolutePath,
-                        "-af",
-                        tempoAndPitchFilter +
-                            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
-                            "areverse," +
-                            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-55dB," +
-                            "areverse," +
-                            "apad=pad_dur=$microBreath",
+                        "-af", voiceFilter,
                         "-ar", "44100",
                         "-ac", "1",
                         "-c:a", "pcm_s16le",
                         trimmedWav.absolutePath
                     )
                 )
-            }.isSuccess
+                trimmedWav.exists() && trimmedWav.length() > 44L
+            }.getOrDefault(false)
 
-            if (!trimmedOk || !trimmedWav.exists() || trimmedWav.length() <= 44L) {
+            if (!normOk) {
                 runFfmpeg(
                     arrayOf(
                         "-y",
@@ -1183,14 +1233,103 @@ class VideoRenderEngine @Inject constructor(
                     )
                 )
             }
+            rawMp3.delete()
             wavFiles += trimmedWav
         }
         wavFiles
     }
 
+    private fun buildVoiceNormalizeFilter(
+        usedFallback: Boolean,
+        wantsMaleVoice: Boolean,
+        emotion: String,
+        voiceTone: VoiceTone
+    ): String {
+        val emo = emotion.lowercase().trim()
+        val trim = "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.04," +
+            "areverse,silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05,areverse"
+
+        if (usedFallback) {
+            return if (wantsMaleVoice) {
+                val tempo = when (emo) {
+                    "suspense" -> "1.30"
+                    "sad", "emotional" -> "1.26"
+                    "excited", "hook", "climax" -> "1.46"
+                    else -> "1.40"
+                }
+                "$trim,aresample=44100,asetrate=37485,aresample=44100,atempo=$tempo"
+            } else {
+                val tempo = when (emo) {
+                    "suspense" -> "1.12"
+                    "sad", "emotional" -> "1.08"
+                    "excited", "hook", "climax" -> "1.25"
+                    else -> "1.20"
+                }
+                "$trim,atempo=$tempo"
+            }
+        }
+
+        val baseTempo = when (voiceTone.name.uppercase()) {
+            "ENERGETIC", "HYPE" -> 1.10
+            "FUNNY", "COMIC" -> 1.09
+            "SERIOUS", "INTENSE" -> 1.03
+            "NATURAL", "PODCAST", "HUMAN" -> 1.06
+            else -> 1.07
+        }
+
+        val (tempoOffset, emotionEq) = when (emo) {
+            "hook" -> 0.03 to "equalizer=f=3200:t=q:w=1.2:g=2.4,equalizer=f=125:t=q:w=1.0:g=1.4"
+            "excited" -> 0.04 to "equalizer=f=3500:t=q:w=1.2:g=2.8,equalizer=f=140:t=q:w=1.0:g=1.6"
+            "climax" -> 0.04 to "equalizer=f=3000:t=q:w=1.1:g=2.6,equalizer=f=110:t=q:w=0.9:g=2.5"
+            "roast" -> 0.03 to "equalizer=f=2400:t=q:w=1.3:g=2.5,equalizer=f=3800:t=q:w=1.2:g=1.6"
+            "question" -> -0.01 to "equalizer=f=2800:t=q:w=1.3:g=1.8"
+            "suspense" -> -0.06 to "equalizer=f=105:t=q:w=0.9:g=3.2,equalizer=f=4200:t=q:w=1.2:g=-1.8"
+            "sad", "emotional" -> -0.09 to "equalizer=f=150:t=q:w=1.0:g=2.2,equalizer=f=4800:t=q:w=1.2:g=-2.8,aecho=0.82:0.88:22:0.12"
+            "warm" -> -0.01 to "equalizer=f=180:t=q:w=1.0:g=2.0,equalizer=f=5000:t=q:w=1.2:g=-1.0"
+            else -> 0.0 to ""
+        }
+
+        val finalTempo = String.format(
+            Locale.US,
+            "%.2f",
+            (baseTempo + tempoOffset).coerceIn(0.94, 1.18)
+        )
+
+        return if (emotionEq.isNotBlank()) {
+            "$trim,atempo=$finalTempo,$emotionEq"
+        } else {
+            "$trim,atempo=$finalTempo"
+        }
+    }
+
     private fun getPcmWavDurationSeconds(wavFile: File): Double {
-        val dataBytes = (wavFile.length() - 44L).coerceAtLeast(0L)
-        return dataBytes.toDouble() / (44100.0 * 2.0)
+        if (!wavFile.exists() || wavFile.length() <= 44L) return 1.0
+        val bytes = wavFile.readBytes()
+        if (bytes.size <= 44) return 1.0
+
+        var byteRate = 88200
+        var dataLen = bytes.size - 44
+
+        var offset = 12
+        while (offset + 8 <= bytes.size) {
+            val chunkId = String(bytes, offset, 4, Charsets.US_ASCII)
+            val chunkSize = ((bytes[offset + 4].toInt() and 0xFF)) or
+                ((bytes[offset + 5].toInt() and 0xFF) shl 8) or
+                ((bytes[offset + 6].toInt() and 0xFF) shl 16) or
+                ((bytes[offset + 7].toInt() and 0xFF) shl 24)
+            if (chunkId == "fmt " && offset + 20 <= bytes.size && chunkSize >= 16) {
+                byteRate = ((bytes[offset + 16].toInt() and 0xFF)) or
+                    ((bytes[offset + 17].toInt() and 0xFF) shl 8) or
+                    ((bytes[offset + 18].toInt() and 0xFF) shl 16) or
+                    ((bytes[offset + 19].toInt() and 0xFF) shl 24)
+            } else if (chunkId == "data") {
+                dataLen = chunkSize.coerceIn(0, bytes.size - (offset + 8))
+                break
+            }
+            if (chunkSize < 0) break
+            offset += 8 + chunkSize + (chunkSize and 1)
+        }
+        return (dataLen.toDouble() / byteRate.coerceAtLeast(16000)).coerceAtLeast(0.45)
     }
 
     private fun createPopCaptionOverlays(
@@ -1201,88 +1340,73 @@ class VideoRenderEngine @Inject constructor(
         videoWidth: Int,
         isShorts: Boolean
     ): List<PopCaptionChunk> {
-        val chunksText = splitIntoPopChunks(fullSceneText, maxWordsPerChunk = if (isShorts) 4 else 6)
-        if (chunksText.isEmpty()) return emptyList()
+        val cleanText = fullSceneText.trim().replace(Regex("\\s+"), " ")
+        if (cleanText.isBlank()) return emptyList()
 
-        val weights = chunksText.map { chunk ->
-            chunk.count { !it.isWhitespace() }.coerceAtLeast(1).toDouble()
+        val words = cleanText.split(' ').filter { it.isNotBlank() }
+        val maxWordsPerChunk = if (isShorts) 4 else 6
+        val chunks = mutableListOf<String>()
+
+        if (words.size <= maxWordsPerChunk) {
+            chunks += cleanText
+        } else {
+            var i = 0
+            while (i < words.size) {
+                val end = (i + maxWordsPerChunk).coerceAtMost(words.size)
+                if (words.size - end == 1) {
+                    chunks += words.subList(i, words.size).joinToString(" ")
+                    break
+                } else {
+                    chunks += words.subList(i, end).joinToString(" ")
+                    i = end
+                }
+            }
         }
-        val totalWeight = weights.sum().coerceAtLeast(1.0)
 
+        val totalChars = chunks.sumOf { it.length.coerceAtLeast(1) }.coerceAtLeast(1)
+        var cursorSec = 0.0
         val result = mutableListOf<PopCaptionChunk>()
-        var cursorTime = 0.0
 
-        chunksText.forEachIndexed { chunkIdx, chunkText ->
-            val chunkDur = (weights[chunkIdx] / totalWeight) * sceneDurationSeconds
-            val startTime = cursorTime
-            val isLast = chunkIdx == chunksText.lastIndex
-            val endTime = if (isLast) {
+        chunks.forEachIndexed { chunkIdx, chunkText ->
+            val share = chunkText.length.coerceAtLeast(1).toDouble() / totalChars
+            val chunkDur = if (chunkIdx == chunks.lastIndex) {
+                (sceneDurationSeconds - cursorSec).coerceAtLeast(0.25)
+            } else {
+                (sceneDurationSeconds * share).coerceAtLeast(0.25)
+            }
+            val startSec = cursorSec
+            val endSec = if (chunkIdx == chunks.lastIndex) {
                 sceneDurationSeconds + 0.05
             } else {
-                (cursorTime + chunkDur).coerceAtLeast(startTime + 0.05)
+                (cursorSec + chunkDur).coerceAtMost(sceneDurationSeconds)
             }
-            cursorTime += chunkDur
+            cursorSec = endSec
 
-            val pngFile = File(renderDirectory, "pop_${sceneIndex + 1}_${chunkIdx + 1}.png")
-            val stripHeight = renderCaptionPng(
-                text = chunkText,
-                videoWidth = videoWidth,
-                isShorts = isShorts,
-                outputFile = pngFile
-            )
-            if (stripHeight != null && pngFile.exists()) {
-                result += PopCaptionChunk(
-                    file = pngFile,
-                    stripHeight = stripHeight,
-                    startSeconds = startTime,
-                    endSeconds = endTime,
-                    isLastChunk = isLast
-                )
-            }
+            val pngFile = File(renderDirectory, "cap_${sceneIndex + 1}_$chunkIdx.png")
+            val stripH = renderSubtitleStripPng(chunkText, videoWidth, isShorts, pngFile)
+            result += PopCaptionChunk(pngFile, stripH, startSec, endSec)
         }
         return result
     }
 
-    private fun splitIntoPopChunks(text: String, maxWordsPerChunk: Int): List<String> {
-        val words = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (words.isEmpty()) return emptyList()
-        if (words.size <= maxWordsPerChunk) return listOf(words.joinToString(" "))
-
-        val chunks = mutableListOf<String>()
-        var idx = 0
-        while (idx < words.size) {
-            val remaining = words.size - idx
-            val takeCount = when {
-                remaining <= maxWordsPerChunk -> remaining
-                remaining == maxWordsPerChunk + 1 -> maxWordsPerChunk - 1
-                else -> maxWordsPerChunk
-            }
-            chunks += words.subList(idx, idx + takeCount).joinToString(" ")
-            idx += takeCount
-        }
-        return chunks
-    }
-
-    private fun renderCaptionPng(
+    private fun renderSubtitleStripPng(
         text: String,
         videoWidth: Int,
         isShorts: Boolean,
         outputFile: File
-    ): Int? {
+    ): Int {
         val cleanText = text.trim()
-        if (cleanText.isBlank()) return null
+        val horizontalMargin = if (isShorts) 96 else 180
+        val maxTextWidth = (videoWidth - horizontalMargin).coerceAtLeast(240)
+        val boxPadX = if (isShorts) 26f else 28f
+        val boxPadY = if (isShorts) 14f else 13f
+        val maxStripHeight = if (isShorts) 260 else 190
 
-        val horizontalMargin = if (isShorts) 105 else 180
-        val maxTextWidth = (videoWidth - horizontalMargin * 2).coerceAtLeast(320)
-        val boxPadX = if (isShorts) 30f else 34f
-        val boxPadY = if (isShorts) 18f else 16f
-        val maxStripHeight = if (isShorts) 320 else 240
-
-        var fontSize = if (isShorts) 56f else 46f
+        var fontSize = if (isShorts) 46f else 42f
         lateinit var fillPaint: TextPaint
         lateinit var layout: StaticLayout
 
-        while (fontSize >= 36f) {
+        while (fontSize >= 28f) {
             fillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = 0xFFFFE135.toInt()
                 textSize = fontSize
@@ -1300,20 +1424,18 @@ class VideoRenderEngine @Inject constructor(
                 .setIncludePad(true)
                 .build()
 
-            if (layout.lineCount <= 2 && (layout.height + boxPadY * 2 + 24f) <= maxStripHeight) {
+            if (layout.lineCount <= 2 && layout.height + boxPadY * 2 + 24 <= maxStripHeight) {
                 break
             }
-            fontSize -= 4f
+            fontSize -= 3f
         }
 
         val strokePaint = TextPaint(fillPaint).apply {
             style = Paint.Style.STROKE
-            strokeWidth = if (isShorts) 11f else 9f
+            strokeWidth = 7.5f
             strokeJoin = Paint.Join.ROUND
-            strokeMiter = 10f
             color = Color.BLACK
         }
-
         val strokeLayout = StaticLayout.Builder.obtain(
             cleanText,
             0,
@@ -1384,20 +1506,16 @@ class VideoRenderEngine @Inject constructor(
         raw
             .replace(
                 Regex(
-                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay|stat badge|youtube shorts?|video_clip|meme_clip|split layout|act as|collage|photo grid|grid of|panels|neon sign|cinema marquee|billboard|signboard|marquee|logo|rs movie spot)\\b",
+                    "\\b(comment box|subscribe button|subscribe|social media|website|ui overlay|user interface|title card|movie poster|poster|text overlay|stat badge|youtube shorts?|video_clip|meme_clip|split layout|act as|collage|photo grid|grid of|panels|holding microphone|holding a microphone|holding mic)\\b",
                     RegexOption.IGNORE_CASE
                 ),
                 ""
             )
-            .replace(Regex("\\bsecret wars\\b", RegexOption.IGNORE_CASE), "shattered cosmic multiverse battlefield")
-            .replace(Regex("\\bdoctor doom\\b", RegexOption.IGNORE_CASE), "armored ruler in dark emerald cloak and brushed steel mask")
-            .replace(Regex("\\bavengers\\s+doomsday\\b", RegexOption.IGNORE_CASE), "epic dark sci-fi superhero ensemble confrontation")
-            .replace(Regex("\\bholding (?:a )?microphone\\b|\\bmic in hand\\b", RegexOption.IGNORE_CASE), "seated cleanly behind desk boom condenser mic, hands relaxed out of frame")
             .replace(Regex("\\banimal\\s+(?:movie|film|teaser|trailer)\\b", RegexOption.IGNORE_CASE), "intense Bollywood action film")
             .replace(Regex("\\bspirit\\s+(?:movie|film|teaser|trailer)\\b", RegexOption.IGNORE_CASE), "fierce police thriller")
             .replace(Regex("\\bdark violence\\b|\\bbrutal violence\\b|\\bviolence\\b", RegexOption.IGNORE_CASE), "dramatic action confrontation in moody lighting")
             .replace(Regex("\\bblood rivers?\\b|\\brivers of blood\\b", RegexOption.IGNORE_CASE), "dramatic crimson-lit action showdown with flying sparks")
-            .replace(Regex("\\bbox[- ]?office\\b", RegexOption.IGNORE_CASE), "cheering packed cinema hall")
+            .replace(Regex("\\bbox[- ]?office\\b", RegexOption.IGNORE_CASE), "packed enthusiastic crowd")
             .replace(Regex("\\bunreal engine(?:\\s*5)?\\b", RegexOption.IGNORE_CASE), "cinema film still")
             .replace(Regex("\\babstract\\b", RegexOption.IGNORE_CASE), "detailed scene")
             .replace(Regex("\\s{2,}"), " ")
@@ -1816,52 +1934,46 @@ class VideoRenderEngine @Inject constructor(
     private fun buildStudioVoiceFilter(voiceTone: VoiceTone): String =
         when (voiceTone.name.uppercase()) {
             "NATURAL", "PODCAST", "HUMAN" ->
-                "highpass=f=60," +
+                "highpass=f=65," +
                     "equalizer=f=110:t=q:w=0.9:g=6.5," +
-                    "equalizer=f=210:t=q:w=1.1:g=3.2," +
-                    "equalizer=f=480:t=q:w=1.5:g=-2.6," +
-                    "equalizer=f=3100:t=q:w=1.3:g=2.6," +
-                    "highshelf=f=6800:g=-3.0," +
-                    "aecho=0.85:0.88:18:0.12," +
-                    "acompressor=threshold=-20dB:ratio=3.0:attack=6:release=75," +
-                    "alimiter=limit=0.95," +
-                    "volume=1.16"
+                    "equalizer=f=210:t=q:w=1.2:g=3.2," +
+                    "equalizer=f=480:t=q:w=1.4:g=-2.6," +
+                    "equalizer=f=3100:t=q:w=1.4:g=2.6," +
+                    "equalizer=f=6800:t=q:w=1.2:g=-3.0," +
+                    "aecho=0.88:0.90:14:0.08," +
+                    "acompressor=threshold=-20dB:ratio=3.0:attack=5:release=70:makeup=2.2," +
+                    "alimiter=limit=0.95"
 
             "SERIOUS", "INTENSE" ->
                 "highpass=f=55," +
                     "equalizer=f=95:t=q:w=0.85:g=7.0," +
-                    "equalizer=f=190:t=q:w=1.1:g=3.4," +
-                    "equalizer=f=460:t=q:w=1.5:g=-2.5," +
-                    "equalizer=f=2800:t=q:w=1.3:g=2.2," +
-                    "highshelf=f=6800:g=-3.2," +
-                    "aecho=0.84:0.86:24:0.14," +
-                    "acompressor=threshold=-20dB:ratio=3.2:attack=5:release=90," +
-                    "alimiter=limit=0.95," +
-                    "volume=1.16"
+                    "equalizer=f=200:t=q:w=1.1:g=3.5," +
+                    "equalizer=f=480:t=q:w=1.4:g=-2.4," +
+                    "equalizer=f=2900:t=q:w=1.4:g=2.0," +
+                    "equalizer=f=6800:t=q:w=1.2:g=-2.5," +
+                    "aecho=0.88:0.90:16:0.09," +
+                    "acompressor=threshold=-20dB:ratio=3.0:attack=6:release=80:makeup=2.2," +
+                    "alimiter=limit=0.95"
 
             "FUNNY", "COMIC", "ENERGETIC", "HYPE" ->
                 "highpass=f=70," +
-                    "equalizer=f=120:t=q:w=0.95:g=5.2," +
-                    "equalizer=f=220:t=q:w=1.1:g=2.5," +
-                    "equalizer=f=490:t=q:w=1.5:g=-2.8," +
-                    "equalizer=f=3400:t=q:w=1.25:g=3.2," +
-                    "highshelf=f=7000:g=-2.6," +
-                    "aecho=0.86:0.88:14:0.09," +
-                    "acompressor=threshold=-19dB:ratio=2.8:attack=5:release=65," +
-                    "alimiter=limit=0.95," +
-                    "volume=1.18"
+                    "equalizer=f=125:t=q:w=0.9:g=4.5," +
+                    "equalizer=f=480:t=q:w=1.5:g=-2.2," +
+                    "equalizer=f=3300:t=q:w=1.3:g=3.2," +
+                    "equalizer=f=7200:t=q:w=1.2:g=-2.0," +
+                    "acompressor=threshold=-19dB:ratio=2.8:attack=4:release=65:makeup=2.0," +
+                    "alimiter=limit=0.95"
 
             else ->
-                "highpass=f=60," +
-                    "equalizer=f=110:t=q:w=0.9:g=6.0," +
-                    "equalizer=f=210:t=q:w=1.1:g=3.0," +
-                    "equalizer=f=480:t=q:w=1.5:g=-2.4," +
-                    "equalizer=f=3100:t=q:w=1.3:g=2.4," +
-                    "highshelf=f=6800:g=-2.8," +
-                    "aecho=0.85:0.88:17:0.11," +
-                    "acompressor=threshold=-20dB:ratio=2.9:attack=6:release=75," +
-                    "alimiter=limit=0.95," +
-                    "volume=1.15"
+                "highpass=f=65," +
+                    "equalizer=f=110:t=q:w=0.9:g=5.8," +
+                    "equalizer=f=205:t=q:w=1.15:g=2.8," +
+                    "equalizer=f=480:t=q:w=1.4:g=-2.2," +
+                    "equalizer=f=3100:t=q:w=1.4:g=2.4," +
+                    "equalizer=f=6800:t=q:w=1.2:g=-2.5," +
+                    "aecho=0.88:0.90:14:0.07," +
+                    "acompressor=threshold=-20dB:ratio=2.8:attack=5:release=75:makeup=2.0," +
+                    "alimiter=limit=0.95"
         }
 
     private suspend fun mixAudioTrackSafely(
@@ -1876,7 +1988,7 @@ class VideoRenderEngine @Inject constructor(
         val formattedDuration = String.format(Locale.US, "%.2f", totalDurationSeconds)
 
         val eqVoiceFile = File(renderDirectory, "voice_eq.wav")
-        var eqOk = runCatching {
+        val eqOk = runCatching {
             runFfmpeg(
                 arrayOf(
                     "-y",
@@ -1888,21 +2000,23 @@ class VideoRenderEngine @Inject constructor(
                     eqVoiceFile.absolutePath
                 )
             )
-        }.isSuccess
+            eqVoiceFile.exists() && eqVoiceFile.length() > 44L
+        }.getOrDefault(false)
 
-        if (!eqOk || !eqVoiceFile.exists() || eqVoiceFile.length() <= 44L) {
-            eqOk = runCatching {
+        val safeEqOk = if (eqOk) {
+            true
+        } else {
+            runCatching {
                 runFfmpeg(
                     arrayOf(
                         "-y",
                         "-i", fullVoiceFile.absolutePath,
                         "-af",
-                        "highpass=f=60," +
-                            "equalizer=f=110:t=q:w=0.9:g=6.0," +
-                            "equalizer=f=210:t=q:w=1.1:g=3.0," +
-                            "equalizer=f=480:t=q:w=1.5:g=-2.4," +
-                            "equalizer=f=3100:t=q:w=1.3:g=2.4," +
-                            "acompressor=threshold=-20dB:ratio=2.8:attack=6:release=75," +
+                        "highpass=f=65," +
+                            "equalizer=f=110:t=q:w=0.9:g=5.5," +
+                            "equalizer=f=480:t=q:w=1.4:g=-2.0," +
+                            "equalizer=f=3100:t=q:w=1.4:g=2.4," +
+                            "acompressor=threshold=-19dB:ratio=2.6:attack=6:release=75," +
                             "volume=1.12",
                         "-ar", "44100",
                         "-ac", "1",
@@ -1910,10 +2024,11 @@ class VideoRenderEngine @Inject constructor(
                         eqVoiceFile.absolutePath
                     )
                 )
-            }.isSuccess
+                eqVoiceFile.exists() && eqVoiceFile.length() > 44L
+            }.getOrDefault(false)
         }
 
-        val voiceSource = if (eqOk && eqVoiceFile.exists() && eqVoiceFile.length() > 44L) {
+        val voiceSource = if (safeEqOk && eqVoiceFile.exists() && eqVoiceFile.length() > 44L) {
             eqVoiceFile
         } else {
             fullVoiceFile
@@ -1979,7 +2094,7 @@ class VideoRenderEngine @Inject constructor(
                 } else {
                     0.0
                 }
-                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.34 else 0.0
+                val s = if (idx < sfxSamples.size) (sfxSamples[idx] / 32768.0) * 0.35 else 0.0
                 (v + b + s).coerceIn(-0.96, 0.96)
             }
             mixedWavFile.exists() && mixedWavFile.length() > 44L
@@ -2108,11 +2223,11 @@ class VideoRenderEngine @Inject constructor(
                 "zoompan=z='1.14':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/$denom)':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
             else ->
-                "zoompan=z='1.05+0.10*on/$denom':x='(iw-iw/zoom)*on/$denom':y='(ih-ih/zoom)*0.32':" +
+                "zoompan=z='1.06+0.10*on/$denom':x='(iw-iw/zoom)*on/$denom':y='(ih-ih/zoom)*0.32':" +
                     "d=$frames:s=${width}x${height}:fps=$FRAME_RATE"
         }
 
-        val baseGrade = "eq=contrast=1.08:saturation=1.12:brightness=0.01,unsharp=3:3:0.45,vignette=PI/6"
+        val baseGrade = "eq=contrast=1.06:saturation=1.10:brightness=0.01,unsharp=3:3:0.45,vignette=PI/6"
         return "scale=$upWidth:$upHeight:force_original_aspect_ratio=increase," +
             "crop=$upWidth:$upHeight,setsar=1,$motionFilter,$baseGrade"
     }
@@ -2122,23 +2237,26 @@ class VideoRenderEngine @Inject constructor(
         filterBuilder: StringBuilder,
         baseLabel: String,
         prevTransitionFile: File?,
-        prevInputIndex: Int,
+        nextInputIndex: Int,
         width: Int,
         height: Int
-    ): String {
+    ): Pair<String, Int> {
         if (prevTransitionFile == null || !prevTransitionFile.exists()) {
-            return baseLabel
+            return baseLabel to nextInputIndex
         }
-        val fadeSec = String.format(Locale.US, "%.2f", SCENE_DISSOLVE_SECONDS)
-        val clipDurSec = String.format(Locale.US, "%.2f", SCENE_DISSOLVE_SECONDS + 0.04)
-        args += listOf("-loop", "1", "-t", clipDurSec, "-r", FRAME_RATE.toString(), "-i", prevTransitionFile.absolutePath)
-        filterBuilder.append(
-            "[$prevInputIndex:v]scale=$width:$height:force_original_aspect_ratio=increase," +
-                "crop=$width:$height,setsar=1,eq=contrast=1.07:saturation=1.12," +
-                "format=yuva420p,fade=t=out:st=0:d=$fadeSec:alpha=1[tr_prev];" +
-                "[$baseLabel][tr_prev]overlay=0:0:eof_action=pass[tr_base];"
+        args += listOf(
+            "-loop", "1",
+            "-t", "0.26",
+            "-r", FRAME_RATE.toString(),
+            "-i", prevTransitionFile.absolutePath
         )
-        return "tr_base"
+        filterBuilder.append(
+            "[$nextInputIndex:v]scale=${width}:${height}:force_original_aspect_ratio=increase," +
+                "crop=${width}:${height},setsar=1,format=yuva420p," +
+                "fade=t=out:st=0:d=0.22:alpha=1[trprev];" +
+                "[$baseLabel][trprev]overlay=0:0:eof_action=pass[trdone];"
+        )
+        return "trdone" to (nextInputIndex + 1)
     }
 
     private fun appendOverlayChain(
@@ -2184,23 +2302,22 @@ class VideoRenderEngine @Inject constructor(
 
         val args = mutableListOf("-y", "-i", imageFile.absolutePath)
         val filterBuilder = StringBuilder("[0:v]$motionAndGrade[bgbase];")
-        val postTransLabel = appendDissolveTransition(
+        val (postTransLabel, nextInputIdx) = appendDissolveTransition(
             args = args,
             filterBuilder = filterBuilder,
             baseLabel = "bgbase",
             prevTransitionFile = prevTransitionFile,
-            prevInputIndex = 1,
+            nextInputIndex = 1,
             width = width,
             height = height
         )
-        val overlayStartIdx = if (postTransLabel == "tr_base") 2 else 1
-        appendOverlayChain(args, filterBuilder, postTransLabel, overlaySpecs, startInputIndex = overlayStartIdx, edgeFades = edgeFades)
+        appendOverlayChain(args, filterBuilder, postTransLabel, overlaySpecs, startInputIndex = nextInputIdx, edgeFades = edgeFades)
 
         args += listOf(
             "-filter_complex", filterBuilder.toString(),
             "-map", "[vout]",
             "-frames:v", frames.toString(),
-            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
             outputFile.absolutePath
         )
@@ -2230,23 +2347,22 @@ class VideoRenderEngine @Inject constructor(
                 "[1:v]$motionAndGrade[p2];" +
                 "[p1][p2]overlay=0:0:enable='gte(t,$switchSec)'[flipbase];"
         )
-        val postTransLabel = appendDissolveTransition(
+        val (postTransLabel, nextInputIdx) = appendDissolveTransition(
             args = args,
             filterBuilder = filterBuilder,
             baseLabel = "flipbase",
             prevTransitionFile = prevTransitionFile,
-            prevInputIndex = 2,
+            nextInputIndex = 2,
             width = width,
             height = height
         )
-        val overlayStartIdx = if (postTransLabel == "tr_base") 3 else 2
-        appendOverlayChain(args, filterBuilder, postTransLabel, overlaySpecs, startInputIndex = overlayStartIdx, edgeFades = edgeFades)
+        appendOverlayChain(args, filterBuilder, postTransLabel, overlaySpecs, startInputIndex = nextInputIdx, edgeFades = edgeFades)
 
         args += listOf(
             "-filter_complex", filterBuilder.toString(),
             "-map", "[vout]",
             "-frames:v", frames.toString(),
-            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
             outputFile.absolutePath
         )
@@ -2278,25 +2394,24 @@ class VideoRenderEngine @Inject constructor(
                 "[bgsrc]scale=$blurW:$blurH:force_original_aspect_ratio=increase,crop=$blurW:$blurH," +
                 "scale=$width:$height:flags=bilinear,eq=brightness=-0.20:saturation=0.85[bg0];" +
                 "[fgsrc]scale=$width:$height:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2[fg];" +
-                "[bg0][fg]overlay=(W-w)/2:(H-h)/2,eq=contrast=1.08:saturation=1.12,unsharp=3:3:0.35,vignette=PI/6[clipbase];"
+                "[bg0][fg]overlay=(W-w)/2:(H-h)/2,eq=contrast=1.06:saturation=1.10,unsharp=3:3:0.35,vignette=PI/6[clipbase];"
         )
-        val postTransLabel = appendDissolveTransition(
+        val (postTransLabel, nextInputIdx) = appendDissolveTransition(
             args = args,
             filterBuilder = filterBuilder,
             baseLabel = "clipbase",
             prevTransitionFile = prevTransitionFile,
-            prevInputIndex = 1,
+            nextInputIndex = 1,
             width = width,
             height = height
         )
-        val overlayStartIdx = if (postTransLabel == "tr_base") 2 else 1
-        appendOverlayChain(args, filterBuilder, postTransLabel, overlaySpecs, startInputIndex = overlayStartIdx, edgeFades = edgeFades)
+        appendOverlayChain(args, filterBuilder, postTransLabel, overlaySpecs, startInputIndex = nextInputIdx, edgeFades = edgeFades)
 
         args += listOf(
             "-filter_complex", filterBuilder.toString(),
             "-map", "[vout]",
             "-frames:v", safeFrames.toString(),
-            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-threads", "2", "-pix_fmt", "yuv420p", "-r", FRAME_RATE.toString(),
             outputFile.absolutePath
         )
@@ -2497,6 +2612,5 @@ class VideoRenderEngine @Inject constructor(
         const val FRAME_RATE = 25
         const val MIN_SCENE_FRAMES = 15
         const val AUDIO_TAIL_PADDING_SECONDS = 0.35
-        const val SCENE_DISSOLVE_SECONDS = 0.22
     }
 }
