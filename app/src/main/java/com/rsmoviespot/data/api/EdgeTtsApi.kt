@@ -49,6 +49,7 @@ data class EdgeTtsClipResult(
 @Singleton
 class EdgeTtsApi @Inject constructor(
     private val okHttpClient: OkHttpClient,
+    @Suppress("unused")
     @ApplicationContext private val context: Context
 ) {
     private val ttsHttpClient: OkHttpClient by lazy {
@@ -120,7 +121,7 @@ class EdgeTtsApi @Inject constructor(
             }
 
             val failures = consecutiveEdgeFailures.incrementAndGet()
-            if (failures >= 3) {
+            if (failures >= 4) {
                 edgeDisabledUntilMs.set(System.currentTimeMillis() + EDGE_COOLDOWN_MS)
             }
         }
@@ -159,26 +160,35 @@ class EdgeTtsApi @Inject constructor(
         rate: String,
         pitch: String
     ): ByteArray {
+        val endpoints = listOf(EDGE_PRIMARY_WS_URL, EDGE_LEGACY_WS_URL)
         var lastError: Throwable? = null
-        repeat(2) { attempt ->
-            try {
-                return executeEdgeWebSocket(
-                    text = text,
-                    voiceName = voiceName,
-                    rate = rate,
-                    pitch = pitch
-                )
-            } catch (err: Throwable) {
-                lastError = err
-                if (attempt == 0 && err.message?.contains("403") == true) {
-                    syncClockSkewFromBing()
+
+        for (endpoint in endpoints) {
+            repeat(2) { attempt ->
+                try {
+                    return executeEdgeWebSocket(
+                        baseHttpsUrl = endpoint,
+                        text = text,
+                        voiceName = voiceName,
+                        rate = rate,
+                        pitch = pitch
+                    )
+                } catch (err: Throwable) {
+                    lastError = err
+                    if (attempt == 0 && err.message?.contains("403") == true) {
+                        syncClockSkewFromEndpoint(endpoint)
+                    } else if (attempt == 0) {
+                        // Retry once quickly on transient socket error
+                    }
                 }
             }
         }
+
         throw lastError ?: IOException("Edge TTS WebSocket synthesis failed.")
     }
 
     private fun executeEdgeWebSocket(
+        baseHttpsUrl: String,
         text: String,
         voiceName: String,
         rate: String,
@@ -188,7 +198,7 @@ class EdgeTtsApi @Inject constructor(
         val requestId = UUID.randomUUID().toString().replace("-", "")
         val secMsGec = generateSecMsGec(clockSkewSeconds.get())
 
-        val wsUrl = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+        val wsUrl = baseHttpsUrl
             .toHttpUrl()
             .newBuilder()
             .addQueryParameter("TrustedClientToken", TRUSTED_CLIENT_TOKEN)
@@ -205,7 +215,6 @@ class EdgeTtsApi @Inject constructor(
             .header("Cache-Control", "no-cache")
             .header("Origin", EDGE_ORIGIN)
             .header("User-Agent", EDGE_USER_AGENT)
-            .header("Accept-Encoding", "gzip, deflate, br")
             .header("Accept-Language", "en-US,en;q=0.9")
             .build()
 
@@ -311,10 +320,12 @@ class EdgeTtsApi @Inject constructor(
         return digest.joinToString("") { "%02X".format(it) }
     }
 
-    private fun syncClockSkewFromBing() {
+    private fun syncClockSkewFromEndpoint(endpointUrl: String) {
         runCatching {
+            val httpUrl = endpointUrl.toHttpUrl()
+            val rootUrl = "${httpUrl.scheme}://${httpUrl.host}/"
             val req = Request.Builder()
-                .url("https://speech.platform.bing.com/")
+                .url(rootUrl)
                 .head()
                 .header("User-Agent", EDGE_USER_AGENT)
                 .build()
@@ -517,14 +528,19 @@ class EdgeTtsApi @Inject constructor(
         const val MAX_ATTEMPTS = 3
         const val DEFAULT_VOICE_RATE = "+24%"
         const val DEFAULT_VOICE_PITCH = "+1Hz"
-        const val EDGE_TTS_TIMEOUT_SECONDS = 12L
+        const val EDGE_TTS_TIMEOUT_SECONDS = 15L
         const val EDGE_COOLDOWN_MS = 60_000L
 
+        const val EDGE_PRIMARY_WS_URL =
+            "https://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+        const val EDGE_LEGACY_WS_URL =
+            "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+
         const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-        const val SEC_MS_GEC_VERSION = "1-130.0.2849.68"
+        const val SEC_MS_GEC_VERSION = "1-143.0.3650.75"
         const val EDGE_ORIGIN = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
         const val EDGE_USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
     }
 }
 
