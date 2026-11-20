@@ -163,7 +163,7 @@ class VideoRepositoryImpl @Inject constructor(
         val targetGenderLabel = voiceGender.label
         val toneDirective = buildVoiceToneDirective(voiceTone)
         val languageDirective = if (language == VideoLanguage.AUTO) {
-            "Language: Auto-detect from user request. Default to spoken Hindi (Devanagari) with voice_name '${VideoLanguage.HINDI.resolveVoice(voiceGender)}', UNLESS the user explicitly requested another language (e.g. English, Marathi, Gujarati, Bengali, Tamil, Telugu, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, Japanese, Arabic), in which case write in THAT language and pick the matching $targetGenderLabel Edge TTS voice_name."
+            "Language: Auto-detect from user request. Default to spoken Hindi (Devanagari) with voice_name '${VideoLanguage.HINDI.resolveVoice(voiceGender)}', UNLESS the user explicitly requested another language (e.g. English, Marathi, Gujarati, Bengali, Tamil, Telugu, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, Japanese, Arabic), in which case write in THAT language and strictly use the $targetGenderLabel Edge TTS voice_name."
         } else {
             "Language MANDATORY: Write ALL voiceover_text strictly in ${language.languageInstruction} and set voice_name to '${language.resolveVoice(voiceGender)}'."
         }
@@ -173,10 +173,11 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("MODE: FULL USER SCRIPT ($inputWordCount words).")
                 appendLine("DO NOT rewrite, paraphrase, translate, add, or change a single word. Keep the EXACT user text intact and split sequentially into 12 to 18 natural spoken scenes (~6-11 words / ~2.3-3.5s each).")
                 appendLine("CRITICAL SPLIT RULE: NEVER split inside a person's full name (e.g., NEVER 'Pedro' | 'Pascal' or 'Robert' | 'Downey Jr' or 'Russo' | 'Brothers'), NEVER split numbers/currency ('₹2000' | 'Crore'), and NEVER cross a sentence period (e.g., NEVER 'hai. Pedro' in one slab and 'Pascal' in the next)! Always break at full stops (. ! ? ।) or clean comma/conjunction clauses.")
-                appendLine("Select MULTIPLE distinct 'video_clip' (3-6 action/trailer/movie scenes) and 'meme_clip' (1-2 recognizable meme reactions) with concrete movie/character/meme English queries — NEVER query abstract phrases like '4 out of 5 stars', 'rating', 'review', 'ending', 'multiverse'.")
-                appendLine("Whenever a real director or actor is named (e.g., 'Russo Brothers', 'Pedro Pascal', 'Robert Downey Jr'), prefer visual_source='real_photo' with ONLY their clean English name — NEVER draw deformed wax AI faces for real people.")
+                appendLine("VISUAL SOURCE RULE: Match visual_source strictly to the topic! ONLY use 'video_clip' or 'meme_clip' if this script is actually about movies, trailers, actors, pop-culture, or comedy roasts with a concrete movie/character/meme query. For cooking/recipes, food, facts, tech, motivation, devotional, or educational scripts, use visual_source='ai_generated' so every scene shows clean custom visuals (no random unrelated clips or Pikachu/cinema halls!).")
+                appendLine("Whenever a real director or actor is named (e.g., 'Russo Brothers', 'Pedro Pascal', 'Robert Downey Jr'), prefer visual_source='real_photo' with ONLY their clean English name.")
                 appendLine("For ai_generated scenes, match the exact subject/action of THAT scene in crisp visual words (no movie titles, channel names, neon text, or holding-microphone hand closeups that cause deformed fingers/gibberish text).")
-                appendLine("Set voice_name matching the script's language and $targetGenderLabel gender (e.g., Hindi: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
+                appendLine("Set voice_name strictly matching the script's language AND $targetGenderLabel gender (e.g., Hindi $targetGenderLabel: ${VideoLanguage.HINDI.resolveVoice(voiceGender)}, English IN $targetGenderLabel: ${VideoLanguage.ENGLISH_IN.resolveVoice(voiceGender)}, English US $targetGenderLabel: ${VideoLanguage.ENGLISH_US.resolveVoice(voiceGender)}, Marathi $targetGenderLabel: ${VideoLanguage.MARATHI.resolveVoice(voiceGender)}).")
+                appendLine("Set per-scene voice_emotion dynamically ('hook', 'excited', 'climax', 'suspense', 'sad', 'roast', 'question', 'warm', 'normal') matching the exact emotional beat of each line — do NOT leave every scene as 'normal'.")
                 appendLine("Voice delivery style: $toneDirective")
                 appendLine("Return ONLY ONE complete valid JSON object with properly closed 'slabs' array ']' and root object '}'. Avoid unescaped double quotes inside JSON strings.")
                 appendLine()
@@ -197,10 +198,11 @@ class VideoRepositoryImpl @Inject constructor(
                 appendLine("CRITICAL DIRECTOR PROMPT RULES:")
                 appendLine("1) NEVER speak or copy meta-instructions ('Act as...', 'Create a fast 9:16...', 'Write a script...', 'Include...', 'Data to include', 'Scene 1:', 'Visual:', 'Image prompts') into voiceover_text! Put ONLY natural spoken storytelling narration in voiceover_text.")
                 appendLine("2) Whenever the user describes visuals, scenes, camera shots, character appearance/costume, lighting, props, or style (in English, Hindi, or Hinglish), put those EXACT visual details right at the BEGINNING of image_prompt (in crisp English) with visual_source='ai_generated' — NEVER replace described visuals with generic crowds or unrelated real_photo.")
-                appendLine("3) Match each scene's image_prompt to THAT SPECIFIC scene's action/character! If a scene focuses on a secondary character or scenery, put THAT subject FIRST in image_prompt and set has_character=false. NEVER include gibberish-prone text, logos, cinema marquees, or hands gripping microphones.")
-                appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) and NEVER split names across scenes. Dynamically choose 'video_clip' (3 to 6 scenes with recognizable concrete movie/character English queries) + 'meme_clip' (1 to 2 named meme templates) + 'real_photo' (for real actors/directors/movie posters) + 'ai_generated'.")
+                appendLine("3) Match each scene's image_prompt to THAT SPECIFIC scene's action/subject! If a scene focuses on food, cooking ingredients, scenery, or a secondary character, put THAT subject FIRST in image_prompt and set has_character=false. NEVER include gibberish-prone text, logos, cinema marquees, or hands gripping microphones.")
+                appendLine("4) Keep every scene's voiceover_text short and punchy (7-10 words) and NEVER split names across scenes. Only pick 'video_clip' / 'meme_clip' / 'real_photo' when the topic genuinely involves movies, actors, celebrities, or fitting reactions — NEVER force movie/meme clips into cooking, facts, tutorials, or story topics.")
                 appendLine(languageDirective)
                 appendLine("Voice delivery & writing tone: $toneDirective")
+                appendLine("Assign dynamic per-scene voice_emotion ('hook', 'excited', 'climax', 'suspense', 'sad', 'roast', 'question', 'warm', 'normal') across scenes so vocal tone shifts naturally with story tension and payoff.")
                 appendLine("Format guideline: $formatGuide")
                 appendLine("Write ONE continuous, expressive storytelling monologue with exclamation (!), question (?), and dramatic pauses (...) so voice intonation sounds dynamic and alive — NEVER a flat newsreader.")
                 appendLine("Return ONLY ONE complete valid JSON object with properly closed 'slabs' array ']' and root object '}'. Avoid unescaped double quotes inside JSON string values; use single quotes if quoting dialogue.")
@@ -460,7 +462,7 @@ class VideoRepositoryImpl @Inject constructor(
         val negativePrompt = buildNegativePrompt(promptLower)
 
         return try {
-            callWithHttpUrl(maxAttempts = 3) {
+            callWithHttpUrl(maxAttempts = 2, retryDelayMs = 1000L) {
                 cloudflareApi.generateImage(
                     authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
                     accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
@@ -471,7 +473,7 @@ class VideoRepositoryImpl @Inject constructor(
                         height = imageHeight,
                         negativePrompt = negativePrompt,
                         seed = seed,
-                        numSteps = 18,
+                        numSteps = 14,
                         guidance = 7.5
                     )
                 )
@@ -479,7 +481,7 @@ class VideoRepositoryImpl @Inject constructor(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
-            callWithHttpUrl(maxAttempts = 2) {
+            callWithHttpUrl(maxAttempts = 2, retryDelayMs = 900L) {
                 cloudflareApi.generateImage(
                     authorization = "Bearer ${BuildConfig.CLOUDFLARE_API_TOKEN}",
                     accountId = BuildConfig.CLOUDFLARE_ACCOUNT_ID,
@@ -490,7 +492,7 @@ class VideoRepositoryImpl @Inject constructor(
                         height = imageHeight,
                         negativePrompt = negativePrompt,
                         seed = seed,
-                        numSteps = 6,
+                        numSteps = 8,
                         guidance = 2.0
                     )
                 )
@@ -507,11 +509,11 @@ class VideoRepositoryImpl @Inject constructor(
 
         return when {
             is3dAnimated ->
-                ", ONE single unified 3D animated Pixar feature film frame, $aspect, cinematic depth of field, rich outdoor 3D environment, soft volumetric sunlight, single cohesive story shot, no repeating pattern, no wallpaper, no sticker sheet, no collage, no grid, no text, no watermark"
+                ", ONE single unified 3D animated Pixar feature film frame, $aspect, cinematic depth of field, rich 3D environment, soft volumetric sunlight, single cohesive story shot, sharp crisp textures, no repeating pattern, no wallpaper, no sticker sheet, no collage, no grid, no text, no watermark"
             isStylized ->
                 ", ONE single unified $aspect, ultra-detailed art direction, sharp focus, dramatic atmospheric lighting, no repeating pattern, no wallpaper, no collage, no grid, no split frames, no text, no watermark, no UI, no logos"
             else ->
-                ", raw 35mm DSLR live-action movie set photograph, ONE single unified $aspect, candid film still, realistic human skin pores and natural fabric textures, shallow depth of field, cinema lighting, clean unlabelled background, no collage, no grid, no multiple panels, no text, no words, no signs, no watermark, no UI, no logos"
+                ", raw 35mm DSLR photograph, ONE single unified $aspect, crisp natural lighting, realistic fine details and textures, shallow depth of field, high clarity focus, clean unlabelled background, no collage, no grid, no multiple panels, no text, no words, no signs, no watermark, no UI, no logos"
         }
     }
 
@@ -530,7 +532,8 @@ class VideoRepositoryImpl @Inject constructor(
             "neon sign text", "cinema marquee text", "billboard text", "pedestal text", "plaque",
             "signboard", "typography", "banner text",
             "ui", "interface", "comment box", "subscribe button", "social media", "website",
-            "blurry", "low quality", "distorted", "deformed", "mutated anatomy",
+            "blurry", "out of focus", "soft focus", "low quality", "jpeg artifacts",
+            "distorted", "deformed", "mutated anatomy",
             "deformed hands", "extra fingers", "twisted fingers", "fused fingers", "ugly hands",
             "creepy hand", "holding microphone badly",
             "extra limbs", "extra arms", "extra legs", "extra tail",
@@ -610,14 +613,16 @@ class VideoRepositoryImpl @Inject constructor(
         val lower = rawQuery.lowercase()
         val forbiddenFragments = listOf(
             "out of 5", "stars", "rating", "review", "subscribe", "comment",
-            "ending", "part 1", "part 2", "box office", "multiverse", "cigar"
+            "ending", "part 1", "part 2", "box office", "multiverse", "cigar",
+            "recipe", "biryani", "cooking", "ingredients", "spices", "simmer"
         )
         if (forbiddenFragments.any { lower.contains(it) }) return true
 
         val genericWords = setOf(
             "out", "five", "four", "three", "two", "one", "stars", "star",
             "rating", "review", "best", "worst", "good", "bad", "top", "epic",
-            "awesome", "amazing", "cinema", "theater", "theatre", "audience"
+            "awesome", "amazing", "cinema", "theater", "theatre", "audience",
+            "cooking", "kitchen", "food", "dish", "rice", "water", "boil"
         )
         val substantiveWords = coreWords.filter { it !in genericWords && !it.all(Char::isDigit) }
         return if (isMeme) {
@@ -662,7 +667,7 @@ class VideoRepositoryImpl @Inject constructor(
             "valorant", "pubg", "freefire", "mannequin", "asmr", "amv",
             "tiktok", "reels", "selfie", "bathroom", "mirror", "shirtless",
             "gym", "dance", "twerk", "couple", "kiss", "fanedit",
-            "velocity", "phonk", "anime edit", "sigma edit"
+            "velocity", "phonk", "anime edit", "sigma edit", "pikachu", "pokemon"
         )
 
         for (item in coubs) {
@@ -687,7 +692,7 @@ class VideoRepositoryImpl @Inject constructor(
                 Regex("""\b${Regex.escape(word)}\b""").containsMatchIn(title.lowercase())
             }
             val likes = obj["likes_count"]?.jsonPrimitive?.intOrNull ?: 0
-            if (titleHits == 0 && likes < 15) continue
+            if (titleHits == 0 && likes < 20) continue
 
             val videoObj = ((obj["file_versions"] as? JsonObject)
                 ?.get("html5") as? JsonObject)
@@ -716,7 +721,7 @@ class VideoRepositoryImpl @Inject constructor(
         val html = fetchTextString("https://tenor.com/search/$slug-gifs", BROWSER_USER_AGENT) ?: return
         val mp4Regex = Regex("""https://media\.tenor\.com/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+\.mp4""")
         val matches = mp4Regex.findAll(html).map { it.value }.distinct().toList()
-        val requiredSlugHits = if (coreWords.size >= 2) 1 else 1
+        val requiredSlugHits = if (coreWords.size >= 2) 2 else 1
 
         for (mp4Url in matches) {
             val fileSlug = mp4Url.substringAfterLast('/').lowercase()
@@ -1225,50 +1230,93 @@ class VideoRepositoryImpl @Inject constructor(
         val emo = emotion.lowercase().trim()
         return when (voiceTone.name.uppercase()) {
             "NATURAL", "PODCAST", "HUMAN" -> when (emo) {
-                "hook" -> "+24%" to "+1Hz"
-                "suspense" -> "+16%" to "-3Hz"
-                "climax" -> "+26%" to "-2Hz"
-                "question" -> "+20%" to "+2Hz"
-                "excited", "roast" -> "+25%" to "+2Hz"
-                else -> "+21%" to "-2Hz"
+                "hook" -> "+25%" to "+3Hz"
+                "excited" -> "+28%" to "+4Hz"
+                "climax" -> "+27%" to "+2Hz"
+                "roast" -> "+26%" to "+3Hz"
+                "question" -> "+21%" to "+4Hz"
+                "suspense" -> "+14%" to "-5Hz"
+                "sad", "emotional" -> "+11%" to "-6Hz"
+                "warm" -> "+20%" to "-1Hz"
+                else -> "+22%" to "-2Hz"
             }
 
             "FUNNY", "COMIC" -> when (emo) {
-                "hook" -> "+28%" to "+4Hz"
-                "suspense" -> "+20%" to "-1Hz"
-                "climax" -> "+30%" to "+3Hz"
-                "question" -> "+24%" to "+5Hz"
-                "excited", "roast" -> "+29%" to "+4Hz"
-                else -> "+25%" to "+2Hz"
+                "hook" -> "+29%" to "+5Hz"
+                "excited" -> "+31%" to "+6Hz"
+                "climax" -> "+30%" to "+4Hz"
+                "roast" -> "+30%" to "+5Hz"
+                "question" -> "+24%" to "+6Hz"
+                "suspense" -> "+18%" to "-2Hz"
+                "sad", "emotional" -> "+15%" to "-3Hz"
+                "warm" -> "+24%" to "+2Hz"
+                else -> "+26%" to "+2Hz"
             }
 
             "SERIOUS", "INTENSE" -> when (emo) {
-                "hook" -> "+18%" to "-4Hz"
-                "suspense" -> "+12%" to "-7Hz"
-                "climax" -> "+20%" to "-5Hz"
-                "question" -> "+15%" to "-2Hz"
-                "excited", "roast" -> "+19%" to "-3Hz"
-                else -> "+15%" to "-5Hz"
+                "hook" -> "+20%" to "-3Hz"
+                "excited" -> "+22%" to "-1Hz"
+                "climax" -> "+23%" to "-4Hz"
+                "roast" -> "+21%" to "-2Hz"
+                "question" -> "+16%" to "-1Hz"
+                "suspense" -> "+10%" to "-8Hz"
+                "sad", "emotional" -> "+9%" to "-7Hz"
+                "warm" -> "+15%" to "-5Hz"
+                else -> "+16%" to "-5Hz"
             }
 
             "ENERGETIC", "HYPE" -> when (emo) {
-                "hook" -> "+30%" to "+3Hz"
-                "suspense" -> "+22%" to "-2Hz"
-                "climax" -> "+32%" to "+2Hz"
-                "question" -> "+25%" to "+4Hz"
-                "excited", "roast" -> "+31%" to "+3Hz"
-                else -> "+27%" to "+1Hz"
+                "hook" -> "+31%" to "+4Hz"
+                "excited" -> "+34%" to "+5Hz"
+                "climax" -> "+33%" to "+3Hz"
+                "roast" -> "+32%" to "+4Hz"
+                "question" -> "+26%" to "+5Hz"
+                "suspense" -> "+20%" to "-3Hz"
+                "sad", "emotional" -> "+16%" to "-4Hz"
+                "warm" -> "+26%" to "+1Hz"
+                else -> "+28%" to "+1Hz"
             }
 
             else -> when (emo) {
-                "hook" -> "+25%" to "+2Hz"
-                "suspense" -> "+16%" to "-5Hz"
-                "climax" -> "+27%" to "-1Hz"
-                "question" -> "+20%" to "+2Hz"
-                "excited", "roast" -> "+26%" to "+3Hz"
+                "hook" -> "+26%" to "+3Hz"
+                "excited" -> "+29%" to "+4Hz"
+                "climax" -> "+28%" to "+2Hz"
+                "roast" -> "+27%" to "+3Hz"
+                "question" -> "+21%" to "+4Hz"
+                "suspense" -> "+14%" to "-5Hz"
+                "sad", "emotional" -> "+11%" to "-6Hz"
+                "warm" -> "+20%" to "-1Hz"
                 else -> "+22%" to "-2Hz"
             }
         }
+    }
+
+    private fun enforceVoiceGender(rawVoiceName: String, requestedGender: VoiceGender): String {
+        val candidate = rawVoiceName.trim()
+        if (candidate.isBlank()) return VideoLanguage.HINDI.resolveVoice(requestedGender)
+
+        val matchedLang = VideoLanguage.values().firstOrNull { lang ->
+            lang != VideoLanguage.AUTO && (
+                lang.maleVoice.equals(candidate, ignoreCase = true) ||
+                    lang.femaleVoice.equals(candidate, ignoreCase = true)
+                )
+        }
+        if (matchedLang != null) {
+            return matchedLang.resolveVoice(requestedGender)
+        }
+
+        val localePrefix = candidate.split('-').take(2).joinToString("-")
+        if (localePrefix.isNotBlank()) {
+            val langByPrefix = VideoLanguage.values().firstOrNull { lang ->
+                lang != VideoLanguage.AUTO &&
+                    lang.maleVoice.startsWith("$localePrefix-", ignoreCase = true)
+            }
+            if (langByPrefix != null) {
+                return langByPrefix.resolveVoice(requestedGender)
+            }
+        }
+
+        return VideoLanguage.HINDI.resolveVoice(requestedGender)
     }
 
     private fun parseScriptResponse(
@@ -1316,7 +1364,7 @@ class VideoRepositoryImpl @Inject constructor(
             val voiceover = dto.voiceoverText.trim()
             val prompt = dto.imagePrompt.trim()
             val sfxCue = dto.sfxCue?.trim()?.lowercase()?.ifBlank { "whoosh" } ?: "whoosh"
-            val emotion = dto.voiceEmotion?.trim()?.lowercase()?.ifBlank { "normal" } ?: "normal"
+            val emotion = normalizeEmotion(dto.voiceEmotion, voiceover, index, slabElements.size)
 
             val rawQuery = dto.realPhotoQuery?.trim().orEmpty()
             val realQuery = if (rawQuery.lowercase() in setOf("none", "null", "n/a", "-")) "" else rawQuery
@@ -1374,7 +1422,7 @@ class VideoRepositoryImpl @Inject constructor(
         val finalVoiceName = if (requestedLanguage != VideoLanguage.AUTO) {
             requestedLanguage.resolveVoice(requestedGender)
         } else {
-            parsedVoiceName.ifBlank { VideoLanguage.HINDI.resolveVoice(requestedGender) }
+            enforceVoiceGender(parsedVoiceName, requestedGender)
         }
 
         return VideoScriptResponse(
@@ -1388,6 +1436,29 @@ class VideoRepositoryImpl @Inject constructor(
             pinned_comment = pinnedComment,
             slabs = slabs
         )
+    }
+
+    private fun normalizeEmotion(
+        rawEmotion: String?,
+        voiceoverText: String,
+        sceneIndex: Int,
+        totalScenes: Int
+    ): String {
+        val cleaned = rawEmotion?.trim()?.lowercase().orEmpty()
+        val allowed = setOf("hook", "excited", "climax", "suspense", "sad", "emotional", "roast", "question", "warm", "normal")
+        if (cleaned in allowed && cleaned != "normal") {
+            return if (cleaned == "emotional") "sad" else cleaned
+        }
+
+        val text = voiceoverText.trim()
+        return when {
+            sceneIndex == 0 -> if (text.contains("?")) "question" else "hook"
+            text.contains("?") -> "question"
+            text.contains("!") -> if (sceneIndex >= totalScenes - 2) "climax" else "excited"
+            text.contains("...") -> "suspense"
+            sceneIndex == totalScenes - 1 -> "warm"
+            else -> if (cleaned == "emotional") "sad" else "normal"
+        }
     }
 
     private fun extractJsonPayload(rawText: String): String {
@@ -1501,6 +1572,7 @@ class VideoRepositoryImpl @Inject constructor(
 
     private suspend fun <T> callWithHttpUrl(
         maxAttempts: Int = MAX_API_ATTEMPTS,
+        retryDelayMs: Long = 1500L,
         request: suspend () -> T
     ): T {
         var lastError: Throwable? = null
@@ -1516,13 +1588,13 @@ class VideoRepositoryImpl @Inject constructor(
                 val wrapped = IllegalStateException("HTTP $code Error at URL: $url. Body: $body", error)
                 lastError = wrapped
                 if ((code == 429 || code in 500..599) && attempt < maxAttempts - 1) {
-                    delay(1500L * (attempt + 1))
+                    delay(retryDelayMs * (attempt + 1))
                 } else {
                     throw wrapped
                 }
             } catch (error: IOException) {
                 lastError = error
-                if (attempt < maxAttempts - 1) delay(1500L * (attempt + 1)) else throw error
+                if (attempt < maxAttempts - 1) delay(retryDelayMs * (attempt + 1)) else throw error
             }
         }
         throw lastError ?: IllegalStateException("API request failed.")
@@ -1562,61 +1634,68 @@ class VideoRepositoryImpl @Inject constructor(
                 "- Whenever the user's prompt or script explicitly describes a specific visual scene, character appearance, outfit, location, lighting, style, camera shot, or action (whether in Hindi, Hinglish, or English, e.g., 'pehle scene me...', 'Scene 1:', '[Visual: ...]'), YOU MUST generate that EXACT visual in image_prompt and set visual_source='ai_generated' and real_photo_query=''.\n" +
                 "- Front-load the exact described subject, costume/outfit, action, setting, props, and lighting in the FIRST 25-35 words of image_prompt so the image generator prioritizes them!\n" +
                 "- If the user asks for a specific style (e.g., anime, 3D Pixar, noir, cyberpunk) or forbids posters/comics/real_photo, strictly honor that style across every scene.\n" +
-                "- SCENE-BY-SCENE CHARACTER & ACTION MATCHING: NEVER put the main hero alone in every scene! If a scene talks about a monkey, butterfly, rabbit, parrot, villain, crowd, mud splash, rainbow sky, or water spray, describe THAT EXACT subject and action in the first 15 words of image_prompt, and set has_character=false whenever the scene is focused on secondary characters or scenery! Keep the main character's look consistent across their scenes with zero random hats/outfits unless mentioned.\n\n" +
-                "DYNAMIC MULTI-CLIP MOVIE SCENES, MEMES, 2-PHOTO SPLITS & STAT BADGES:\n" +
-                "- 'video_clip' (USE 3 to 6 SCENES depending on topic need, UNLESS user requests pure AI animation/no clips): Set visual_source='video_clip', layout_mode='single', and give EACH clip a DIFFERENT, concrete 2-3 word recognizable English movie/character/action query (e.g., 'Avengers Endgame', 'Robert Downey Jr', 'Thanos snap', 'Doctor Strange portal', 'cinema explosion'). NEVER repeat the same query across clips, and NEVER use abstract/vague queries like '4 out of 5 stars', 'rating', 'review', 'multiverse', 'subscribe', 'ending', or 'cigar'!\n" +
-                "- 'meme_clip' (1 to 2 SCENES where comedy, shock, hype, or roast fits, unless user disables memes): Set visual_source='meme_clip', layout_mode='single', and real_photo_query to a named, well-known meme template (e.g. 'Hera Pheri paisa', 'shocked Pikachu', 'mind blown', 'Leonardo DiCaprio toast', 'spiderman pointing').\n" +
-                "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, or vs scenes, set layout_mode='split' (or 'flip' for rapid dual reveal) with visual_source in {'real_photo','ai_generated'} and fill BOTH primary AND secondary visual fields (visual_source_2, real_photo_query_2, image_prompt_2)!\n" +
-                "- STAT BADGES: Whenever a scene announces a HUGE number, budget, box office record, or release date (e.g. '$150M PRE-SALES', '₹2000 CR BUDGET', '17 DEC RELEASE'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
-                "REAL PHOTO / POSTER vs REALISTIC CHARACTER AI IMAGE RULES (When scene is not video_clip/meme_clip and user did NOT specify a custom/animated style):\n" +
-                "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR / FILMMAKER named in the scene (e.g., Russo Brothers, Christopher Nolan, James Gunn, Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr, Pedro Pascal, Chris Evans):\n" +
-                "     ALWAYS set visual_source='real_photo' and real_photo_query to ONLY their clean English name (e.g. 'Russo Brothers', 'Pedro Pascal', 'Robert Downey Jr') — NEVER generate distorted AI faces for real directors or actors!\n" +
-                "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene (e.g., Animal, Kabir Singh, Spirit, Pushpa 2, KGF, Avengers Endgame, Avengers Doomsday, Salaar, Spider-Man No Way Home):\n" +
-                "     Set visual_source='real_photo' and real_photo_query to '<Exact Clean English Title> movie poster'. NEVER combine actor + movie in one query.\n" +
-                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN (e.g., Iron Man, Superman, Batman, Spider-Man, Doctor Doom, Thanos, Joker, Deadpool, Thor, Goku, Rocky Bhai, Pushpa Raj, Hanuman):\n" +
+                "- SCENE-BY-SCENE CHARACTER & ACTION MATCHING: NEVER put the main hero alone in every scene! If a scene talks about a monkey, butterfly, food, spices, cooking pot, crowd, mud splash, rainbow sky, or water spray, describe THAT EXACT subject and action in the first 15 words of image_prompt, and set has_character=false whenever the scene is focused on objects, food, scenery, or secondary characters!\n\n" +
+                "TOPIC-FIT VIDEO CLIPS, MEMES, 2-PHOTO SPLITS & STAT BADGES:\n" +
+                "- ONLY use 'video_clip' (2-5 scenes) and 'meme_clip' (1-2 scenes) when the topic actually involves MOVIES, TRAILERS, ACTORS, POP-CULTURE, or COMEDY ROASTS where real footage/memes genuinely belong! For cooking/recipes, food, facts, tech, tutorials, devotional, motivation, or general stories, keep visual_source='ai_generated' (no unrelated Coub clips or Pikachu memes!).\n" +
+                "- When 'video_clip' fits: give EACH clip a DIFFERENT concrete 2-3 word recognizable English movie/character/action query (e.g., 'Avengers Endgame', 'Robert Downey Jr', 'Thanos snap', 'Doctor Strange portal'). NEVER repeat queries, and NEVER use abstract phrases like '4 out of 5 stars', 'rating', 'review', 'multiverse', 'subscribe', or 'ending'.\n" +
+                "- When 'meme_clip' fits: set real_photo_query to a named, well-known meme template (e.g., 'Hera Pheri paisa', 'mind blown', 'Leonardo DiCaprio toast', 'spiderman pointing').\n" +
+                "- 'split' / 'flip' 2-PHOTO SCENES: For record-comparison, clash, before-after, or vs scenes, set layout_mode='split' (or 'flip') and fill BOTH primary AND secondary visual fields!\n" +
+                "- STAT BADGES: Whenever a scene announces a HUGE number, time limit, budget, box office record, or release date (e.g. '60 SEC CHALLENGE', '$150M PRE-SALES', '₹2000 CR BUDGET'), set stat_badge to a crisp 2-4 word uppercase headline; otherwise set stat_badge=''.\n\n" +
+                "REAL PHOTO / POSTER vs REALISTIC SCENE AI IMAGE RULES (When scene is not video_clip/meme_clip and user did NOT specify a custom/animated style):\n" +
+                "  1) REAL-WORLD ACTOR / ACTRESS / DIRECTOR / FILMMAKER named in the scene (e.g., Russo Brothers, Christopher Nolan, Prabhas, Sandeep Reddy Vanga, Allu Arjun, Ranbir Kapoor, Shah Rukh Khan, Robert Downey Jr, Pedro Pascal, Chris Evans):\n" +
+                "     ALWAYS set visual_source='real_photo' and real_photo_query to ONLY their clean English name — NEVER generate distorted AI faces for real directors or actors!\n" +
+                "  2) SPECIFIC MOVIE / WEB SERIES / SHOW highlighted in the scene:\n" +
+                "     Set visual_source='real_photo' and real_photo_query to '<Exact Clean English Title> movie poster'.\n" +
+                "  3) FICTIONAL CHARACTER / SUPERHERO / VILLAIN:\n" +
                 "     * 1 or 2 iconic character reveals: visual_source='real_photo' and real_photo_query='<Clean English Character Name> character'.\n" +
-                "     * ALL STORY / ACTION / DIALOGUE scenes: visual_source='ai_generated' with raw LIVE-ACTION MOVIE PHOTOGRAPH image_prompt.\n" +
-                "  4) ALL OTHER SCENES: set visual_source='ai_generated' and real_photo_query=''.\n" +
-                "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab (even video_clip/meme_clip/real_photo scenes).\n\n" +
+                "     * ALL STORY / ACTION / DIALOGUE scenes: visual_source='ai_generated' with raw LIVE-ACTION FILM PHOTOGRAPH image_prompt.\n" +
+                "  4) ALL OTHER SCENES (including cooking, food, lifestyle, science, kids, business): set visual_source='ai_generated' and real_photo_query=''.\n" +
+                "- ALWAYS write a rich, content-matched fallback image_prompt for EVERY slab.\n\n" +
                 "IMAGE PROMPT RULES (SINGLE UNIFIED SCENE — ZERO TEXT / ZERO GIBBERISH / ZERO BAD HANDS):\n" +
                 "- Every image_prompt MUST describe ONE SINGLE CONTINUOUS CAMERA SHOT of the exact scene (never collages, grids, wallpapers, sticker patterns, or multiple panels).\n" +
-                "- NEVER write movie titles, channel names, signs, logos, neon letters, cinema marquees, or words inside image_prompt (NEVER write 'Secret Wars', 'Doctor Doom', 'RS Movie Spot', 'neon sign', 'billboard', or 'poster' inside ai_generated prompts — write pure visual description like 'armored figure in dark emerald cloak and brushed steel mask in ruined castle').\n" +
+                "- NEVER write movie titles, channel names, signs, logos, neon letters, cinema marquees, or words inside image_prompt (no 'Secret Wars', 'RS Movie Spot', 'neon sign', 'billboard', or 'poster' inside ai_generated prompts).\n" +
                 "- NEVER prompt hands holding objects close to camera (NEVER write 'holding microphone' or 'holding phone' — use 'podcast host seated cleanly behind desk studio condenser mic on boom arm, relaxed natural posture').\n" +
-                "- Unless user specifies animation/3D/anime/cartoon, write every image_prompt as a REAL LIVE-ACTION FILM SET PHOTOGRAPH (brushed steel, heavy wool cloak, rain droplets, sweat, warm streetlights, cinema depth of field) — NEVER write 'Marvel', 'comic', 'concept art', or 'neon digital glow' unless asked!\n" +
-                "- NEVER write real living actor names inside image_prompt unless explicitly instructed for a mask/costume scene.\n" +
-                "- Avoid literal title words like 'Animal', 'Spirit', 'Beast', 'Tiger', 'Lion', 'Ghost', 'King' when referring to a movie title.\n" +
-                "- NEVER write 'box office', 'records', 'close-up eyes', 'comment box', 'subscribe', 'UI', 'poster', or 'text' inside image_prompt.\n" +
-                "- Vary camera framing across scenes (wide shot, medium shot, over-the-shoulder, low-angle).\n\n"
+                "- Match visual medium to the topic: if it's a cooking/food video, describe steaming dishes, spices, kitchen lighting, macro food photography; if it's a movie/action story, describe 35mm cinema set photography with realistic lighting — NEVER force 'cinema theater' into non-movie prompts!\n" +
+                "- Vary camera framing across scenes (wide shot, medium shot, macro close-up, over-the-shoulder, low-angle).\n\n"
 
         const val VOICE_AND_BGM_RULES =
             "VOICE EMOTION, BGM & YOUTUBE METADATA RULES:\n" +
                 "- Pick bgm_mood: 'comedy_roast', 'epic_action', 'suspense_thriller', 'emotional_sad', 'devotional', 'sci_fi_tech', 'motivational', or 'horror_dark'.\n" +
-                "- For each scene, set voice_emotion: 'hook', 'suspense', 'climax', 'question', 'excited', or 'normal'.\n" +
-                "- Pick valid Edge TTS voice_name (e.g. hi-IN-MadhurNeural, hi-IN-SwaraNeural, en-IN-PrabhatNeural, en-IN-NeerjaNeural, en-US-AndrewNeural, en-US-AvaNeural, etc.).\n" +
-                "- Also generate youtube_title (catchy <75 chars viral title with 1 emoji), youtube_description (2-3 crisp SEO lines for RS Movies Spot), youtube_hashtags ('#shorts #movies ...'), and pinned_comment (a debate/question to spark viewer comments).\n\n"
+                "- For EACH scene, pick the most fitting voice_emotion so audio pacing & tone shift dynamically:\n" +
+                "  * 'hook' = bold energetic opening grab\n" +
+                "  * 'excited' = high-energy hype, joy, delicious/wow reveal\n" +
+                "  * 'climax' = dramatic peak impact / finale\n" +
+                "  * 'suspense' = tense, secret, slow build-up\n" +
+                "  * 'sad' = heartfelt, nostalgic, emotional drop\n" +
+                "  * 'roast' = playful, witty, sarcastic punchline\n" +
+                "  * 'question' = curious rising intonation\n" +
+                "  * 'warm' = friendly, comforting explanation\n" +
+                "  * 'normal' = neutral transition\n" +
+                "- Pick valid Edge TTS voice_name matching the requested language AND gender (e.g. hi-IN-MadhurNeural, hi-IN-SwaraNeural, en-IN-PrabhatNeural, en-IN-NeerjaNeural, en-US-AndrewNeural, en-US-AvaNeural).\n" +
+                "- Also generate youtube_title (catchy <75 chars viral title with 1 emoji), youtube_description (2-3 crisp SEO lines for RS Movie Spot), youtube_hashtags ('#shorts ...'), and pinned_comment (a debate/question to spark viewer comments).\n\n"
 
         const val JSON_SCHEMA_SPEC =
             "Return ONLY ONE valid JSON object (no markdown fences, no commentary) matching this schema:\n" +
                 "{\n" +
                 "  \"character_bible\": \"Fixed simple visual look of main character in English (no random hats/outfits unless needed)\",\n" +
-                "  \"visual_style\": \"Visual medium matching user request (e.g. 3D Pixar animation or Raw live-action 35mm film)\",\n" +
+                "  \"visual_style\": \"Visual medium matching user request (e.g. Raw 35mm DSLR photography, Culinary macro film, or 3D Pixar animation)\",\n" +
                 "  \"bgm_mood\": \"comedy_roast | epic_action | suspense_thriller | emotional_sad | devotional | sci_fi_tech | motivational | horror_dark\",\n" +
-                "  \"voice_name\": \"Edge TTS voice shortName matching language and gender\",\n" +
+                "  \"voice_name\": \"Edge TTS voice shortName strictly matching requested language and gender\",\n" +
                 "  \"youtube_title\": \"Catchy viral YouTube title under 75 chars\",\n" +
-                "  \"youtube_description\": \"2-3 line SEO YouTube description mentioning RS Movies Spot\",\n" +
-                "  \"youtube_hashtags\": \"#shorts #bollywood #hollywood #rsmoviesspot\",\n" +
+                "  \"youtube_description\": \"2-3 line SEO YouTube description mentioning RS Movie Spot\",\n" +
+                "  \"youtube_hashtags\": \"#shorts #viral #rsmoviespot\",\n" +
                 "  \"pinned_comment\": \"Debate question to boost comments on this video\",\n" +
                 "  \"slabs\": [\n" +
                 "    {\n" +
                 "      \"voiceover_text\": \"Natural complete clause of 6-11 words (NEVER cut mid-name or across period)\",\n" +
-                "      \"voice_emotion\": \"hook | suspense | climax | question | excited | normal\",\n" +
+                "      \"voice_emotion\": \"hook | excited | climax | suspense | sad | roast | question | warm | normal\",\n" +
                 "      \"visual_source\": \"real_photo | ai_generated | video_clip | meme_clip\",\n" +
                 "      \"real_photo_query\": \"Clean English query if real_photo/video_clip/meme_clip, else ''\",\n" +
                 "      \"layout_mode\": \"single | split | flip\",\n" +
                 "      \"visual_source_2\": \"real_photo | ai_generated | ''\",\n" +
                 "      \"real_photo_query_2\": \"2nd photo query if split/flip and real_photo, else ''\",\n" +
                 "      \"image_prompt_2\": \"2nd scene English prompt if split/flip, else ''\",\n" +
-                "      \"stat_badge\": \"Optional 2-4 word uppercase stat headline (e.g. '₹80 CR DAY 1?') or ''\",\n" +
+                "      \"stat_badge\": \"Optional 2-4 word uppercase stat headline (e.g. '60 SEC RECIPE!') or ''\",\n" +
                 "      \"has_character\": false,\n" +
                 "      \"image_prompt\": \"Front-loaded crisp English prompt matching THAT scene's exact visual shot (no text/words/logos)\",\n" +
                 "      \"sfx_cue\": \"boom | thunder | sword | fire | whoosh\"\n" +
@@ -1637,7 +1716,7 @@ class VideoRepositoryImpl @Inject constructor(
                 JSON_SCHEMA_SPEC
 
         const val TOPIC_SYSTEM_PROMPT =
-            "You are an elite YouTube storyteller, movie critic, and film director for RS Movie Spot.\n" +
+            "You are an elite YouTube storyteller, scriptwriter, and film director for RS Movie Spot.\n" +
                 "Think like ONE continuous spoken storyteller where every scene's voiceover_text is the NEXT flowing phrase of the same unbroken story!\n\n" +
                 "RULE 1 — CONTINUOUS HIGH-RETENTION FAST-PACED SCRIPT (13 TO 16 SCENES):\n" +
                 "- Create 13 to 16 ultra-crisp scenes (~7-10 words / ~2.4-3.2s each for Shorts; 14-18 scenes for 16:9 YouTube) with seamless spoken transitions so visuals change every ~3 seconds and NO single image sits static!\n" +
